@@ -3,8 +3,9 @@
 .venv/
 __pycache__/
 *.pyc
-.obsidian/
 
+# IDE & Editor
+.obsidian/
 .vscode/
 .idea/
 
@@ -13,9 +14,6 @@ __pycache__/
 
 # Logs & data
 logs/
-data/*.db
-data/*.sqlite
-src/finance_agent/metadata/tables/
 data/
 Note/
 
@@ -24,9 +22,6 @@ Note/
 tests/
 docs/
 STARTUP.md
-
-# Obsidian
-.obsidian/
 
 # Python build
 *.egg-info/
