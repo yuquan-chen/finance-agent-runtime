@@ -25,3 +25,6 @@ STARTUP.md
 
 # Python build
 *.egg-info/
+
+# Schema tables (internal)
+src/finance_agent/metadata/tables/
