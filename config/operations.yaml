@@ -1,0 +1,50 @@
+version: "2026-07-24"
+operations:
+  - name: top_n
+    description: "按维度聚合指标并返回排名靠前的 N 项。"
+    execution_modes: ["sql"]
+    preferred_mode: "sql"
+    risk_level: low
+    requires_method_review: true
+  - name: group_by
+    description: "按维度分组并计算聚合指标。"
+    execution_modes: ["sql"]
+    preferred_mode: "sql"
+    risk_level: low
+    requires_method_review: true
+  - name: latest_by_group
+    description: "按分组字段查询每组最后一条记录。"
+    execution_modes: ["sql"]
+    preferred_mode: "sql"
+    risk_level: low
+    requires_method_review: true
+  - name: time_range
+    description: "将自然语言时间范围解析为查询过滤条件。"
+    execution_modes: ["sql"]
+    preferred_mode: "sql"
+    risk_level: low
+    requires_method_review: false
+  - name: status_distribution
+    description: "统计状态字段的分布。"
+    execution_modes: ["sql"]
+    preferred_mode: "sql"
+    risk_level: low
+    requires_method_review: true
+  - name: trend
+    description: "按时间粒度统计指标趋势。"
+    execution_modes: ["sql"]
+    preferred_mode: "sql"
+    risk_level: low
+    requires_method_review: true
+  - name: variance
+    description: "计算数值指标的总体方差。"
+    execution_modes: ["sql", "code"]
+    preferred_mode: "sql"
+    risk_level: low
+    requires_method_review: true
+  - name: stddev
+    description: "计算数值指标的标准差。"
+    execution_modes: ["sql", "code"]
+    preferred_mode: "sql"
+    risk_level: low
+    requires_method_review: true

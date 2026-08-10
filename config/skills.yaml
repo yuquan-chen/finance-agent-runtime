@@ -1,0 +1,61 @@
+version: "2026-07-28"
+skills:
+  - name: business_health_analysis
+    title: "业务健康度分析"
+    description: "面向宽泛的业务好不好、增长是否健康、交易表现如何等问题，组织一组安全的分析步骤。"
+    when_to_use:
+      - "用户提出宽泛业务分析请求，但没有指定单一指标。"
+      - "用户希望系统主动选择趋势、结构、质量、波动等分析角度。"
+    suggested_capabilities:
+      - trend
+      - status_distribution
+      - top_n
+      - variance
+    required_metadata_terms:
+      - "交易金额"
+      - "交易时间"
+      - "交易状态"
+      - "客户"
+      - "卡渠道"
+    clarification_policy: "缺少时间范围时可以先使用安全默认范围或在 Method Review 中列出假设；只有对象完全不清楚时才澄清。"
+    risk_notes:
+      - "不能在用户授权前读取真实数据。"
+      - "不能由 LLM 直接给出业务好坏结论，结论必须基于执行结果。"
+
+  - name: transaction_quality_review
+    title: "交易质量分析"
+    description: "分析交易状态分布、失败/异常交易占比、时间趋势和可能的质量问题。"
+    when_to_use:
+      - "用户询问交易质量、异常状态、失败交易、成功率、状态分布。"
+      - "用户希望查看某类交易是否异常。"
+    suggested_capabilities:
+      - status_distribution
+      - trend
+      - group_by
+    required_metadata_terms:
+      - "交易状态"
+      - "交易时间"
+      - "交易金额"
+      - "卡渠道"
+    clarification_policy: "如果用户指定状态名或渠道名，优先作为过滤条件；否则先做状态分布。"
+    risk_notes:
+      - "状态分布只能展示聚合结果，不导出交易明细。"
+
+  - name: channel_performance_analysis
+    title: "卡渠道表现分析"
+    description: "分析不同卡渠道的交易规模、状态质量、最后一笔交易和波动情况。"
+    when_to_use:
+      - "用户询问卡渠道表现、渠道排名、渠道最近交易、渠道质量。"
+    suggested_capabilities:
+      - top_n
+      - latest_by_group
+      - status_distribution
+      - variance
+    required_metadata_terms:
+      - "卡渠道"
+      - "交易金额"
+      - "交易时间"
+      - "交易状态"
+    clarification_policy: "如果用户没有指定指标，优先使用交易金额和交易笔数作为默认观察指标。"
+    risk_notes:
+      - "渠道分析默认使用聚合结果，不暴露单笔交易明细。"

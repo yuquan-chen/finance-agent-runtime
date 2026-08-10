@@ -1,0 +1,32 @@
+# Environment & secrets
+.env
+.venv/
+__pycache__/
+*.pyc
+.obsidian/
+
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Logs & data
+logs/
+data/*.db
+data/*.sqlite
+src/finance_agent/metadata/tables/
+data/
+Note/
+
+# Pytest
+.pytest_cache/
+tests/
+docs/
+STARTUP.md
+
+# Obsidian
+.obsidian/
+
+# Python build
+*.egg-info/

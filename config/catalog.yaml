@@ -1,0 +1,89 @@
+version: "2026-07-24"
+description: "Initial hand-written metadata catalog. LLM sees this metadata only; it never sees real rows."
+tables:
+  - name: card_transaction
+    description: "Card transaction ledger. Stores card-related transfers, purchases, refunds, fees, and reversals."
+    primary_key: id
+    allowed_intents:
+      - latest_by_group
+      - top_n
+      - count_distinct
+      - aggregate_by_group
+    columns:
+      - name: id
+        type: uuid
+        semantic: "Transaction primary key."
+        sensitive: false
+      - name: id_no
+        type: bigint
+        semantic: "Monotonic transaction sequence used as a fallback ordering field."
+        sensitive: false
+      - name: account_id
+        type: uuid
+        semantic: "Customer account identifier. Used as customer_id in card transaction analysis."
+        sensitive: false
+      - name: card_id
+        type: uuid
+        semantic: "Card identifier."
+        sensitive: false
+      - name: card_channel
+        type: text
+        semantic: "Card issuing or processing channel."
+        sensitive: false
+      - name: type
+        type: text
+        semantic: "Transaction type. Examples: consumption, transfer_in, transfer_out, refund, reversal."
+        sensitive: false
+      - name: status
+        type: text
+        semantic: "Transaction status. Completed/success-like values are used for settled consumption analytics."
+        sensitive: false
+      - name: total_amount
+        type: decimal
+        semantic: "Total transaction amount."
+        sensitive: false
+      - name: settle_amount
+        type: decimal
+        semantic: "Settled amount."
+        sensitive: false
+      - name: origin_amount
+        type: decimal
+        semantic: "Original transaction amount."
+        sensitive: false
+      - name: currency
+        type: text
+        semantic: "Transaction currency."
+        sensitive: false
+      - name: transaction_at
+        type: timestamptz
+        semantic: "Business transaction timestamp. Preferred ordering field for latest transaction queries."
+        sensitive: false
+      - name: complete_at
+        type: timestamptz
+        semantic: "Completion timestamp."
+        sensitive: false
+      - name: channel_complete_at
+        type: timestamptz
+        semantic: "Channel completion timestamp."
+        sensitive: false
+      - name: created_at
+        type: timestamptz
+        semantic: "Record creation timestamp."
+        sensitive: false
+    relationships: []
+business_terms:
+  customer:
+    description: "In card transaction analysis, customer maps to account_id unless a more specific customer dimension is configured."
+    candidate_fields: ["account_id", "customer_id", "user_id", "client_id"]
+  card_channel:
+    description: "Card channel dimension."
+    candidate_fields: ["card_channel", "channel", "card_channel_code", "channel_code"]
+  consumption:
+    description: "Consumption transaction. Prefer type = consumption and completed/success-like statuses."
+    filters:
+      - field: type
+        op: in
+        value: ["consumption", "consume", "purchase"]
+      - field: status
+        op: in
+        value: ["completed", "success", "succeeded", "settled"]

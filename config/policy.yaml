@@ -1,0 +1,36 @@
+version: "2026-07-24"
+max_rows: 1000
+statement_timeout_ms: 30000
+default_limit: 50
+planner_max_retries: 2
+sensitive_column_patterns:
+  - "password"
+  - "secret"
+  - "token"
+  - "api_key"
+  - "id_card"
+  - "passport"
+  - "ssn"
+  - "salary"
+  - "bank_account"
+  - "phone"
+  - "email"
+forbidden_sql_keywords:
+  - insert
+  - update
+  - delete
+  - drop
+  - alter
+  - truncate
+  - create
+  - grant
+  - revoke
+  - merge
+  - call
+approval:
+  auto_execute_intents:
+    - latest_by_group
+    - top_n
+    - count_distinct
+    - aggregate_by_group
+  require_approval_for_opencode: true
