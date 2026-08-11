@@ -283,7 +283,7 @@ CHAT_HTML = """<!doctype html>
       var div = document.createElement("div");
       div.className = "thinking";
       div.id = "thinking";
-      div.innerHTML = '<div class="thinking-avatar">AI</div><div class="thinking-text">正在思考...</div><div class="thinking-dots"><span></span><span></span><span></span></div>';
+      div.innerHTML = '<div class="thinking-avatar">AI</div><div class="thinking-text">正在思考</div><div class="thinking-dots"><span></span><span></span><span></span></div>';
       messagesEl.appendChild(div);
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
@@ -531,10 +531,13 @@ async def create_run_stream(question: str, thread_id: str | None = None):
             response = _response_from_state(state)
             yield f"data: {json.dumps({'type': 'complete', 'data': response.model_dump()})}\n\n"
 
-            # 保存 pending run
+            # 保存 pending run（使用 thread_id 作为 key，这样同一个用户的连续查询会更新同一个 state）
             request_id = state.get("request_id", "")
             if state.get("status") in {"analysis_plan_review_ready", "method_review_ready", "data_authorization_pending", "prior_result_authorization_pending"} and request_id:
                 PENDING_RUNS[request_id] = dict(state)
+                # 同时保存到 thread_id，这样后续查询可以找到之前的 state
+                if thread_id:
+                    PENDING_RUNS[thread_id] = dict(state)
 
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -565,7 +568,15 @@ async def approve_analysis_plan(request_id: str) -> RunResponse:
 
 @app.post("/v1/runs/{request_id}/method-review/approve", response_model=RunResponse)
 async def approve_method_review(request_id: str) -> RunResponse:
+    # 先尝试用 request_id 获取，如果没有则尝试用 thread_id 获取
     state = PENDING_RUNS.get(request_id)
+    if state is None:
+        # 尝试用 thread_id 获取（处理连续查询的情况）
+        # 从 request_id 中提取 thread_id（如果有的话）
+        for key, value in PENDING_RUNS.items():
+            if key.startswith("thread_") and value.get("request_id") == request_id:
+                state = value
+                break
     if state is None:
         raise HTTPException(status_code=404, detail="pending method review not found")
     try:

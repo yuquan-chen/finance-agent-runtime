@@ -28,3 +28,4 @@ STARTUP.md
 
 # Schema tables (internal)
 src/finance_agent/metadata/tables/
+server.log

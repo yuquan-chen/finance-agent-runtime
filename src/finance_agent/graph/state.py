@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any
+
+from langgraph.graph import MessagesState
 
 
-class AgentState(TypedDict, total=False):
+class AgentState(MessagesState):
+    """使用 MessagesState 自动管理对话历史。"""
+
+    # MessagesState 自动管理 messages 列表
+    # 只需要添加自定义字段
+
     request_id: str
     user_query: str
     status: str
@@ -56,7 +63,5 @@ class AgentState(TypedDict, total=False):
     sent_memory_count: int
     relevant_memories: list[dict[str, Any]]
     public_memory_entries: list[dict[str, Any]]
-    # Conversation history
-    conversation_history: list[dict[str, str]]
     # SQL fields
     completed_sql: str

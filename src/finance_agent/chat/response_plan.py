@@ -98,9 +98,10 @@ UNSAFE_PATTERNS = [
     "查看密码",
 ]
 
-SQL_FORBIDDEN_KEYWORDS = [
-    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE",
-    "GRANT", "REVOKE", "EXEC", "EXECUTE", "INTO OUTFILE", "LOAD_FILE",
+# 真正危险的操作（在 SELECT 语句中会泄露数据或执行危险操作）
+DANGEROUS_SELECT_PATTERNS = [
+    "INTO OUTFILE",  # 把查询结果写到文件（泄露数据）
+    "LOAD_FILE",     # 读取文件内容（泄露数据）
 ]
 
 # ---------------------------------------------------------------------------
@@ -159,6 +160,7 @@ skill > capability > operations > 自写 SQL
 当通用操作不覆盖用户需求时，在 sql 字段写 SQL：
 1. 只写 SELECT，绝不写 INSERT/UPDATE/DELETE
 2. 【强制】表名必须来自 context.table_manifest 中的 name 字段，禁止使用任何不在列表中的表名（如 customers、users、prior_result 等不存在的表）
+2.1. 【强制】必须根据 table_manifest 中的 description 字段选择正确的表！description 说明了表的用途，选择错误的表会导致查询结果为空
 3. 【强制】字段名必须来自 context.table_manifest 中对应表的 columns 列表，不要猜测字段名
 4. 使用 context.business_terms 理解业务术语
 5. 多表用 JOIN，关系参考 table_manifest 中的 relationships
@@ -166,6 +168,7 @@ skill > capability > operations > 自写 SQL
 7. 字段格式：column_name(type): description，使用 column_name 部分
 8. 重要：仔细检查 table_manifest 中的字段名，不要假设字段名（如 account_id 可能不存在，可能是 identifier_id）
 9. KYC/KYB 相关查询使用 account 表（包含 kyc_status, card_kyb_status, cw_kyb_status, va_kyb_status, acquiring_kyb_status 字段）
+9.1. 【强制】消费相关查询（消费、退款、冲正等卡交易）必须使用 card_transaction 表，不要使用 transaction 表！transaction 表只记录余额变动
 10. 【强制】注意字段类型！varchar/text 类型的字段（如 status、type、kyc_status）只能用于 WHERE/GROUP BY/ORDER BY，绝对不能用于 SUM/AVG 等数值计算！
 11. 【强制】先理解用户意图再写 SQL！用户问"查询 company1 的 KYC 状态"→ 写简单的 SELECT ... WHERE legal_name = :customer_name，不要写 GROUP BY/SUM 等聚合操作！
 
@@ -261,6 +264,7 @@ def plan_response_with_llm_and_registry(
     business_term_registry: BusinessTermRegistry | None = None,
     table_manifest: list[dict[str, Any]] | None = None,
     relevant_memories: list[dict[str, Any]] | None = None,
+    conversation_messages: list[dict[str, Any]] | None = None,
 ) -> ResponsePlan:
     safety = hard_safety_plan(message)
     if safety:
@@ -282,12 +286,27 @@ def plan_response_with_llm_and_registry(
         relevant_memories=relevant_memories,
     )
 
-    messages = [
+    # 构建 messages，包含对话历史
+    llm_messages = [
         {"role": "system", "content": INSTRUCTIONS},
         {"role": "user", "content": context_block},
-        {"role": "user", "content": message},
     ]
-    payload, _ = llm_provider.chat_json(messages, temperature=0)
+
+    # 注入对话历史（最近 6 轮）
+    if conversation_messages:
+        for msg in conversation_messages[-12:]:  # 最近 12 条消息（6 轮对话）
+            if hasattr(msg, 'type') and hasattr(msg, 'content'):
+                # LangChain 消息对象
+                role = "user" if msg.type == "human" else "assistant"
+                llm_messages.append({"role": role, "content": msg.content})
+            elif isinstance(msg, dict) and 'role' in msg:
+                # 字典格式
+                llm_messages.append(msg)
+
+    # 添加当前用户消息
+    llm_messages.append({"role": "user", "content": message})
+
+    payload, _ = llm_provider.chat_json(llm_messages, temperature=0)
     plan = _parse_payload(payload, message)
     return _normalize(plan, message)
 
@@ -361,15 +380,7 @@ def _validate_proposal(
     # LLM 自写 SQL 安全检查
     if proposal.sql:
         sql_upper = proposal.sql.upper()
-        for keyword in SQL_FORBIDDEN_KEYWORDS:
-            if keyword in sql_upper:
-                return ResponseValidationResult(
-                    allowed=False,
-                    route="direct_response",
-                    status="refusal",
-                    user_goal=user_goal,
-                    errors=[f"LLM SQL 包含禁止关键词: {keyword}"],
-                )
+        # 检查是否以 SELECT 开头（只读查询）
         if not sql_upper.strip().startswith("SELECT"):
             return ResponseValidationResult(
                 allowed=False,
@@ -378,6 +389,16 @@ def _validate_proposal(
                 user_goal=user_goal,
                 errors=["LLM SQL 必须以 SELECT 开头"],
             )
+        # 检查真正危险的操作（在 SELECT 语句中会泄露数据或执行危险操作）
+        for pattern in DANGEROUS_SELECT_PATTERNS:
+            if pattern in sql_upper:
+                return ResponseValidationResult(
+                    allowed=False,
+                    route="direct_response",
+                    status="refusal",
+                    user_goal=user_goal,
+                    errors=[f"LLM SQL 包含危险操作: {pattern}"],
+                )
 
     # 有 entity_id → 查注册表
     if entity_id:

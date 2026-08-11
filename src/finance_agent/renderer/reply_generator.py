@@ -1,10 +1,13 @@
 import asyncio
+import time
 from typing import Any
 
 from finance_agent.llm.provider import LlmProvider
 
 
 SYSTEM_PROMPT = """你是一个友好的数据分析助手。根据系统数据，用自然、口语化的中文回复用户。
+
+【当前日期】{today}
 
 说话风格：
 - 像朋友聊天一样自然，不要太正式
@@ -129,7 +132,7 @@ async def generate_reply(
     context: dict[str, Any],
     user_query: str,
     llm: LlmProvider,
-    conversation_history: list[dict[str, str]] | None = None,
+    messages: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     根据结构化上下文生成用户可见的回复。
@@ -138,36 +141,45 @@ async def generate_reply(
         context: 结构化数据，包含 type, steps, fields, results 等
         user_query: 用户的原始问题
         llm: LLM 客户端
-        conversation_history: 对话历史列表
+        messages: 对话历史消息列表（LangGraph MessagesState）
 
     Returns:
         LLM 生成的自然语言回复
     """
     context_text = _format_context(context)
 
-    # 总结对话历史（而不是全量注入）
-    history_summary = ""
-    if conversation_history:
-        summary = await summarize_conversation(conversation_history, llm)
-        if summary:
-            history_summary = f"\n【最近对话摘要】\n{summary}\n"
-
     user_message = f"""用户问题：{user_query}
-{history_summary}
+
 系统数据：
 {context_text}
 
 请根据以上数据生成回复。"""
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
-    ]
+    # 注入当前日期到系统提示词
+    today = time.strftime("%Y-%m-%d")
+    system_prompt = SYSTEM_PROMPT.format(today=today)
+
+    # 构建 LLM 调用的 messages，包含对话历史
+    llm_messages = [{"role": "system", "content": system_prompt}]
+
+    # 添加对话历史（LangGraph MessagesState 自动管理）
+    if messages:
+        for msg in messages[-10:]:  # 最近 10 条消息
+            if hasattr(msg, 'type') and hasattr(msg, 'content'):
+                # LangChain 消息对象
+                role = "user" if msg.type == "human" else "assistant"
+                llm_messages.append({"role": role, "content": msg.content})
+            elif isinstance(msg, dict) and 'role' in msg:
+                # 字典格式
+                llm_messages.append(msg)
+
+    # 添加当前用户消息
+    llm_messages.append({"role": "user", "content": user_message})
 
     # 使用 asyncio.to_thread 包装同步的 chat 方法
     response = await asyncio.to_thread(
         llm.chat,
-        messages,
+        llm_messages,
         temperature=0.7,
     )
     return response.content.strip()

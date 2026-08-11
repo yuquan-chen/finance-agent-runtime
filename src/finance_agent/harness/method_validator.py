@@ -58,6 +58,9 @@ def validate_method_draft(
                 errors.append(f"required field must be qualified as table.field: {qualified}")
                 continue
             table_name, field = qualified.split(".", 1)
+            # 跳过 * 通配符（SELECT * 或 SELECT table.*）
+            if field == "*":
+                continue
             # 检查表是否可见
             if table_name not in all_visible_fields:
                 errors.append(f"required field references unknown table: {qualified}")
