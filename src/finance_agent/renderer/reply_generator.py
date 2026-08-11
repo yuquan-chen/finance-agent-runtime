@@ -45,6 +45,86 @@ SYSTEM_PROMPT = """你是一个友好的数据分析助手。根据系统数据�
 - 【绝对不能】编造查询结果！如果没有数据就说没有"""
 
 
+SUMMARIZE_PROMPT = """请总结以下对话历史，提取关键信息。
+
+要求：
+1. 只保留用户的核心需求和偏好
+2. 只保留关键的查询结果（表名、字段、行数）
+3. 不要保留对话细节，只保留结论
+4. 用简洁的中文，每条一行
+5. 如果没有值得保留的信息，返回空字符串
+
+输出格式：
+- 用户查询过 XXX
+- 用户偏好 XXX
+- 上次查询返回了 N 条记录
+
+示例：
+- 用户查询过 Company 5 的 KYC 状态
+- 用户偏好按金额降序排列结果
+- 上次查询涉及 account 和 cdd_kyc 表"""
+
+
+async def summarize_conversation(
+    conversation_history: list[dict[str, str]],
+    llm: LlmProvider,
+) -> str:
+    """
+    总结对话历史，提取关键信息。
+
+    Args:
+        conversation_history: 对话历史列表
+        llm: LLM 客户端
+
+    Returns:
+        总结后的文本
+    """
+    if not conversation_history:
+        return ""
+
+    # 构建对话文本
+    conversation_text = ""
+    for turn in conversation_history[-10:]:  # 只总结最近 10 轮
+        role = "用户" if turn["role"] == "user" else "AI"
+        content = turn["content"][:200] + "..." if len(turn["content"]) > 200 else turn["content"]
+        conversation_text += f"{role}: {content}\n"
+
+    messages = [
+        {"role": "system", "content": SUMMARIZE_PROMPT},
+        {"role": "user", "content": f"请总结以下对话历史：\n\n{conversation_text}"},
+    ]
+
+    try:
+        response = await asyncio.to_thread(
+            llm.chat,
+            messages,
+            temperature=0,
+            max_tokens=200,
+        )
+        return response.content.strip()
+    except Exception:
+        # 如果总结失败，返回简化版本
+        return _fallback_summary(conversation_history)
+
+
+def _fallback_summary(conversation_history: list[dict[str, str]]) -> str:
+    """备用的简化总结（不调用 LLM）。"""
+    if not conversation_history:
+        return ""
+
+    # 提取用户消息中的关键词
+    user_queries = [
+        turn["content"][:50]
+        for turn in conversation_history
+        if turn["role"] == "user"
+    ]
+
+    if not user_queries:
+        return ""
+
+    return f"- 用户最近查询过：{', '.join(user_queries[-3:])}"
+
+
 async def generate_reply(
     context: dict[str, Any],
     user_query: str,
@@ -65,17 +145,15 @@ async def generate_reply(
     """
     context_text = _format_context(context)
 
-    # 构建对话历史文本
-    history_text = ""
+    # 总结对话历史（而不是全量注入）
+    history_summary = ""
     if conversation_history:
-        history_text = "\n【最近对话历史】\n"
-        for turn in conversation_history[-6:]:  # 只显示最近 6 轮
-            role = "用户" if turn["role"] == "user" else "AI"
-            content = turn["content"][:100] + "..." if len(turn["content"]) > 100 else turn["content"]
-            history_text += f"{role}: {content}\n"
+        summary = await summarize_conversation(conversation_history, llm)
+        if summary:
+            history_summary = f"\n【最近对话摘要】\n{summary}\n"
 
     user_message = f"""用户问题：{user_query}
-{history_text}
+{history_summary}
 系统数据：
 {context_text}
 

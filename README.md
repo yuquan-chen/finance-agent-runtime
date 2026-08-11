@@ -83,6 +83,7 @@ LLM 分析意图 → ResponsePlan
 保存所有用户消息和 AI 回复，支持跨 session 查询：
 - 保存到 `data/conversations/` 目录，按日期分文件（JSONL 格式）
 - 下次对话时自动读取最近 10 轮对话历史
+- **LLM 总结**：用 LLM 提取关键信息，注入摘要而不是全量（参考 Claude Code）
 - 注入到 LLM 上下文，帮助理解连续对话
 
 ### 查询记录存储
