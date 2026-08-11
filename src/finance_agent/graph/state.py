@@ -56,5 +56,7 @@ class AgentState(TypedDict, total=False):
     sent_memory_count: int
     relevant_memories: list[dict[str, Any]]
     public_memory_entries: list[dict[str, Any]]
+    # Conversation history
+    conversation_history: list[dict[str, str]]
     # SQL fields
     completed_sql: str

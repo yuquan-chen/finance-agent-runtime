@@ -25,6 +25,7 @@ from finance_agent.harness.analysis_schema import (
 )
 from finance_agent.harness.method_validator import validate_method_draft
 from finance_agent.llm.provider import LlmProvider, build_llm_provider
+from finance_agent.memory.conversation_store import ConversationStore
 from finance_agent.memory.memory_store import MemoryStore
 from finance_agent.memory.private_result_store import PrivateResultStore
 from finance_agent.memory.public_memory import PublicMemoryStore
@@ -94,6 +95,7 @@ class FinanceAgentRuntime:
         self.private_result_store = PrivateResultStore(self.settings.private_result_store_path)
         self.public_memory_store = PublicMemoryStore(self.settings.public_memory_path)
         self.memory_store = MemoryStore(self.settings.public_memory_path.parent / "public_memory")
+        self.conversation_store = ConversationStore(self.settings.public_memory_path.parent / "conversations")
         self.executor = self._build_executor()
         self.graph = self._build_graph()
 
@@ -157,12 +159,23 @@ class FinanceAgentRuntime:
         return graph.compile()
 
     async def invoke(self, question: str) -> AgentState:
+        # 读取最近的对话历史
+        recent_turns = self.conversation_store.get_recent_turns(limit=10)
+        conversation_history = [
+            {"role": turn.role, "content": turn.content}
+            for turn in recent_turns
+        ]
+
+        # 保存用户消息
+        self.conversation_store.add_turn("user", question)
+
         initial: AgentState = {
             "request_id": str(uuid.uuid4()),
             "user_query": question,
             "status": "started",
             "errors": [],
             "public_memory_context": self.public_memory_store.context_for_llm(),
+            "conversation_history": conversation_history,
             "repair_attempts": 0,
             "repair_history": [],
         }
@@ -294,7 +307,7 @@ class FinanceAgentRuntime:
         )
 
         context = render_execution_result_data(card, narration, self.handler_registry)
-        answer = await generate_reply(context, state["user_query"], self.llm_provider)
+        answer = await generate_reply(context, state["user_query"], self.llm_provider, state.get("conversation_history"))
         next_state: AgentState = {
             **state,
             "status": "executed_simulated_real",
@@ -735,7 +748,7 @@ class FinanceAgentRuntime:
         plan = AnalysisPlan.model_validate(state["analysis_plan"])
         card = build_analysis_plan_review_card(plan, state.get("selected_skill_detail"))
         context = render_analysis_plan_review_data(card, self.handler_registry)
-        answer = await generate_reply(context, state["user_query"], self.llm_provider)
+        answer = await generate_reply(context, state["user_query"], self.llm_provider, state.get("conversation_history"))
         return {
             **state,
             "analysis_plan_review_card": card.model_dump(mode="json"),
@@ -1012,7 +1025,7 @@ class FinanceAgentRuntime:
             if len(cards) > 1
             else render_method_review_data(plan, methods[0], card, prior_queries=prior_queries)
         )
-        answer = await generate_reply(context, state["user_query"], self.llm_provider)
+        answer = await generate_reply(context, state["user_query"], self.llm_provider, state.get("conversation_history"))
 
         # Dependent method: skip normal data authorization, use prior result auth instead
         primary_method = methods[0]
@@ -1061,7 +1074,7 @@ class FinanceAgentRuntime:
 
     async def refuse_method(self, state: AgentState) -> AgentState:
         context = refuse_method_data("; ".join(state.get("errors", [])[-5:]))
-        answer = await generate_reply(context, state["user_query"], self.llm_provider)
+        answer = await generate_reply(context, state["user_query"], self.llm_provider, state.get("conversation_history"))
         return {
             **state,
             "status": "method_refused",
@@ -1227,7 +1240,7 @@ class FinanceAgentRuntime:
             result_ref=private_record.result_ref,
         )
         context = render_execution_result_data(card, narration, self.handler_registry)
-        answer = await generate_reply(context, state["user_query"], self.llm_provider)
+        answer = await generate_reply(context, state["user_query"], self.llm_provider, state.get("conversation_history"))
         return self.audit(
             {
                 **state,
@@ -1325,5 +1338,10 @@ class FinanceAgentRuntime:
                 event["extracted_memories"] = [m.name for m in extracted_memories]
         except Exception as e:
             event["memory_extraction_error"] = str(e)
+
+        # 保存 AI 回复到对话历史
+        answer = state.get("answer")
+        if answer:
+            self.conversation_store.add_turn("assistant", answer)
 
         return {**state, "audit": audit}

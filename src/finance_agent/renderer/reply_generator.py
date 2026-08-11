@@ -49,6 +49,7 @@ async def generate_reply(
     context: dict[str, Any],
     user_query: str,
     llm: LlmProvider,
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> str:
     """
     根据结构化上下文生成用户可见的回复。
@@ -57,13 +58,24 @@ async def generate_reply(
         context: 结构化数据，包含 type, steps, fields, results 等
         user_query: 用户的原始问题
         llm: LLM 客户端
+        conversation_history: 对话历史列表
 
     Returns:
         LLM 生成的自然语言回复
     """
     context_text = _format_context(context)
-    user_message = f"""用户问题：{user_query}
 
+    # 构建对话历史文本
+    history_text = ""
+    if conversation_history:
+        history_text = "\n【最近对话历史】\n"
+        for turn in conversation_history[-6:]:  # 只显示最近 6 轮
+            role = "用户" if turn["role"] == "user" else "AI"
+            content = turn["content"][:100] + "..." if len(turn["content"]) > 100 else turn["content"]
+            history_text += f"{role}: {content}\n"
+
+    user_message = f"""用户问题：{user_query}
+{history_text}
 系统数据：
 {context_text}
 
