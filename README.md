@@ -80,11 +80,22 @@ LLM 分析意图 → ResponsePlan
 
 ### 对话历史持久化
 
-保存所有用户消息和 AI 回复，支持跨 session 查询：
-- 保存到 `data/conversations/` 目录，按日期分文件（JSONL 格式）
-- 下次对话时自动读取最近 10 轮对话历史
+使用 LangGraph 内置的 checkpoint 功能，自动保存对话状态：
+- **MemorySaver**：内存存储（开发环境）
+- **Thread**：按 thread_id 组织对话，支持多用户并发
+- **自动持久化**：每个节点执行后自动保存状态
 - **LLM 总结**：用 LLM 提取关键信息，注入摘要而不是全量（参考 Claude Code）
-- 注入到 LLM 上下文，帮助理解连续对话
+
+技术实现：
+```python
+from langgraph.checkpoint.memory import MemorySaver
+
+checkpointer = MemorySaver()
+graph = builder.compile(checkpointer=checkpointer)
+
+config = {"configurable": {"thread_id": "user-123"}}
+result = graph.invoke(input_data, config=config)
+```
 
 ### 查询记录存储
 

@@ -15,6 +15,7 @@ from finance_agent.graph.runtime import FinanceAgentRuntime
 
 class RunRequest(BaseModel):
     question: str
+    thread_id: str | None = None  # 用于对话历史持久化
 
 
 class RunResponse(BaseModel):
@@ -173,6 +174,13 @@ CHAT_HTML = """<!doctype html>
     var currentRequestId = null;
     var pendingActions = {};  // request_id -> {approve: fn, cancel: fn}
 
+    // 生成或获取 thread_id（用于对话历史持久化）
+    var threadId = localStorage.getItem("thread_id");
+    if (!threadId) {
+      threadId = "thread_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
+      localStorage.setItem("thread_id", threadId);
+    }
+
     // 调试看板函数
     function addDebugEntry(label, content, type) {
       var entry = document.createElement("div");
@@ -305,7 +313,7 @@ CHAT_HTML = """<!doctype html>
 
       try {
         // 使用 SSE 接收实时事件（GET 请求）
-        var eventSource = new EventSource("/v1/runs/stream?question=" + encodeURIComponent(text));
+        var eventSource = new EventSource("/v1/runs/stream?question=" + encodeURIComponent(text) + "&thread_id=" + encodeURIComponent(threadId));
 
         eventSource.onmessage = function(event) {
           var data = JSON.parse(event.data);
@@ -480,7 +488,7 @@ def health() -> dict[str, Any]:
 @app.post("/v1/runs", response_model=RunResponse)
 async def create_run(request: RunRequest) -> RunResponse:
     # 不再清除 pending runs，让每个请求独立管理自己的生命周期
-    state = await runtime().invoke(request.question)
+    state = await runtime().invoke(request.question, thread_id=request.thread_id)
     request_id = state.get("request_id", "")
     if state.get("status") in {"analysis_plan_review_ready", "method_review_ready", "data_authorization_pending", "prior_result_authorization_pending"} and request_id:
         PENDING_RUNS[request_id] = dict(state)
@@ -488,7 +496,7 @@ async def create_run(request: RunRequest) -> RunResponse:
 
 
 @app.get("/v1/runs/stream")
-async def create_run_stream(question: str):
+async def create_run_stream(question: str, thread_id: str | None = None):
     """SSE 端点：实时推送 LLM 处理过程。"""
     async def event_generator():
         try:
@@ -496,7 +504,7 @@ async def create_run_stream(question: str):
             yield f"data: {json.dumps({'type': 'start', 'message': '开始处理请求...'})}\n\n"
 
             # 调用 runtime
-            state = await runtime().invoke(question)
+            state = await runtime().invoke(question, thread_id=thread_id)
 
             # 发送 Response Plan
             if state.get("response_plan"):

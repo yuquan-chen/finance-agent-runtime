@@ -4,6 +4,7 @@ import uuid
 from typing import Any
 
 from langgraph.graph import END, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
 
 from finance_agent.audit.audit_logger import AuditLogger, stable_hash
 from finance_agent.chat.response_plan import (
@@ -25,7 +26,6 @@ from finance_agent.harness.analysis_schema import (
 )
 from finance_agent.harness.method_validator import validate_method_draft
 from finance_agent.llm.provider import LlmProvider, build_llm_provider
-from finance_agent.memory.conversation_store import ConversationStore
 from finance_agent.memory.memory_store import MemoryStore
 from finance_agent.memory.private_result_store import PrivateResultStore
 from finance_agent.memory.public_memory import PublicMemoryStore
@@ -95,7 +95,7 @@ class FinanceAgentRuntime:
         self.private_result_store = PrivateResultStore(self.settings.private_result_store_path)
         self.public_memory_store = PublicMemoryStore(self.settings.public_memory_path)
         self.memory_store = MemoryStore(self.settings.public_memory_path.parent / "public_memory")
-        self.conversation_store = ConversationStore(self.settings.public_memory_path.parent / "conversations")
+        self.checkpointer = MemorySaver()
         self.executor = self._build_executor()
         self.graph = self._build_graph()
 
@@ -156,18 +156,30 @@ class FinanceAgentRuntime:
         graph.add_edge("load_prior_result", "generate_dependent_method")
         graph.add_edge("generate_dependent_method", "review_method")
         graph.add_edge("audit", END)
-        return graph.compile()
+        return graph.compile(checkpointer=self.checkpointer)
 
-    async def invoke(self, question: str) -> AgentState:
-        # 读取最近的对话历史
-        recent_turns = self.conversation_store.get_recent_turns(limit=10)
-        conversation_history = [
-            {"role": turn.role, "content": turn.content}
-            for turn in recent_turns
-        ]
+    async def invoke(self, question: str, thread_id: str | None = None) -> AgentState:
+        # 生成 thread_id（如果没有提供）
+        if not thread_id:
+            thread_id = str(uuid.uuid4())
 
-        # 保存用户消息
-        self.conversation_store.add_turn("user", question)
+        # 从 checkpointer 读取历史状态
+        config = {"configurable": {"thread_id": thread_id}}
+        conversation_history = []
+
+        try:
+            # 尝试获取之前的 checkpoint
+            checkpoint = self.checkpointer.get(config)
+            if checkpoint:
+                # 从 checkpoint 中提取对话历史
+                state = checkpoint.get("channel_values", {})
+                if "conversation_history" in state:
+                    conversation_history = state["conversation_history"]
+        except Exception:
+            pass
+
+        # 添加当前用户消息到历史
+        conversation_history.append({"role": "user", "content": question})
 
         initial: AgentState = {
             "request_id": str(uuid.uuid4()),
@@ -179,7 +191,9 @@ class FinanceAgentRuntime:
             "repair_attempts": 0,
             "repair_history": [],
         }
-        return await self.graph.ainvoke(initial)
+
+        # 使用 thread_id 调用图
+        return await self.graph.ainvoke(initial, config=config)
 
     async def approve_method_review(self, state: AgentState) -> AgentState:
         """合并方法确认和数据授权为一步：确认后直接执行。"""
@@ -1339,9 +1353,10 @@ class FinanceAgentRuntime:
         except Exception as e:
             event["memory_extraction_error"] = str(e)
 
-        # 保存 AI 回复到对话历史
+        # 更新对话历史（保存到状态，LangGraph checkpointer 会自动持久化）
+        conversation_history = state.get("conversation_history", [])
         answer = state.get("answer")
         if answer:
-            self.conversation_store.add_turn("assistant", answer)
+            conversation_history.append({"role": "assistant", "content": answer})
 
-        return {**state, "audit": audit}
+        return {**state, "audit": audit, "conversation_history": conversation_history}
