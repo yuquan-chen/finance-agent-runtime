@@ -95,6 +95,7 @@ CHAT_HTML = """<!doctype html>
     @keyframes pulse { 50% { opacity: 0.5; } }
     .thinking { display: flex; gap: 8px; align-items: center; padding: 8px 0; }
     .thinking-avatar { width: 36px; height: 36px; border-radius: 50%; background: #e5e7eb; display: flex; align-items: center; justify-content: center; font-size: 14px; }
+    .thinking-text { color: #6b7280; font-size: 14px; }
     .thinking-dots { display: flex; gap: 4px; }
     .thinking-dots span { width: 8px; height: 8px; border-radius: 50%; background: #9ca3af; animation: thinking 1.4s infinite; }
     .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
@@ -282,7 +283,7 @@ CHAT_HTML = """<!doctype html>
       var div = document.createElement("div");
       div.className = "thinking";
       div.id = "thinking";
-      div.innerHTML = '<div class="thinking-avatar">AI</div><div class="thinking-dots"><span></span><span></span><span></span></div>';
+      div.innerHTML = '<div class="thinking-avatar">AI</div><div class="thinking-text">正在思考...</div><div class="thinking-dots"><span></span><span></span><span></span></div>';
       messagesEl.appendChild(div);
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
