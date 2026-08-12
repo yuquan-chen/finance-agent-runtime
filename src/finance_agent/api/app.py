@@ -727,6 +727,7 @@ class SessionResponse(BaseModel):
     title: str
     created_at: str
     updated_at: str
+    pinned: bool = False
     message_count: int = 0
 
 
@@ -746,6 +747,7 @@ async def create_session(request: SessionCreateRequest | None = None):
         title=session["title"],
         created_at=session["created_at"],
         updated_at=session["updated_at"],
+        pinned=bool(session.get("metadata", {}).get("pinned", False)),
         message_count=len(session.get("conversation_history", [])),
     )
 
@@ -761,17 +763,37 @@ async def get_session(session_id: str):
         title=session["title"],
         created_at=session["created_at"],
         updated_at=session["updated_at"],
+        pinned=bool(session.get("metadata", {}).get("pinned", False)),
         message_count=len(session.get("conversation_history", [])),
     )
 
 
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(session_id: str):
-    """删除 session。"""
-    deleted = runtime().session_manager.delete_session(session_id)
-    if not deleted:
+    """删除 session 及其会话级记忆、私有结果和内存检查点。"""
+    deleted = await runtime().delete_session(session_id)
+    if deleted is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"status": "ok", "message": "Session deleted"}
+    for key, state in list(PENDING_RUNS.items()):
+        if key == session_id or state.get("session_id") == session_id:
+            PENDING_RUNS.pop(key, None)
+    return {"status": "ok", "message": "Session deleted", "deleted": deleted}
+
+
+@app.post("/v1/sessions/{session_id}/pin", response_model=SessionResponse)
+async def set_session_pinned(session_id: str, pinned: bool = True):
+    """置顶或取消置顶某个会话。"""
+    session = runtime().session_manager.set_session_pinned(session_id, pinned)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return SessionResponse(
+        session_id=session["session_id"],
+        title=session["title"],
+        created_at=session["created_at"],
+        updated_at=session["updated_at"],
+        pinned=bool(session.get("metadata", {}).get("pinned", False)),
+        message_count=len(session.get("conversation_history", [])),
+    )
 
 
 @app.get("/v1/sessions/{session_id}/history")

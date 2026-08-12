@@ -45,6 +45,7 @@ async def extract_memories(
     messages: list[dict[str, str]],
     store: MemoryStore,
     llm: LlmProvider,
+    session_id: str,
 ) -> list[MemoryFile]:
     """从对话中提取记忆。
 
@@ -57,7 +58,7 @@ async def extract_memories(
         提取的记忆列表
     """
     # 获取现有记忆 manifest
-    existing_manifest = store.get_manifest(limit=50)
+    existing_manifest = store.get_manifest(limit=50, session_id=session_id)
 
     # 构建提取器提示词
     type_prompt = get_type_prompt()
@@ -94,7 +95,7 @@ async def extract_memories(
         # 应用更新
         saved_memories = []
         for update in memory_updates:
-            memory = _apply_memory_update(update, store)
+            memory = _apply_memory_update(update, store, session_id)
             if memory:
                 saved_memories.append(memory)
 
@@ -124,6 +125,7 @@ def _summarize_conversation(messages: list[dict[str, str]]) -> str:
 def _apply_memory_update(
     update: dict[str, Any],
     store: MemoryStore,
+    session_id: str,
 ) -> MemoryFile | None:
     """应用记忆更新。"""
     name = update.get("name", "")
@@ -134,6 +136,10 @@ def _apply_memory_update(
 
     if not name or not content:
         return None
+
+    prefix = f"session_{session_id[:8]}_"
+    if not name.startswith(prefix):
+        name = f"{prefix}{name}"
 
     # 验证类型
     try:
@@ -158,6 +164,7 @@ def _apply_memory_update(
             type=mem_type,
             content=content,
             path=store.base_path / f"{name}.md",
+            session_id=session_id,
         )
         return store.save_memory(memory)
 
@@ -198,7 +205,7 @@ async def extract_memories_from_state(
     if not messages:
         return []
 
-    return await extract_memories(messages, store, llm)
+    return await extract_memories(messages, store, llm, state.get("session_id", ""))
 
 
 def extract_memories_from_state_sync(

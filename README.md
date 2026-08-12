@@ -233,9 +233,27 @@ src/finance_agent/
 
 ### Schema 元数据来源
 
-运行时的完整 schema 来自 `src/finance_agent/metadata/tables/` 中的 Python 表元数据：这些文件由上游业务项目的数据库 schema / ORM 定义提取并版本化，目前覆盖约 173 张表。`TableRegistry` 自动发现这些定义，构建全局 Catalog；系统再按用户问题、权限和安全策略裁剪为本次请求的 `VisibleCatalog`。
+运行时的完整 schema 来自 `schema_catalog/tables/` 中的 Python 表元数据：这些文件由上游业务项目的数据库 schema / ORM 定义提取并版本化，目前覆盖约 173 张表。表级业务 description 单独存放在 `schema_catalog/table_descriptions.yaml`，由人工或本地 LLM 维护，避免 ORM 同步覆盖业务语义。`TableRegistry` 自动合并两层元数据，构建全局 Catalog；系统再按用户问题、权限和安全策略裁剪为本次请求的 `VisibleCatalog`。
 
 因此，173 张表是系统拥有的元数据全集，而不是每次都应发送给 LLM 的上下文。系统会按用户问题、权限和安全策略生成当前请求的 `VisibleCatalog`；规划与校验的目标边界是只使用该经过字段可见性过滤的子集。`config/catalog.yaml` 保留业务词典及早期测试/兼容内容，不与 Python 表定义共同充当 schema 事实源。
+
+上游 ORM 更新后，先重新生成快照，再校验二者字段完全一致：
+
+```bash
+.venv/bin/python scripts/extract_schema.py \
+  --from-entity /path/to/wavepool-core/src/repository \
+  --output schema_catalog/tables
+.venv/bin/python scripts/verify_schema_sync.py \
+  --from-entity /path/to/wavepool-core/src/repository
+```
+
+提取器会递归保留 TypeORM 继承链，以及 `CreateDateColumn`、`UpdateDateColumn`、`DeleteDateColumn`、`VersionColumn` 等专用字段。校验失败时不得发布新的 schema 快照。
+
+缺失的表级业务说明可用本地 LLM 补齐；该脚本只更新覆盖层，不会修改 schema 文件：
+
+```bash
+.venv/bin/python scripts/generate_table_descriptions.py
+```
 
 ---
 

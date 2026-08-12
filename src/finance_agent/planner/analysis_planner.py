@@ -42,9 +42,9 @@ SYSTEM_PROMPT = """# 角色
 
 # 关键规则
 1. 每个步骤必须有 sql 字段，写完整的 SELECT 语句
-2. 表名和字段名来自 context.table_manifest（列名、类型都在里面）
+2. 表名和字段名只能来自 context.visible_metadata；不要猜测或使用未展示的表/字段
 3. 只写 SELECT，绝不写 INSERT/UPDATE/DELETE
-4. 多表用 JOIN，关系参考 table_manifest 中的 relationships
+4. 多表用 JOIN，关系参考 visible_metadata 中的 relationships
 5. 业务术语参考 context.business_terms（如"消费"= type='consumption'）
 6. 参数用 :param_name 格式
 

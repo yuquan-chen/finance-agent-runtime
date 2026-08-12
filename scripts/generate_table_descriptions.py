@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""使用 LM Studio（本地 LLM）为表自动生成描述。
+"""使用 LM Studio（本地 LLM）为表自动生成业务 description 覆盖层。
 
 用法：
   python scripts/generate_table_descriptions.py
@@ -8,12 +8,14 @@
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
 from pathlib import Path
 
 import requests
+import yaml
 
 # 添加项目根目录到 Python 路径
 project_root = Path(__file__).parent.parent
@@ -63,8 +65,9 @@ def generate_description(table_name: str, columns: list[str]) -> str:
     data = response.json()
     description = data["choices"][0]["message"]["content"].strip()
 
-    # 清理描述（去掉可能的引号、句号等）
-    description = description.strip('"\'')
+    # 清理模型偶尔输出的引号、Markdown 列表符和句号。
+    description = description.strip('"\'').strip()
+    description = re.sub(r"^(?:[-*•]\s+)+", "", description)
     if description.endswith('。'):
         description = description[:-1]
 
@@ -75,24 +78,53 @@ def generate_description(table_name: str, columns: list[str]) -> str:
     return description
 
 
-def update_table_file(file_path: Path, table_name: str, description: str) -> None:
-    """更新表定义文件，添加描述。"""
-    content = file_path.read_text()
+OVERLAY_PATH = project_root / "schema_catalog" / "table_descriptions.yaml"
 
-    # 查找 @register_table 装饰器
-    pattern = r'@register_table\(name="' + re.escape(table_name) + r'",\s*description="[^"]*"\)'
-    replacement = f'@register_table(name="{table_name}", description="{description}")'
 
-    new_content = re.sub(pattern, replacement, content)
+def load_overlay() -> dict[str, str]:
+    if not OVERLAY_PATH.exists():
+        return {}
+    raw = yaml.safe_load(OVERLAY_PATH.read_text()) or {}
+    tables = raw.get("tables", {}) if isinstance(raw, dict) else {}
+    return {
+        str(name): normalize_description(str(value))
+        for name, value in tables.items()
+        if str(value).strip()
+    }
 
-    if new_content != content:
-        file_path.write_text(new_content)
-        print(f"  ✓ 已更新: {file_path.name}")
-    else:
-        print(f"  - 未找到匹配的装饰器: {file_path.name}")
+
+def normalize_description(description: str) -> str:
+    description = description.strip('"\'').strip()
+    return re.sub(r"^(?:[-*•]\s+)+", "", description).rstrip("。").strip()
+
+
+def save_overlay(descriptions: dict[str, str]) -> None:
+    """以固定的双引号 YAML 格式写入覆盖层。"""
+    lines = ["# 业务 description 覆盖层：由人工或本地 LLM 维护，不随 ORM schema 同步覆盖。", "tables:"]
+    for table_name, description in sorted(descriptions.items()):
+        lines.append(f"  {table_name}: {json.dumps(normalize_description(description), ensure_ascii=False)}")
+    OVERLAY_PATH.write_text("\n".join(lines) + "\n")
 
 
 def main():
+    parser = argparse.ArgumentParser(description="用本地 LLM 补齐缺失的表级业务说明")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="本次最多生成多少条；适合受执行时间限制的环境断点续跑",
+    )
+    parser.add_argument(
+        "--include-source",
+        action="store_true",
+        help="也将仅来自上游 ORM 注释、尚未写入覆盖层的 description 统一为本地短描述",
+    )
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="只规范已有 YAML 的列表符号与引号格式，不调用 LLM",
+    )
+    args = parser.parse_args()
     print("=" * 60)
     print("使用 LM Studio 为表自动生成描述")
     print("=" * 60)
@@ -103,16 +135,26 @@ def main():
     registry = get_default_table_registry()
     tables = registry.all_tables()
 
-    # 找出没有描述的表
-    tables_without_desc = [t for t in tables if not t.description]
+    overlay = load_overlay()
+    if args.normalize:
+        save_overlay(overlay)
+        print(f"已规范 {len(overlay)} 条 description。")
+        return
+    # 装饰器内已有上游注释、或覆盖层已有业务说明的表都必须保留。
+    tables_without_desc = [
+        table
+        for table in tables
+        if not overlay.get(table.name) and (args.include_source or not table.description)
+    ]
+    if args.limit is not None:
+        if args.limit <= 0:
+            raise SystemExit("--limit must be positive")
+        tables_without_desc = tables_without_desc[:args.limit]
     print(f"需要生成描述的表: {len(tables_without_desc)} 个")
 
     if not tables_without_desc:
         print("\n所有表都有描述，无需处理。")
         return
-
-    # 表定义目录
-    tables_dir = project_root / "src" / "finance_agent" / "metadata" / "tables"
 
     # 为每个表生成描述
     print("\n开始生成描述...")
@@ -129,13 +171,11 @@ def main():
             description = generate_description(table.name, columns)
             print(f"  描述: {description}")
 
-            # 更新文件
-            file_path = tables_dir / f"{table.name}.py"
-            if file_path.exists():
-                update_table_file(file_path, table.name, description)
-                updated_count += 1
-            else:
-                print(f"  ✗ 文件不存在: {file_path}")
+            overlay[table.name] = description
+            # 每条立即落盘：本地模型调用较慢或进程被中断时，下次运行会
+            # 自动跳过已完成项，实现无损断点续跑。
+            save_overlay(overlay)
+            updated_count += 1
         except Exception as e:
             print(f"  ✗ 生成失败: {e}")
 

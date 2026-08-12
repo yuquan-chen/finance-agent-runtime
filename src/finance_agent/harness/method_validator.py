@@ -97,6 +97,7 @@ def validate_method_draft(
                 allow_prior_result=method.data_source == "result_ref",
             )
             errors.extend(sql_errors)
+            errors.extend(_validate_sql_column_references(method.sql_template, visible_catalog, table_registry))
     elif method.method_type == "code":
         if not method.code:
             errors.append("code method requires code")
@@ -171,6 +172,44 @@ def _validate_sql_semantics(
                 f"KYC/KYB 查询应使用 'account' 表。"
             )
 
+    return errors
+
+
+def _validate_sql_column_references(sql: str, visible_catalog: Catalog, table_registry=None) -> list[str]:
+    """在进入沙箱前检查 SQL 所引用表的字段，避免把数据库错误交给用户。"""
+    all_tables: dict[str, set[str]] = {}
+    if visible_catalog:
+        all_tables.update({table.name.lower(): table.column_names for table in visible_catalog.tables})
+    if table_registry:
+        all_tables.update(
+            {
+                name.lower(): table_registry.get(name).column_names
+                for name in table_registry.names()
+                if table_registry.get(name) is not None
+            }
+        )
+
+    referenced_tables = [match.lower() for match in re.findall(r"(?:FROM|JOIN)\s+(\w+)", sql, re.IGNORECASE)]
+    known_referenced = {name: all_tables[name] for name in referenced_tables if name in all_tables}
+    if not known_referenced:
+        return []
+
+    errors: list[str] = []
+    sql_keywords = {
+        "select", "from", "where", "join", "on", "and", "or", "as", "group", "by", "order", "asc", "desc",
+        "limit", "offset", "having", "distinct", "count", "sum", "avg", "min", "max", "coalesce", "date_trunc",
+        "current_date", "interval", "null", "is", "not", "in", "like", "case", "when", "then", "else", "end",
+    }
+    select_aliases = {alias.lower() for alias in re.findall(r"\bAS\s+(\w+)", sql, re.IGNORECASE)}
+    # 所有已知的列名，只要出现在 SQL 中，就必须属于本次 FROM/JOIN 的任一表。
+    available_columns = set().union(*known_referenced.values())
+    all_known_columns = set().union(*all_tables.values()) if all_tables else set()
+    for field in sorted(all_known_columns - available_columns - sql_keywords - select_aliases):
+        if re.search(rf"\b{re.escape(field)}\b", sql, re.IGNORECASE):
+            errors.append(
+                f"SQL 字段错误：'{field}' 不属于本次查询的表 "
+                f"({', '.join(referenced_tables)})。"
+            )
     return errors
 
 

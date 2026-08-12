@@ -32,6 +32,7 @@ async def select_relevant_memories(
     query: str,
     store: MemoryStore,
     llm: LlmProvider,
+    session_id: str,
     max_results: int = 5,
 ) -> list[MemoryFile]:
     """选择与查询相关的记忆。
@@ -46,12 +47,12 @@ async def select_relevant_memories(
         相关的记忆列表
     """
     # 获取所有记忆
-    all_memories = store.list_memories()
+    all_memories = store.list_session_memories(session_id)
     if not all_memories:
         return []
 
     # 构建 manifest
-    manifest = store.get_manifest(limit=50)
+    manifest = store.get_manifest(limit=50, session_id=session_id)
 
     # 构建选择器提示词
     messages = [
@@ -82,7 +83,7 @@ async def select_relevant_memories(
         selected_memories = []
         for name in selected_names:
             memory = store.get_memory(name)
-            if memory:
+            if memory and memory.session_id == session_id:
                 selected_memories.append(memory)
 
         return selected_memories
@@ -127,7 +128,8 @@ def select_relevant_memories_sync(
     query: str,
     store: MemoryStore,
     llm: LlmProvider,
+    session_id: str,
     max_results: int = 5,
 ) -> list[MemoryFile]:
     """同步版本的记忆选择器。"""
-    return asyncio.run(select_relevant_memories(query, store, llm, max_results))
+    return asyncio.run(select_relevant_memories(query, store, llm, session_id, max_results))

@@ -440,6 +440,17 @@ def _generate_pay_transactions(
             "pay_type": "online",
             "expire_time": int((tx_time + timedelta(hours=24)).timestamp()),
             "customer_notes": f"Payment {i+1}",
+            # PayTransaction 继承 TrxBaseV2 -> Base；mock 数据也必须保留
+            # 继承字段，否则 SQL 沙箱会按行数据建临时表并丢失 created_at。
+            "transaction_at": tx_time.isoformat() + "+08:00",
+            "completed_at": (tx_time + timedelta(minutes=3 + i % 12)).isoformat() + "+08:00"
+            if status == "completed" else None,
+            "batch_id": f"pay-batch-{i // 10 + 1}",
+            "created_at": (tx_time - timedelta(minutes=1)).isoformat() + "+08:00",
+            "update_at": tx_time.isoformat() + "+08:00",
+            "delete_at": None,
+            "version": 1,
+            "remarks": None,
         })
 
     return pay_transactions

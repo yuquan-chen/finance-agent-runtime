@@ -1,0 +1,47 @@
+"""自动提取的 va_transaction 表 schema。"""
+from finance_agent.metadata.table_registry import register_table
+
+
+@register_table(name="va_transaction", description="")
+class VaTransaction:
+    COLUMNS = {
+        "id_no": {"type": "bigint"},
+        "account_id": {"type": "uuid"},
+        "va_id": {"type": "uuid", "description": "发生交易的VaId"},
+        "channel": {"type": "varchar", "description": "渠道"},
+        "origin_amount": {"type": "numeric", "description": "原始金额"},
+        "origin_currency": {"type": "varchar", "description": "原始交易币种"},
+        "settle_amount": {"type": "numeric", "description": "交易金额"},
+        "currency": {"type": "varchar", "description": "币种"},
+        "settle_currency": {"type": "varchar", "description": "清算币种"},
+        "fee": {"type": "numeric", "description": "交易手续费"},
+        "type": {"type": "varchar", "description": "交易类型"},
+        "total_amount": {"type": "numeric", "description": "当前订单总消费金额"},
+        "status": {"type": "varchar", "description": "交易状态"},
+        "process_status": {"type": "varchar", "description": "流转态"},
+        "balance_id": {"type": "uuid"},
+        "transaction_id": {"type": "uuid", "description": "交易表ID"},
+        "complete_at": {"type": "timestamptz", "description": "订单完成时间"},
+        "source_id": {"type": "varchar", "description": "三方交易表ID"},
+        "trace_id": {"type": "varchar", "description": "订单跟踪ID，如授权交易ID"},
+        "detail": {"type": "varchar", "description": "交易描述"},
+        "channel_complete_at": {"type": "timestamptz", "description": "三方订单完成时间"},
+        "raw": {"type": "json", "description": "缓存数据"},
+        "extraData": {"type": "json", "description": "定义保存的额外数据"},
+        "customer_notes": {"type": "varchar", "description": "客户备注(Notes)"},
+        "relation": {"type": "varchar", "description": "同名/非同名"},
+        "hidden": {"type": "boolean", "description": "是否对商户隐藏"},
+        "call_id": {"type": "varchar"},
+        "operation_type": {"type": "varchar", "description": "操作类型"},
+        "reference": {"type": "varchar", "description": "附言"},
+        "aml_info": {"type": "jsonb", "description": "aml 信息"},
+        "original_id_no": {"type": "varchar", "description": "原始交易订单号"},
+        "transaction_at": {"type": "timestamptz", "description": "订单创建时间"},
+        "batch_id": {"type": "varchar"},
+        "id": {"type": "uuid", "nullable": False, "description": "主键"},
+        "remarks": {"type": "text"},
+        "created_at": {"type": "timestamptz"},
+        "update_at": {"type": "timestamptz"},
+        "delete_at": {"type": "timestamptz"},
+        "version": {"type": "integer", "nullable": False},
+    }

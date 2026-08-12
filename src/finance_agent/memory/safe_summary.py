@@ -10,6 +10,7 @@ from finance_agent.memory.public_memory import PublicMemoryEntry
 def build_public_memory_entry(
     *,
     request_id: str,
+    session_id: str,
     method: MethodDraft,
     execution_card: ExecutionResultCard,
     private_record: PrivateResultRecord,
@@ -21,6 +22,7 @@ def build_public_memory_entry(
     return PublicMemoryEntry(
         memory_id=f"memory_{private_record.result_ref}",
         request_id=request_id,
+        session_id=session_id,
         result_ref=private_record.result_ref,
         method_name=method.name,
         method_type=method.method_type,

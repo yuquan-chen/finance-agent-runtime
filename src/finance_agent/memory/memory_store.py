@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ class MemoryFile:
     path: Path
     created_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     updated_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    session_id: str = ""
 
     def to_frontmatter(self) -> str:
         """生成 frontmatter 格式。"""
@@ -35,6 +37,7 @@ description: {self.description}
 type: {self.type.value}
 created_at: {self.created_at}
 updated_at: {self.updated_at}
+session_id: {self.session_id}
 ---
 
 {self.content}"""
@@ -84,6 +87,7 @@ updated_at: {self.updated_at}
             path=path,
             created_at=frontmatter.get("created_at", ""),
             updated_at=frontmatter.get("updated_at", ""),
+            session_id=frontmatter.get("session_id", ""),
         )
 
 
@@ -111,6 +115,10 @@ class MemoryStore:
         path = self.base_path / f"{name}.md"
         return MemoryFile.from_file(path)
 
+    def list_session_memories(self, session_id: str) -> list[MemoryFile]:
+        """只返回属于当前会话的记忆；未标记的旧记录不进入新会话。"""
+        return [memory for memory in self.list_memories() if memory.session_id == session_id]
+
     def save_memory(self, memory: MemoryFile) -> MemoryFile:
         """保存记忆到文件。"""
         # 更新时间戳
@@ -135,6 +143,17 @@ class MemoryStore:
             return True
         return False
 
+    def delete_session_memories(self, session_id: str) -> int:
+        """永久移除一个会话的文件型记忆，并重建索引。"""
+        deleted = 0
+        for memory in self.list_session_memories(session_id):
+            if memory.path.exists():
+                memory.path.unlink()
+                deleted += 1
+        if deleted:
+            self._update_index()
+        return deleted
+
     def _update_index(self) -> None:
         """更新 MEMORY.md 索引文件。"""
         memories = self.list_memories()
@@ -156,9 +175,9 @@ class MemoryStore:
 
         self.index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    def get_manifest(self, limit: int = 20) -> str:
+    def get_manifest(self, limit: int = 20, session_id: str | None = None) -> str:
         """获取轻量级 manifest（用于 LLM 选择记忆）。"""
-        memories = self.list_memories()
+        memories = self.list_session_memories(session_id) if session_id is not None else self.list_memories()
 
         # 按更新时间排序，取最新的
         memories.sort(key=lambda m: m.updated_at, reverse=True)
@@ -169,11 +188,11 @@ class MemoryStore:
             lines.append(f"- [{memory.type.value}] {memory.name}: {memory.description}")
         return "\n".join(lines)
 
-    def save_query_history(self, user_query: str, result_summary: str, tables: list[str] | None = None, fields: list[str] | None = None) -> MemoryFile:
+    def save_query_history(self, user_query: str, result_summary: str, tables: list[str] | None = None, fields: list[str] | None = None, session_id: str = "") -> MemoryFile:
         """保存查询历史到 memory（保存用户意图，不保存 SQL）。"""
         # 生成唯一的名称
         timestamp = int(time.time())
-        name = f"query_history_{timestamp}"
+        name = f"query_history_{timestamp}_{uuid.uuid4().hex[:8]}"
 
         # 构建内容（只保存用户意图和结果，不保存 SQL）
         content = f"""## 用户查询
@@ -196,13 +215,14 @@ class MemoryStore:
             type=MemoryType.PROJECT,
             content=content,
             path=self.base_path / f"{name}.md",
+            session_id=session_id,
         )
 
         return self.save_memory(memory)
 
-    def get_recent_queries(self, limit: int = 3) -> list[dict[str, Any]]:
+    def get_recent_queries(self, limit: int = 3, session_id: str | None = None) -> list[dict[str, Any]]:
         """获取最近的查询历史。"""
-        memories = self.list_memories()
+        memories = self.list_session_memories(session_id) if session_id is not None else self.list_memories()
 
         # 过滤查询历史
         query_memories = [m for m in memories if m.name.startswith("query_history_")]

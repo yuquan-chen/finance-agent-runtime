@@ -1,7 +1,7 @@
 """数据库表 Schema 注册表（装饰器 + 自动发现）。
 
 使用 @register_table 和 @register_column 装饰器注册表结构和业务元数据。
-自动扫描 metadata/tables/ 包下的所有模块。
+从 versioned `schema_catalog/tables/` 目录加载表定义。
 
 用法：
     @register_table(name="card_transaction", description="卡交易记录")
@@ -14,12 +14,13 @@
 """
 from __future__ import annotations
 
-import importlib
-import pkgutil
+import importlib.util
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable
 
 from pydantic import BaseModel, Field
+import yaml
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,24 @@ class TableMeta(BaseModel):
 # ---------------------------------------------------------------------------
 
 _pending_tables: list[dict[str, Any]] = []
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DESCRIPTION_OVERLAY_PATH = PROJECT_ROOT / "schema_catalog" / "table_descriptions.yaml"
+SCHEMA_TABLES_PATH = PROJECT_ROOT / "schema_catalog" / "tables"
+
+
+def _load_description_overlay(path: Path = DESCRIPTION_OVERLAY_PATH) -> dict[str, str]:
+    """读取不属于 ORM 的业务说明覆盖层。"""
+    if not path.exists():
+        return {}
+    raw = yaml.safe_load(path.read_text()) or {}
+    tables = raw.get("tables", {}) if isinstance(raw, dict) else {}
+    if not isinstance(tables, dict):
+        return {}
+    return {
+        str(table_name): str(description).strip()
+        for table_name, description in tables.items()
+        if str(description).strip()
+    }
 
 
 def register_table(
@@ -174,13 +193,19 @@ class TableRegistry:
 # ---------------------------------------------------------------------------
 
 def _discover_tables() -> None:
-    """扫描 finance_agent.metadata.tables 包，触发所有装饰器。"""
-    try:
-        package = importlib.import_module("finance_agent.metadata.tables")
-    except ModuleNotFoundError:
-        return
-    for _importer, modname, _ispkg in pkgutil.iter_modules(package.__path__):
-        importlib.import_module(f"finance_agent.metadata.tables.{modname}")
+    """加载 versioned schema catalog 中的表定义，触发注册装饰器。"""
+    if not SCHEMA_TABLES_PATH.is_dir():
+        raise RuntimeError(f"schema catalog directory does not exist: {SCHEMA_TABLES_PATH}")
+
+    for table_path in sorted(SCHEMA_TABLES_PATH.glob("*.py")):
+        if table_path.name == "__init__.py":
+            continue
+        module_name = f"finance_agent_schema_catalog.{table_path.stem}"
+        spec = importlib.util.spec_from_file_location(module_name, table_path)
+        if not spec or not spec.loader:
+            raise RuntimeError(f"unable to load schema table definition: {table_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
 
 
 @lru_cache(maxsize=1)
@@ -190,6 +215,7 @@ def get_default_table_registry() -> TableRegistry:
 
     registry = TableRegistry()
 
+    description_overlay = _load_description_overlay()
     for table_data in _pending_tables:
         columns = [
             ColumnMeta(
@@ -205,7 +231,7 @@ def get_default_table_registry() -> TableRegistry:
         ]
         registry.register(TableMeta(
             name=table_data["name"],
-            description=table_data["description"],
+            description=description_overlay.get(table_data["name"], table_data["description"]),
             columns=columns,
             source="decorator",
         ))

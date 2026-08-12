@@ -191,7 +191,7 @@ class FinanceAgentRuntime:
             "user_query": question,
             "status": "started",
             "errors": [],
-            "public_memory_context": self.public_memory_store.context_for_llm(),
+            "public_memory_context": self.public_memory_store.context_for_llm(session_id),
             "conversation_history": conversation_history,
             "repair_attempts": 0,
             "repair_history": [],
@@ -206,6 +206,19 @@ class FinanceAgentRuntime:
             self.session_manager.add_message(session_id, "assistant", answer)
 
         return result
+
+    async def delete_session(self, session_id: str) -> dict[str, int] | None:
+        """删除会话及其所有会话级记忆与内存检查点。"""
+        if self.session_manager.get_session(session_id) is None:
+            return None
+        deleted = {
+            "public_memory": self.public_memory_store.delete_session(session_id),
+            "private_results": self.private_result_store.delete_session(session_id),
+            "file_memories": self.memory_store.delete_session_memories(session_id),
+        }
+        await self.checkpointer.adelete_thread(session_id)
+        self.session_manager.delete_session(session_id)
+        return deleted
 
     async def approve_method_review(self, state: AgentState) -> AgentState:
         """合并方法确认和数据授权为一步：确认后直接执行。"""
@@ -240,7 +253,9 @@ class FinanceAgentRuntime:
             if attempt < max_attempts - 1 and self._can_repair(state):
                 current_sql = state.get("sql") or (state.get("method_draft") or {}).get("sql_template", "")
                 user_goal = state.get("action_user_goal") or state["user_query"]
-                repaired_sql = self._call_llm_for_repair(user_goal, current_sql, last_error)
+                repaired_sql = self._call_llm_for_repair(
+                    user_goal, current_sql, last_error, state.get("visible_catalog")
+                )
 
                 if repaired_sql:
                     import re
@@ -288,6 +303,7 @@ class FinanceAgentRuntime:
         card = build_execution_result_card(methods[0], authorization, execution)
         private_record = self.private_result_store.append(
             request_id=state["request_id"],
+            session_id=state["session_id"],
             method_name=methods[0].name,
             method_hash=card.method_hash,
             authorization_hash=stable_hash(authorization.model_dump(mode="json")),
@@ -302,6 +318,7 @@ class FinanceAgentRuntime:
         public_memory = self.public_memory_store.append(
             build_public_memory_entry(
                 request_id=state["request_id"],
+                session_id=state["session_id"],
                 method=methods[0],
                 execution_card=card,
                 private_record=private_record,
@@ -323,6 +340,7 @@ class FinanceAgentRuntime:
             result_summary=result_summary,
             tables=tables,
             fields=methods[0].required_fields,
+            session_id=state["session_id"],
         )
         narration = narrate_execution_result(
             card,
@@ -374,6 +392,7 @@ class FinanceAgentRuntime:
             state["user_query"],
             self.memory_store,
             self.llm_provider,
+            state["session_id"],
             max_results=5,
         )
 
@@ -507,7 +526,6 @@ class FinanceAgentRuntime:
                 action_context=action_context,
                 handler_manifest=self.handler_registry.manifest_for_llm(),
                 business_term_manifest=self.business_term_registry.manifest_for_llm(),
-                table_manifest=self.table_registry.manifest_for_llm(),
             )
             plan = self._apply_action_constraints(plan, state)
             planner_used = self.llm_provider.provider_name
@@ -643,69 +661,25 @@ class FinanceAgentRuntime:
 
     def generate_method(self, state: AgentState) -> AgentState:
         try:
-            # 检查 LLM 是否自写了 SQL 或 Python 代码
-            validation = state.get("action_validation") or {}
-            proposal = validation.get("proposal") or {}
-            llm_sql = proposal.get("sql")
-            llm_code = proposal.get("code")
-
-            if llm_code:
-                # LLM 自写 Python 代码 → 直接生成 MethodDraft
-                user_goal = proposal.get("goal") or state.get("action_user_goal") or state["user_query"]
-                method = MethodDraft(
-                    method_type="code",
-                    name="llm_custom_code",
-                    goal=user_goal,
-                    operation="custom_code",
-                    table="card_transaction",
-                    data_source="table",
-                    code=llm_code,
-                    required_fields=self._extract_fields_from_code(llm_code),
-                    output_schema={},
-                    risk_level="medium",
-                    logic_summary=[f"LLM 自写代码: {user_goal}"],
-                )
-                return {
-                    **state,
-                    "method_draft": method.model_dump(mode="json"),
-                    "method_drafts": [method.model_dump(mode="json")],
-                    "status": "method_generated",
-                }
-
-            if llm_sql:
-                # LLM 自写 SQL → 直接生成 MethodDraft
-                user_goal = proposal.get("goal") or state.get("action_user_goal") or state["user_query"]
-                llm_params = proposal.get("params") or {}
-
-                # 从 SQL 中提取表名
-                import re
-                table_match = re.search(r"FROM\s+(\w+)", llm_sql, re.IGNORECASE)
-                table_name = table_match.group(1) if table_match else "card_transaction"
-
-                method = MethodDraft(
-                    method_type="sql",
-                    name="llm_custom_sql",
-                    goal=user_goal,
-                    operation="custom_sql",
-                    table=table_name,
-                    data_source="table",
-                    sql_template=llm_sql,
-                    required_fields=self._extract_fields_from_sql(llm_sql),
-                    params=llm_params,
-                    output_schema={},
-                    risk_level="medium",
-                    logic_summary=[f"LLM 自写 SQL: {user_goal}"],
-                )
-                return {
-                    **state,
-                    "method_draft": method.model_dump(mode="json"),
-                    "method_drafts": [method.model_dump(mode="json")],
-                    "sql": llm_sql,
-                    "status": "method_generated",
-                }
-
+            # ResponsePlan 中的 SQL / 代码只是意图提示，不能绕过 schema 约束。
+            # 唯一可执行来源是已加载可见元数据后的 AnalysisPlan.steps。
+            proposal = (state.get("action_validation") or {}).get("proposal") or {}
+            proposal_params = proposal.get("params") or {}
             plan = AnalysisPlan.model_validate(state["analysis_plan"])
             methods = generate_method_drafts(plan, self.handler_registry)
+            # 参数值可作为用户意图的一部分复用，但只能绑定到 schema 生成且实际引用了该参数的方法。
+            methods = [
+                method.model_copy(
+                    update={
+                        "params": {
+                            name: value
+                            for name, value in proposal_params.items()
+                            if method.sql_template and f":{name}" in method.sql_template
+                        }
+                    }
+                )
+                for method in methods
+            ]
             method = methods[0]
             return {
                 **state,
@@ -881,7 +855,9 @@ class FinanceAgentRuntime:
             user_goal = state.get("action_user_goal") or state["user_query"]
 
             # 调用 LLM 修复 SQL
-            repaired_sql = self._call_llm_for_repair(user_goal, current_sql, error_summary)
+            repaired_sql = self._call_llm_for_repair(
+                user_goal, current_sql, error_summary, state.get("visible_catalog")
+            )
 
             if repaired_sql:
                 # 从 SQL 中提取表名
@@ -994,14 +970,20 @@ class FinanceAgentRuntime:
                 "errors": state.get("errors", []) + [f"method repair failed: {type(exc).__name__}: {exc}"],
             }
 
-    def _call_llm_for_repair(self, user_goal: str, current_sql: str, error_summary: str) -> str | None:
+    def _call_llm_for_repair(
+        self,
+        user_goal: str,
+        current_sql: str,
+        error_summary: str,
+        visible_catalog: dict[str, Any] | None = None,
+    ) -> str | None:
         """调用 LLM 修复 SQL。"""
         try:
-            # 获取表结构信息
-            table_manifest = self.table_registry.manifest_for_llm()
+            # 修复只能使用本次请求的可见 schema，避免让模型从 173 张表中猜表名。
+            table_manifest = (visible_catalog or {}).get("tables") or self.table_registry.manifest_for_llm()
             table_info = "\n".join([
-                f"- {t['name']}: {', '.join(t['columns'][:5])}..."
-                for t in table_manifest[:10]
+                f"- {t['name']}: {', '.join(column['name'] if isinstance(column, dict) else str(column) for column in t['columns'])}"
+                for t in table_manifest
             ])
 
             prompt = f"""用户想要查询: {user_goal}
@@ -1014,7 +996,7 @@ class FinanceAgentRuntime:
 
 请根据错误信息修复 SQL。要求：
 1. 只返回修复后的 SQL，不要其他文字
-2. 确保表名和字段名正确（参考下方表结构）
+2. 只能使用下方列出的表名和字段名；不得猜测替代表或字段
 3. 使用 PostgreSQL 语法
 4. 如果需要多表查询，使用 JOIN
 
@@ -1061,7 +1043,7 @@ class FinanceAgentRuntime:
         card = cards[0]
 
         # 获取之前的查询记录（从文件型 memory）
-        prior_queries = self.memory_store.get_recent_queries(limit=3)
+        prior_queries = self.memory_store.get_recent_queries(limit=3, session_id=state["session_id"])
 
         context = (
             render_method_set_review_data(plan, methods, cards, self.handler_registry)
@@ -1142,7 +1124,7 @@ class FinanceAgentRuntime:
             }
 
         # Look up all prior results from private store
-        records = self.private_result_store.latest(limit=50)
+        records = self.private_result_store.latest(limit=50, session_id=state["session_id"])
         found_records = []
         for ref in result_refs:
             record = next((r for r in records if r.result_ref == ref), None)
@@ -1256,6 +1238,7 @@ class FinanceAgentRuntime:
 
         private_record = self.private_result_store.append(
             request_id=state["request_id"],
+            session_id=state["session_id"],
             method_name=method.name,
             method_hash=card.method_hash,
             authorization_hash=stable_hash(authorization.model_dump(mode="json")),
@@ -1270,6 +1253,7 @@ class FinanceAgentRuntime:
         public_memory = self.public_memory_store.append(
             build_public_memory_entry(
                 request_id=state["request_id"],
+                session_id=state["session_id"],
                 method=method,
                 execution_card=card,
                 private_record=private_record,

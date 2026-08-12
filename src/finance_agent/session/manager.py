@@ -65,12 +65,22 @@ class SessionManager:
                     "title": data.get("title", ""),
                     "created_at": data.get("created_at", ""),
                     "updated_at": data.get("updated_at", ""),
+                    "pinned": bool(data.get("metadata", {}).get("pinned", False)),
                     "message_count": len(data.get("conversation_history", [])),
                 })
             except Exception:
                 continue
         # 文件名是随机 UUID，不能代表对话的新旧；按最近更新时间展示。
-        return sorted(sessions, key=lambda session: session["updated_at"], reverse=True)
+        return sorted(sessions, key=lambda session: (session["pinned"], session["updated_at"]), reverse=True)
+
+    def set_session_pinned(self, session_id: str, pinned: bool) -> dict[str, Any] | None:
+        """设置会话是否置顶，不改变对话内容。"""
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return None
+        metadata = dict(session_data.get("metadata") or {})
+        metadata["pinned"] = pinned
+        return self.update_session(session_id, {"metadata": metadata})
 
     def update_session(self, session_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
         """更新 session 数据。"""

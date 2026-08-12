@@ -12,6 +12,7 @@ class AgentState(MessagesState):
     # 只需要添加自定义字段
 
     request_id: str
+    session_id: str
     user_query: str
     status: str
     errors: list[str]

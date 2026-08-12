@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import sys
 from pathlib import Path
@@ -201,6 +202,20 @@ COLUMN_RE = re.compile(
     r'@Column\(\s*\{([^}]+)\}\s*\)\s*\n\s*(\w+)[\?:]',
     re.MULTILINE,
 )
+# TypeORM 的审计字段不是普通的 ``@Column``。这些字段经常定义在
+# ``Base`` 基类中；如果不显式识别它们，所有继承该基类的表都会缺少
+# created_at / update_at 等真实列。
+AUDIT_COLUMN_RE = re.compile(
+    r'@(?P<decorator>CreateDateColumn|UpdateDateColumn|DeleteDateColumn)'
+    r'\(\s*(?:\{(?P<options>[^}]*)\})?\s*\)\s*\n\s*'
+    r'(?P<field>\w+)[\?:]',
+    re.MULTILINE,
+)
+VERSION_COLUMN_RE = re.compile(
+    r'@VersionColumn\(\s*(?:\{(?P<options>[^}]*)\})?\s*\)\s*\n\s*'
+    r'(?P<field>\w+)[\?:]',
+    re.MULTILINE,
+)
 PRIMARY_COLUMN_RE = re.compile(
     r'@PrimaryColumn\(\s*(?:\{([^}]*)\})?\s*\)\s*\n\s*(\w+)[\?:]',
     re.MULTILINE,
@@ -226,21 +241,10 @@ def _extract_columns_from_content(content: str, class_name: str | None = None) -
 
     # 如果指定了类名，只提取该类的作用域
     if class_name:
-        # 找到类的起始位置
-        class_pattern = re.compile(rf'export class {class_name}\b', re.IGNORECASE)
-        class_match = class_pattern.search(content)
-        if not class_match:
+        class_content = _class_block(content, class_name)
+        if class_content is None:
             return columns
-
-        # 找到类的结束位置（下一个 export class 或文件结尾）
-        next_class_pattern = re.compile(r'export class \w+', re.IGNORECASE)
-        start_pos = class_match.start()
-        end_pos = len(content)
-        for next_match in next_class_pattern.finditer(content[class_match.end():]):
-            end_pos = class_match.end() + next_match.start()
-            break
-
-        content = content[start_pos:end_pos]
+        content = class_content
 
     # 先提取主键（PrimaryGeneratedColumn）
     for col_match in PRIMARY_GENERATED_COLUMN_RE.finditer(content):
@@ -323,36 +327,119 @@ def _extract_columns_from_content(content: str, class_name: str | None = None) -
             'description': description,
         })
 
+    # 提取审计字段。它们使用 CreateDateColumn 等专用装饰器，不能被
+    # COLUMN_RE 捕获；默认类型是 timestamptz。
+    for col_match in AUDIT_COLUMN_RE.finditer(content):
+        field_name = col_match.group('field')
+        if field_name in seen_fields:
+            continue
+        col_body = col_match.group('options') or ''
+        type_match = TYPE_RE.search(col_body)
+        comment_match = COMMENT_RE.search(col_body)
+        nullable_match = NULLABLE_RE.search(col_body)
+        columns.append({
+            'name': field_name,
+            'type': _map_typeorm_type(type_match.group(1)) if type_match else 'timestamptz',
+            'nullable': nullable_match.group(1) == 'true' if nullable_match else True,
+            'description': comment_match.group(1) if comment_match else '',
+        })
+        seen_fields.add(field_name)
+
+    # VersionColumn 同样是专用装饰器；没有显式 type 时按 TypeORM 默认
+    # 的整型版本列处理。
+    for col_match in VERSION_COLUMN_RE.finditer(content):
+        field_name = col_match.group('field')
+        if field_name in seen_fields:
+            continue
+        col_body = col_match.group('options') or ''
+        type_match = TYPE_RE.search(col_body)
+        columns.append({
+            'name': field_name,
+            'type': _map_typeorm_type(type_match.group(1)) if type_match else 'integer',
+            'nullable': False,
+            'description': '',
+        })
+        seen_fields.add(field_name)
+
     return columns
 
 
-def _resolve_inherited_columns(filepath: Path, content: str) -> list[dict[str, Any]]:
-    """解析继承的基类，提取列定义。"""
-    columns = []
+def _class_block(content: str, class_name: str) -> str | None:
+    """返回目标类的源码块，避免把同一文件中另一个类的继承关系混入。"""
+    class_pattern = re.compile(
+        rf'export\s+(?:abstract\s+)?class\s+{re.escape(class_name)}\b',
+        re.IGNORECASE,
+    )
+    class_match = class_pattern.search(content)
+    if not class_match:
+        return None
 
-    # 查找 extends 基类
-    extends_match = re.search(r'export class \w+ extends (\w+)', content)
-    if not extends_match:
-        return columns
+    next_class_pattern = re.compile(r'export\s+(?:abstract\s+)?class\s+\w+', re.IGNORECASE)
+    end_pos = len(content)
+    next_match = next_class_pattern.search(content, class_match.end())
+    if next_match:
+        end_pos = next_match.start()
+    return content[class_match.start():end_pos]
 
-    base_class_name = extends_match.group(1)
 
-    # 在同目录和父目录中查找基类文件
-    search_dirs = [filepath.parent, filepath.parent.parent, filepath.parent.parent / 'base']
+def _base_class_name(content: str, class_name: str) -> str | None:
+    """只读取指定类的 extends，而不是文件中的第一个 class。"""
+    class_pattern = re.compile(
+        rf'export\s+(?:abstract\s+)?class\s+{re.escape(class_name)}\s+extends\s+(\w+)',
+        re.IGNORECASE,
+    )
+    match = class_pattern.search(content)
+    return match.group(1) if match else None
+
+
+def _find_class_file(filepath: Path, class_name: str) -> Path | None:
+    """在上游 repository 的相邻目录中定位基类定义。"""
+    search_dirs = [filepath.parent, filepath.parent.parent, filepath.parent.parent / "base"]
+    checked: set[Path] = set()
     for search_dir in search_dirs:
         if not search_dir.exists():
             continue
-        for ts_file in search_dir.glob('*.ts'):
-            if ts_file == filepath:
+        for ts_file in search_dir.rglob("*.ts"):
+            # 多层基类（Base / TrxBase / TrxBaseV2）会定义在同一个文件。
+            # 不能仅因文件相同而跳过，循环由 seen_classes 按“文件+类名”阻断。
+            if ts_file in checked:
                 continue
-            base_content = ts_file.read_text()
-            # 查找基类定义
-            if re.search(rf'export class {base_class_name}\b', base_content):
-                # 只提取目标基类的列，不是整个文件的列
-                columns.extend(_extract_columns_from_content(base_content, base_class_name))
-                # 递归查找更上层的基类
-                columns.extend(_resolve_inherited_columns(ts_file, base_content))
-                break
+            checked.add(ts_file)
+            try:
+                candidate = ts_file.read_text()
+            except UnicodeDecodeError:
+                continue
+            if re.search(rf'export\s+(?:abstract\s+)?class\s+{re.escape(class_name)}\b', candidate):
+                return ts_file
+    return None
+
+
+def _resolve_inherited_columns(
+    filepath: Path,
+    content: str,
+    class_name: str,
+    seen_classes: set[tuple[Path, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """递归解析指定实体的继承链，并保留 TypeORM 基类列。"""
+    columns = []
+    seen_classes = seen_classes or set()
+    identity = (filepath.resolve(), class_name)
+    if identity in seen_classes:
+        return columns
+    seen_classes.add(identity)
+
+    base_class_name = _base_class_name(content, class_name)
+    if not base_class_name:
+        return columns
+
+    base_file = _find_class_file(filepath, base_class_name)
+    if not base_file:
+        return columns
+
+    base_content = base_file.read_text()
+    # 基类自身的字段优先于其父类；最终由调用方用实体本身字段覆盖。
+    columns.extend(_extract_columns_from_content(base_content, base_class_name))
+    columns.extend(_resolve_inherited_columns(base_file, base_content, base_class_name, seen_classes))
 
     return columns
 
@@ -415,9 +502,19 @@ def parse_typeorm_entity(filepath: Path) -> dict[str, Any] | None:
         if single_line_match:
             table_comment = single_line_match.group(1).strip()
 
-    # 提取列（包括继承的基类）
-    columns = _extract_columns_from_content(content)
-    inherited_columns = _resolve_inherited_columns(filepath, content)
+    # 提取列（包括继承的基类）。必须把当前实体类名传给继承解析，
+    # 否则一个文件存在多个 class 时会误从第一个 class 开始找 extends。
+    entity_pos = content.find('@Entity')
+    entity_class_match = re.search(
+        r'export\s+(?:abstract\s+)?class\s+(\w+)',
+        content[entity_pos:] if entity_pos >= 0 else content,
+    )
+    entity_class_name = entity_class_match.group(1) if entity_class_match else None
+    columns = _extract_columns_from_content(content, entity_class_name)
+    inherited_columns = (
+        _resolve_inherited_columns(filepath, content, entity_class_name)
+        if entity_class_name else []
+    )
 
     # 合并继承的列（当前类的列优先）
     seen_fields = {col['name'] for col in columns}
@@ -537,12 +634,56 @@ PYTHON_RESERVED = {'type', 'class', 'return', 'import', 'from', 'if', 'else', 'f
 RENAME_MAP = {'type': 'type_field', 'col_type': 'col_type_field'}
 
 
+def _existing_business_metadata(output_path: Path) -> tuple[str, dict[str, str]]:
+    """读取上一份快照中的人工/LLM 业务说明。
+
+    ORM 是字段结构的事实源，但表级业务说明并不一定在 ORM 中。Schema
+    同步时若直接覆盖生成文件，会把这层补充知识清空，所以只有在上游
+    没有提供描述时才沿用已有描述。
+    """
+    if not output_path.exists():
+        return "", {}
+
+    content = output_path.read_text()
+    table_match = re.search(r'@register_table\(name="[^"]+", description="([^"]*)"\)', content)
+    table_description = table_match.group(1) if table_match else ""
+
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return table_description, {}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for statement in node.body:
+            if not (
+                isinstance(statement, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "COLUMNS" for target in statement.targets)
+            ):
+                continue
+            try:
+                raw_columns = ast.literal_eval(statement.value)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(raw_columns, dict):
+                continue
+            return table_description, {
+                name: meta.get("description", "")
+                for name, meta in raw_columns.items()
+                if isinstance(name, str) and isinstance(meta, dict) and meta.get("description")
+            }
+    return table_description, {}
+
+
 def generate_python_file(table_name: str, columns: list[dict], output_dir: Path, table_comment: str = '') -> Path:
     """生成 Python 注册文件。"""
     class_name = ''.join(word.capitalize() for word in table_name.split('_'))
+    output_path = output_dir / f"{table_name}.py"
+    existing_table_description, existing_column_descriptions = _existing_business_metadata(output_path)
 
-    # 处理表注释
-    description = table_comment.replace('"', '\\"') if table_comment else ''
+    # 上游 ORM/DDL 的 comment 优先；没有时严格保留本地 LLM/人工补充。
+    description = (table_comment or existing_table_description).replace('"', '\\"')
 
     lines = [
         f'"""自动提取的 {table_name} 表 schema。"""',
@@ -561,7 +702,7 @@ def generate_python_file(table_name: str, columns: list[dict], output_dir: Path,
             col_name = col['name']
             col_type = col['type']
             nullable = col['nullable']
-            desc = col.get('description', '').replace('"', '\\"')
+            desc = (col.get('description') or existing_column_descriptions.get(col_name, '')).replace('"', '\\"')
 
             meta_parts = [f'"type": "{col_type}"']
             if not nullable:
@@ -574,7 +715,6 @@ def generate_python_file(table_name: str, columns: list[dict], output_dir: Path,
         lines.append("    }")
 
     lines.append("")
-    output_path = output_dir / f"{table_name}.py"
     output_path.write_text('\n'.join(lines))
     return output_path
 
@@ -602,7 +742,7 @@ def main():
     if args.output:
         output_dir = Path(args.output)
     else:
-        output_dir = Path(__file__).parent.parent / 'src' / 'finance_agent' / 'metadata' / 'tables'
+        output_dir = Path(__file__).parent.parent / 'schema_catalog' / 'tables'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 指定表过滤
