@@ -15,7 +15,7 @@ from finance_agent.graph.runtime import FinanceAgentRuntime
 
 class RunRequest(BaseModel):
     question: str
-    thread_id: str | None = None  # 用于对话历史持久化
+    session_id: str | None = None  # 用于 session 管理
 
 
 class RunResponse(BaseModel):
@@ -143,6 +143,11 @@ CHAT_HTML = """<!doctype html>
       <div class="header">
         <div class="status" id="status"></div>
         <h1>Finance Agent</h1>
+        <select id="sessionSelect" style="margin-left: 12px; padding: 4px 8px; font-size: 12px; border: 1px solid #ddd; border-radius: 4px; max-width: 200px;" onchange="switchSession(this.value)">
+          <option value="">选择会话...</option>
+        </select>
+        <button onclick="createNewSession()" style="margin-left: 8px; padding: 4px 12px; font-size: 12px; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor:pointer;">新建会话</button>
+        <button onclick="deleteCurrentSession()" style="margin-left: 4px; padding: 4px 12px; font-size: 12px; background: #ef4444; color: white; border: none; border-radius: 4px; cursor:pointer;">删除会话</button>
         <button onclick="clearMemory()" style="margin-left:auto;padding:4px 12px;font-size:12px;background:#f5f5f5;border:1px solid #ddd;border-radius:4px;cursor:pointer;">清空记忆</button>
       </div>
       <div class="messages" id="messages">
@@ -172,15 +177,93 @@ CHAT_HTML = """<!doctype html>
     var submitBtn = document.getElementById("submit");
     var statusEl = document.getElementById("status");
     var debugContent = document.getElementById("debugContent");
+    var sessionSelect = document.getElementById("sessionSelect");
     var currentRequestId = null;
+    var currentSessionId = null;
     var pendingActions = {};  // request_id -> {approve: fn, cancel: fn}
 
-    // 生成或获取 thread_id（用于对话历史持久化）
-    var threadId = localStorage.getItem("thread_id");
-    if (!threadId) {
-      threadId = "thread_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
-      localStorage.setItem("thread_id", threadId);
+    // Session 管理函数
+    async function loadSessions() {
+      try {
+        var response = await fetch("/v1/sessions");
+        var sessions = await response.json();
+        sessionSelect.innerHTML = '<option value="">选择会话...</option>';
+        sessions.forEach(function(session) {
+          var option = document.createElement("option");
+          option.value = session.session_id;
+          option.textContent = session.title + " (" + session.message_count + " 条消息)";
+          if (session.session_id === currentSessionId) {
+            option.selected = true;
+          }
+          sessionSelect.appendChild(option);
+        });
+      } catch (e) {
+        console.error("加载会话列表失败:", e);
+      }
     }
+
+    async function createNewSession() {
+      try {
+        var response = await fetch("/v1/sessions", { method: "POST" });
+        var session = await response.json();
+        currentSessionId = session.session_id;
+        await loadSessions();
+        clearMessages();
+        addDebugEntry("✅ 新会话", "已创建: " + session.session_id, "success");
+      } catch (e) {
+        console.error("创建会话失败:", e);
+      }
+    }
+
+    async function switchSession(sessionId) {
+      if (!sessionId) return;
+      currentSessionId = sessionId;
+      clearMessages();
+      // 加载会话历史
+      try {
+        var response = await fetch("/v1/sessions/" + sessionId + "/history");
+        var data = await response.json();
+        data.history.forEach(function(msg) {
+          addMsg(msg.role === "user" ? "user" : "bot", escapeHtml(msg.content));
+        });
+        addDebugEntry("✅ 切换会话", "已切换到: " + sessionId, "success");
+      } catch (e) {
+        console.error("加载会话历史失败:", e);
+      }
+    }
+
+    async function deleteCurrentSession() {
+      if (!currentSessionId) {
+        alert("请先选择一个会话");
+        return;
+      }
+      if (!confirm("确定要删除这个会话吗？")) return;
+      try {
+        await fetch("/v1/sessions/" + currentSessionId, { method: "DELETE" });
+        currentSessionId = null;
+        await loadSessions();
+        clearMessages();
+        addDebugEntry("✅ 删除会话", "会话已删除", "success");
+      } catch (e) {
+        console.error("删除会话失败:", e);
+      }
+    }
+
+    function clearMessages() {
+      messagesEl.innerHTML = '<div class="empty" id="empty">输入问题开始分析<br>例如：统计每个交易状态有多少笔</div>';
+      emptyEl = document.getElementById("empty");
+    }
+
+    // 初始化：加载会话列表，如果没有会话则创建一个
+    loadSessions().then(function() {
+      if (sessionSelect.options.length <= 1) {
+        createNewSession();
+      } else {
+        // 选择第一个会话
+        currentSessionId = sessionSelect.options[1].value;
+        switchSession(currentSessionId);
+      }
+    });
 
     // 调试看板函数
     function addDebugEntry(label, content, type) {
@@ -303,6 +386,12 @@ CHAT_HTML = """<!doctype html>
     async function submit() {
       var text = inputEl.value.trim();
       if (!text) return;
+
+      // 如果没有当前会话，创建一个
+      if (!currentSessionId) {
+        await createNewSession();
+      }
+
       addMsg("user", escapeHtml(text));
       inputEl.value = "";
       setLoading(true);
@@ -314,7 +403,7 @@ CHAT_HTML = """<!doctype html>
 
       try {
         // 使用 SSE 接收实时事件（GET 请求）
-        var eventSource = new EventSource("/v1/runs/stream?question=" + encodeURIComponent(text) + "&thread_id=" + encodeURIComponent(threadId));
+        var eventSource = new EventSource("/v1/runs/stream?question=" + encodeURIComponent(text) + "&session_id=" + encodeURIComponent(currentSessionId));
 
         eventSource.onmessage = function(event) {
           var data = JSON.parse(event.data);
@@ -478,7 +567,7 @@ CHAT_HTML = """<!doctype html>
 
 @app.get("/", response_class=HTMLResponse)
 def chat_page() -> str:
-    return CHAT_HTML
+    return (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
 
 
 @app.get("/health")
@@ -489,7 +578,7 @@ def health() -> dict[str, Any]:
 @app.post("/v1/runs", response_model=RunResponse)
 async def create_run(request: RunRequest) -> RunResponse:
     # 不再清除 pending runs，让每个请求独立管理自己的生命周期
-    state = await runtime().invoke(request.question, thread_id=request.thread_id)
+    state = await runtime().invoke(request.question, session_id=request.session_id)
     request_id = state.get("request_id", "")
     if state.get("status") in {"analysis_plan_review_ready", "method_review_ready", "data_authorization_pending", "prior_result_authorization_pending"} and request_id:
         PENDING_RUNS[request_id] = dict(state)
@@ -497,7 +586,7 @@ async def create_run(request: RunRequest) -> RunResponse:
 
 
 @app.get("/v1/runs/stream")
-async def create_run_stream(question: str, thread_id: str | None = None):
+async def create_run_stream(question: str, session_id: str | None = None):
     """SSE 端点：实时推送 LLM 处理过程。"""
     async def event_generator():
         try:
@@ -505,7 +594,7 @@ async def create_run_stream(question: str, thread_id: str | None = None):
             yield f"data: {json.dumps({'type': 'start', 'message': '开始处理请求...'})}\n\n"
 
             # 调用 runtime
-            state = await runtime().invoke(question, thread_id=thread_id)
+            state = await runtime().invoke(question, session_id=session_id)
 
             # 发送 Response Plan
             if state.get("response_plan"):
@@ -531,13 +620,12 @@ async def create_run_stream(question: str, thread_id: str | None = None):
             response = _response_from_state(state)
             yield f"data: {json.dumps({'type': 'complete', 'data': response.model_dump()})}\n\n"
 
-            # 保存 pending run（使用 thread_id 作为 key，这样同一个用户的连续查询会更新同一个 state）
+            # 保存 pending run，并按 session 缓存最新的待确认状态。
             request_id = state.get("request_id", "")
             if state.get("status") in {"analysis_plan_review_ready", "method_review_ready", "data_authorization_pending", "prior_result_authorization_pending"} and request_id:
                 PENDING_RUNS[request_id] = dict(state)
-                # 同时保存到 thread_id，这样后续查询可以找到之前的 state
-                if thread_id:
-                    PENDING_RUNS[thread_id] = dict(state)
+                if session_id:
+                    PENDING_RUNS[session_id] = dict(state)
 
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -568,11 +656,10 @@ async def approve_analysis_plan(request_id: str) -> RunResponse:
 
 @app.post("/v1/runs/{request_id}/method-review/approve", response_model=RunResponse)
 async def approve_method_review(request_id: str) -> RunResponse:
-    # 先尝试用 request_id 获取，如果没有则尝试用 thread_id 获取
+    # 优先使用 request_id；兼容旧版 thread_ 缓存键。
     state = PENDING_RUNS.get(request_id)
     if state is None:
-        # 尝试用 thread_id 获取（处理连续查询的情况）
-        # 从 request_id 中提取 thread_id（如果有的话）
+        # 兼容旧版 thread_ 缓存键。
         for key, value in PENDING_RUNS.items():
             if key.startswith("thread_") and value.get("request_id") == request_id:
                 state = value
@@ -624,6 +711,74 @@ async def clear_public_memory():
     if memory_path.exists():
         memory_path.write_text("")
     return {"status": "ok", "message": "公共记忆已清空"}
+
+
+# ---------------------------------------------------------------------------
+# Session 管理接口
+# ---------------------------------------------------------------------------
+
+
+class SessionCreateRequest(BaseModel):
+    title: str | None = None
+
+
+class SessionResponse(BaseModel):
+    session_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    message_count: int = 0
+
+
+@app.get("/v1/sessions", response_model=list[SessionResponse])
+async def list_sessions():
+    """列出所有 session。"""
+    return runtime().session_manager.list_sessions()
+
+
+@app.post("/v1/sessions", response_model=SessionResponse)
+async def create_session(request: SessionCreateRequest | None = None):
+    """创建新的 session。"""
+    title = request.title if request else None
+    session = runtime().session_manager.create_session(title)
+    return SessionResponse(
+        session_id=session["session_id"],
+        title=session["title"],
+        created_at=session["created_at"],
+        updated_at=session["updated_at"],
+        message_count=len(session.get("conversation_history", [])),
+    )
+
+
+@app.get("/v1/sessions/{session_id}", response_model=SessionResponse)
+async def get_session(session_id: str):
+    """获取 session 详情。"""
+    session = runtime().session_manager.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return SessionResponse(
+        session_id=session["session_id"],
+        title=session["title"],
+        created_at=session["created_at"],
+        updated_at=session["updated_at"],
+        message_count=len(session.get("conversation_history", [])),
+    )
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """删除 session。"""
+    deleted = runtime().session_manager.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"status": "ok", "message": "Session deleted"}
+
+
+@app.get("/v1/sessions/{session_id}/history")
+async def get_session_history(session_id: str, limit: int | None = None):
+    """获取 session 的对话历史。"""
+    history = runtime().session_manager.get_conversation_history(session_id, limit)
+    return {"session_id": session_id, "history": history}
 
 
 def _response_from_state(state: dict[str, Any]) -> RunResponse:

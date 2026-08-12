@@ -83,7 +83,7 @@ def _dependent_sql(operation: str, column_names: list[str]) -> str:
 
     if operation == "trend":
         time_field = next((col for col in column_names if "date" in col or "time" in col or "at" in col), column_names[0])
-        return f"SELECT substr({time_field}, 1, 7) AS bucket, SUM(COALESCE({metric or column_names[0]}, 0)) AS total_value FROM prior_result GROUP BY bucket ORDER BY bucket ASC"
+        return f"SELECT DATE_TRUNC('month', {time_field}) AS bucket, SUM(COALESCE({metric or column_names[0]}, 0)) AS total_value FROM prior_result GROUP BY bucket ORDER BY bucket ASC"
 
     if operation == "variance":
         m = metric or column_names[0]
@@ -164,7 +164,7 @@ def _fallback_sql(step: AnalysisStep) -> str:
         metric = step.metric or "total_amount"
         time_field = step.time_field or "transaction_at"
         grain = step.grain or "month"
-        bucket = f"substr({time_field}, 1, 7)" if grain == "month" else f"substr({time_field}, 1, 10)"
+        bucket = f"DATE_TRUNC('month', {time_field})" if grain == "month" else f"DATE_TRUNC('day', {time_field})"
         return f"SELECT {bucket} AS bucket, SUM(COALESCE({metric}, 0)) AS {metric} FROM {table} GROUP BY bucket ORDER BY bucket ASC"
 
     if operation == "variance":
@@ -179,27 +179,41 @@ def _fallback_sql(step: AnalysisStep) -> str:
 
 
 def _extract_fields_from_sql(sql: str, table: str) -> list[str]:
-    """从 SQL 中提取 table.field 格式的字段引用（粗略提取）。"""
+    """从 SELECT 表达式中提取字段引用，避免把函数片段误认为字段。"""
     patterns = re.findall(r"(?:FROM|JOIN)\s+(\w+)", sql, re.IGNORECASE)
     detected_table = patterns[0] if patterns else table
     select_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql, re.IGNORECASE | re.DOTALL)
     if not select_match:
         return []
-    fields = []
-    # 聚合函数和表达式模式，需要跳过
-    agg_pattern = re.compile(r"(?i)^(COUNT|SUM|AVG|MIN|MAX|COALESCE|CASE|WHEN|THEN|ELSE|END|substr)\s*\(|^\*|^\(|^\d")
-    for part in select_match.group(1).split(","):
-        part = part.strip()
-        # 去掉 AS 别名
-        part = re.sub(r"\s+AS\s+\w+", "", part, flags=re.IGNORECASE).strip()
-        # 跳过聚合函数、表达式、字面量
-        if agg_pattern.match(part):
-            continue
-        if "." in part:
-            fields.append(part)
-        elif part and not part.startswith("*") and not part.startswith("("):
-            fields.append(f"{detected_table}.{part}")
-    return fields
+    select_sql = select_match.group(1)
+    fields: list[str] = []
+
+    def add(reference: str) -> None:
+        reference = reference.strip()
+        if not reference or reference == "*":
+            return
+        fields.append(reference if "." in reference else f"{detected_table}.{reference}")
+
+    # 直接选择的字段，例如 SELECT status, card_channel ...
+    direct_pattern = r"(?:^|,)\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*(?:AS\s+\w+)?\s*(?=,|$)"
+    for match in re.finditer(direct_pattern, select_sql, re.IGNORECASE):
+        add(match.group(1))
+
+    # 聚合函数及日期分桶中的参数仍是实际读取字段。
+    for match in re.finditer(
+        r"(?:SUM|AVG|MIN|MAX)\s*\(\s*(?:COALESCE\s*\(\s*)?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+        select_sql,
+        re.IGNORECASE,
+    ):
+        add(match.group(1))
+    for match in re.finditer(
+        r"DATE_TRUNC\s*\(\s*'[^']+'\s*,\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+        select_sql,
+        re.IGNORECASE,
+    ):
+        add(match.group(1))
+
+    return list(dict.fromkeys(fields))
 
 
 def _extract_fields_from_code(code: str) -> list[str]:

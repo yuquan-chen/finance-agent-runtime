@@ -198,8 +198,14 @@ def build_context_block(
     business_term_manifest: list[dict[str, Any]] | None = None,
     table_summary: list[dict[str, Any]] | None = None,
     relevant_memories: list[dict[str, Any]] | None = None,
+    table_detail_level: str = "full",  # "summary" | "full"
 ) -> str:
-    """构建纯数据 context。指导语全在 INSTRUCTIONS，这里只放索引数据。"""
+    """构建纯数据 context。指导语全在 INSTRUCTIONS，这里只放索引数据。
+
+    table_detail_level:
+        - "summary": 只发送表名和描述（用于路由，~5K tokens）
+        - "full": 发送完整的列信息（用于生成 SQL，~39K tokens）
+    """
     context: dict[str, Any] = {}
 
     # 能力索引：只暴露 name + description
@@ -224,9 +230,17 @@ def build_context_block(
     if business_term_manifest:
         context["business_terms"] = business_term_manifest
 
-    # 表信息：name + description + columns + relationships
+    # 表信息：根据 detail_level 控制详细程度
     if table_summary:
-        context["table_manifest"] = table_summary
+        if table_detail_level == "summary":
+            # 第一层：只发送表名和描述（用于路由）
+            context["table_manifest"] = [
+                {"name": t["name"], "description": t.get("description", "")}
+                for t in table_summary
+            ]
+        else:
+            # 第二层：发送完整的列信息（用于生成 SQL）
+            context["table_manifest"] = table_summary
 
     # 先前结果索引：只暴露结构信息
     if prior_results:
@@ -265,6 +279,7 @@ def plan_response_with_llm_and_registry(
     table_manifest: list[dict[str, Any]] | None = None,
     relevant_memories: list[dict[str, Any]] | None = None,
     conversation_messages: list[dict[str, Any]] | None = None,
+    table_detail_level: str = "summary",  # "summary" | "full"
 ) -> ResponsePlan:
     safety = hard_safety_plan(message)
     if safety:
@@ -284,6 +299,7 @@ def plan_response_with_llm_and_registry(
         business_term_manifest=business_term_registry.manifest_for_llm() if business_term_registry else None,
         table_summary=table_manifest,
         relevant_memories=relevant_memories,
+        table_detail_level=table_detail_level,
     )
 
     # 构建 messages，包含对话历史

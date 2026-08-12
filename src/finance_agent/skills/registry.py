@@ -70,7 +70,7 @@ class SkillSpec(BaseModel):
             "clarification_policy": self.clarification_policy,
             "risk_notes": self.risk_notes,
             "data_access": "metadata_only_until_user_authorization",
-            "authorization_policy": "method_review_then_data_authorization",
+            "authorization_policy": "method_review_then_execute",
         }
 
 

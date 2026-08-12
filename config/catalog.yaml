@@ -1,5 +1,5 @@
 version: "2026-07-24"
-description: "Initial hand-written metadata catalog. LLM sees this metadata only; it never sees real rows."
+description: "Legacy/test catalog. Runtime table schema is sourced from the Python TableRegistry; this file provides business terms and compatibility fixtures."
 tables:
   - name: card_transaction
     description: "Card transaction ledger. Stores card-related transfers, purchases, refunds, fees, and reversals."

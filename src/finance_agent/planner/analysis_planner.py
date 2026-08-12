@@ -75,7 +75,7 @@ SYSTEM_PROMPT = """# 角色
   "mode": "analysis_plan",
   "goal": "业务健康度分析",
   "steps": [
-    {"operation": "trend", "table": "card_transaction", "metric": "total_amount", "time_field": "transaction_at", "grain": "month", "sql": "SELECT substr(transaction_at,1,7) AS month, SUM(total_amount) FROM card_transaction GROUP BY month ORDER BY month", "rationale": "观察金额月度趋势"},
+    {"operation": "trend", "table": "card_transaction", "metric": "total_amount", "time_field": "transaction_at", "grain": "month", "sql": "SELECT DATE_TRUNC('month', transaction_at) AS month, SUM(total_amount) FROM card_transaction GROUP BY month ORDER BY month", "rationale": "观察金额月度趋势"},
     {"operation": "status_distribution", "table": "card_transaction", "dimension": "status", "sql": "SELECT status, COUNT(*) FROM card_transaction GROUP BY status", "rationale": "观察状态分布"}
   ],
   "required_metadata": ["card_transaction.total_amount", "card_transaction.transaction_at", "card_transaction.status"]
@@ -225,7 +225,7 @@ def plan_analysis_with_rules(query: str, visible_catalog: Catalog) -> AnalysisPl
                     time_field="transaction_at",
                     grain="month",
                     rationale="观察金额随时间的趋势。",
-                    sql=f"SELECT substr(transaction_at, 1, 7) AS bucket, SUM(COALESCE(total_amount, 0)) AS total_amount FROM {table} GROUP BY bucket ORDER BY bucket ASC",
+                    sql=f"SELECT DATE_TRUNC('month', transaction_at) AS bucket, SUM(COALESCE(total_amount, 0)) AS total_amount FROM {table} GROUP BY bucket ORDER BY bucket ASC",
                 ),
                 AnalysisStep(
                     operation="status_distribution",

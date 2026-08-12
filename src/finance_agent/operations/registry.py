@@ -61,7 +61,7 @@ class OperationSpec(BaseModel):
             "risk_level": self.risk_level,
             "requires_method_review": self.requires_method_review,
             "data_access": "metadata_only_until_user_authorization",
-            "authorization_policy": "method_review_then_data_authorization",
+            "authorization_policy": "method_review_then_execute",
         }
 
 

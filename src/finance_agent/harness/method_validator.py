@@ -90,7 +90,12 @@ def validate_method_draft(
             except Exception as exc:
                 errors.append(f"sql validation failed: {type(exc).__name__}: {exc}")
             # 检查 SQL 语义合理性
-            sql_errors = _validate_sql_semantics(method.sql_template, visible_catalog, table_registry)
+            sql_errors = _validate_sql_semantics(
+                method.sql_template,
+                visible_catalog,
+                table_registry,
+                allow_prior_result=method.data_source == "result_ref",
+            )
             errors.extend(sql_errors)
     elif method.method_type == "code":
         if not method.code:
@@ -116,7 +121,13 @@ STATUS_FIELDS = {
 NUMERIC_AGGREGATE_FUNCTIONS = {"SUM", "AVG", "COUNT", "MIN", "MAX"}
 
 
-def _validate_sql_semantics(sql: str, visible_catalog: Catalog, table_registry=None) -> list[str]:
+def _validate_sql_semantics(
+    sql: str,
+    visible_catalog: Catalog,
+    table_registry=None,
+    *,
+    allow_prior_result: bool = False,
+) -> list[str]:
     """检查 SQL 语义是否合理。
 
     主要检查：
@@ -151,7 +162,9 @@ def _validate_sql_semantics(sql: str, visible_catalog: Catalog, table_registry=N
             known_tables.update(n.lower() for n in table_registry.names())
 
         # 常见的错误表名
-        invalid_tables = {"prior_result", "customers", "users", "client", "customer"}
+        invalid_tables = {"customers", "users", "client", "customer"}
+        if not allow_prior_result:
+            invalid_tables.add("prior_result")
         if table_name in invalid_tables:
             errors.append(
                 f"SQL 表名错误：'{table_name}' 表不存在。"

@@ -17,7 +17,7 @@
 | LLM | DeepSeek API / LM Studio（OpenAI-compatible） |
 | 数据库 | PostgreSQL（只读账号） |
 | 结构化输出 | Pydantic |
-| 配置 | YAML（catalog / operations / skills / policy） |
+| 配置 | Python `TableRegistry`（schema）+ YAML（业务词典 / operations / skills / policy） |
 | 记忆 | 文件型 Markdown（用户意图 + 结果摘要） |
 | 审计 | JSONL 日志 |
 
@@ -202,8 +202,9 @@ src/finance_agent/
     handlers/                  内置操作（top_n, distribution, trend...）
   skills/registry.py           技能注册表
   metadata/
-    catalog.py                 元数据目录
-    table_registry.py          表结构注册（从 TypeORM 提取）
+    catalog.py                 Catalog 数据模型与兼容性 YAML 读取
+    table_registry.py          运行时表结构注册表
+    tables/                    上游项目 schema 提取的 173 张表元数据
     business_registry.py       业务词典
   methods/generator.py         Method Draft 生成
   sandbox/
@@ -224,18 +225,24 @@ src/finance_agent/
 
 | 文件 | 用途 |
 |------|------|
-| `config/catalog.yaml` | 数据库元数据（表、字段、描述） |
+| `config/catalog.yaml` | 业务词典与兼容性/测试 catalog；不是运行时完整 schema 的事实源 |
 | `config/operations.yaml` | 通用操作定义 |
 | `config/skills.yaml` | 技能定义 |
 | `config/policy.yaml` | 安全策略 |
 | `.env` | 环境变量（LLM、数据库连接） |
+
+### Schema 元数据来源
+
+运行时的完整 schema 来自 `src/finance_agent/metadata/tables/` 中的 Python 表元数据：这些文件由上游业务项目的数据库 schema / ORM 定义提取并版本化，目前覆盖约 173 张表。`TableRegistry` 自动发现这些定义，构建全局 Catalog；系统再按用户问题、权限和安全策略裁剪为本次请求的 `VisibleCatalog`。
+
+因此，173 张表是系统拥有的元数据全集，而不是每次都应发送给 LLM 的上下文。系统会按用户问题、权限和安全策略生成当前请求的 `VisibleCatalog`；规划与校验的目标边界是只使用该经过字段可见性过滤的子集。`config/catalog.yaml` 保留业务词典及早期测试/兼容内容，不与 Python 表定义共同充当 schema 事实源。
 
 ---
 
 ## 下一阶段
 
 1. **真实数据库** — 接入 PostgreSQL 只读账号
-2. **更多表** — 扩展到 170+ 表的完整 schema
+2. **Schema 同步** — 持续从上游项目同步并校验 173+ 表的元数据快照
 3. **复杂查询** — 子查询、CTE、窗口函数
 4. **图表生成** — 自动可视化查询结果
 5. **权限控制** — 基于用户角色的字段级权限

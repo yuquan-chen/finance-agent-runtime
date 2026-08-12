@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Finance Agent</title>
+  <style>
+    :root { --bg:#fbfbfa; --panel:#ffffff; --panel-muted:#f8f8f7; --ink:#20201f; --muted:#777774; --line:#e8e8e5; --subtle:#f4f4f1; --accent:#131311; --brand:rgb(100,191,4); --brand-strong:#4c9301; --brand-ink:#315f02; --brand-soft:rgba(100,191,4,.13); --focus:rgba(100,191,4,.24); --danger:#c53d31; --sidebar-width:248px; --inspector-width:348px; }
+    body.theme-dark { --bg:#161715; --panel:#1d1e1b; --panel-muted:#1a1b19; --ink:#f0f1ed; --muted:#a9aaa4; --line:#32342f; --subtle:#272925; --accent:#eff1ec; --brand:#8ee038; --brand-strong:#a3ea59; --brand-ink:#b8f579; --brand-soft:rgba(142,224,56,.16); --focus:rgba(142,224,56,.28); --danger:#ff8e83; color-scheme:dark; }
+    * { box-sizing:border-box; }
+    html, body { height:100%; margin:0; }
+    body { min-width:1024px; color:var(--ink); background:var(--bg); font:14px/1.55 Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button, input { font:inherit; }
+    button { cursor:pointer; }
+    .app { display:grid; grid-template-columns:var(--sidebar-width) 7px minmax(540px, 1fr) 7px var(--inspector-width); height:100vh; overflow:hidden; }
+    .sidebar { display:flex; flex-direction:column; min-width:0; background:var(--panel-muted); padding:15px 11px 12px; }
+    .panel-resizer { position:relative; z-index:3; width:7px; cursor:col-resize; background:transparent; touch-action:none; }
+    .panel-resizer::after { position:absolute; top:0; bottom:0; left:3px; width:1px; background:var(--line); content:""; transition:background .15s, box-shadow .15s; }
+    .panel-resizer:hover::after, .panel-resizer.dragging::after { background:var(--brand); box-shadow:0 0 0 1px var(--brand-soft); }
+    .panel-resizer:focus-visible { outline:0; }
+    .panel-resizer:focus-visible::after { background:var(--brand); box-shadow:0 0 0 3px var(--focus); }
+    body.is-resizing { cursor:col-resize; user-select:none; }
+    .brand-row { display:flex; align-items:center; justify-content:space-between; padding:3px 7px 15px; }
+    .brand { display:flex; align-items:center; gap:8px; font-size:16px; font-weight:650; letter-spacing:-.02em; }
+    .brand-mark { display:grid; place-items:center; width:23px; height:23px; color:#102000; background:var(--brand); border-radius:7px; font-size:12px; }
+    .icon-button { display:grid; place-items:center; width:30px; height:30px; border:0; border-radius:7px; color:var(--muted); background:transparent; font-size:18px; }
+    .icon-button:hover { background:var(--subtle); color:var(--ink); }
+    .new-chat { display:flex; align-items:center; gap:9px; width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:9px; color:var(--ink); background:var(--panel); text-align:left; font-weight:550; box-shadow:0 1px 1px rgba(0,0,0,.02); }
+    .new-chat:hover { background:var(--subtle); border-color:var(--brand); }
+    .new-chat .plus { font-size:20px; font-weight:300; line-height:12px; }
+    .side-section { margin-top:25px; }
+    .side-label { display:flex; justify-content:space-between; align-items:center; padding:0 8px 7px; color:#92928e; font-size:11px; font-weight:650; letter-spacing:.04em; text-transform:uppercase; }
+    .session-list { display:flex; flex-direction:column; gap:2px; overflow:auto; max-height:calc(100vh - 210px); }
+    .session { display:flex; align-items:center; gap:9px; width:100%; min-width:0; padding:8px 8px; border:0; border-radius:7px; color:#555552; background:transparent; text-align:left; }
+    .session:hover { background:var(--subtle); color:var(--ink); }
+    .session.active { color:var(--ink); background:var(--brand-soft); font-weight:560; }
+    .session-icon { flex:0 0 auto; color:#858581; font-size:14px; }
+    .session-title { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    .empty-sessions { padding:9px 8px; color:#999995; font-size:12px; }
+    .sidebar-footer { margin-top:auto; padding:12px 4px 0; border-top:1px solid var(--line); }
+    .footer-row { display:flex; align-items:center; gap:8px; padding:8px 5px; color:#71716e; font-size:12px; }
+    .footer-dot { width:7px; height:7px; border-radius:50%; background:var(--brand); box-shadow:0 0 0 3px var(--brand-soft); }
+    .workspace { display:flex; flex-direction:column; min-width:0; background:var(--panel); }
+    .topbar { display:flex; align-items:center; min-height:52px; padding:0 20px; border-bottom:1px solid var(--line); }
+    .conversation-title { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:14px; font-weight:580; }
+    .topbar-actions { display:flex; align-items:center; gap:3px; margin-left:auto; }
+    .topbar-actions .icon-button { width:32px; height:32px; font-size:16px; }
+    .conversation { flex:1; overflow-y:auto; scroll-behavior:smooth; }
+    .messages { width:min(810px, calc(100% - 56px)); margin:0 auto; padding:42px 0 24px; }
+    .welcome { display:flex; flex-direction:column; align-items:flex-start; justify-content:center; min-height:calc(100vh - 230px); padding:0 9%; }
+    .welcome-mark { display:grid; place-items:center; width:39px; height:39px; margin-bottom:19px; border-radius:11px; color:#102000; background:var(--brand); font-weight:700; }
+    .welcome h1 { margin:0; font-size:27px; line-height:1.25; letter-spacing:-.04em; }
+    .welcome p { max-width:510px; margin:10px 0 22px; color:var(--muted); font-size:15px; }
+    .suggestions { display:flex; flex-wrap:wrap; gap:8px; }
+    .suggestion { padding:7px 11px; border:1px solid var(--line); border-radius:18px; color:var(--muted); background:var(--panel); font-size:12px; }
+    .suggestion:hover { border-color:var(--brand); color:var(--brand-ink); background:var(--brand-soft); }
+    .msg { display:flex; gap:12px; margin-bottom:27px; }
+    .msg-avatar { display:grid; place-items:center; flex:0 0 auto; width:27px; height:27px; margin-top:1px; border-radius:8px; color:#102000; background:var(--brand); font-size:11px; font-weight:700; }
+    .msg.user { justify-content:flex-end; }
+    .msg.user .msg-avatar { display:none; }
+    .msg-content { min-width:0; max-width:calc(100% - 39px); color:var(--ink); white-space:pre-wrap; word-break:break-word; }
+    .msg.user .msg-content { max-width:75%; padding:9px 13px; border-radius:16px 16px 4px 16px; background:var(--brand-soft); }
+    .msg.bot .msg-content { padding:2px 0; font-size:14px; line-height:1.72; }
+    .msg-content pre { overflow:auto; margin:12px 0; padding:14px; border:1px solid #e5e5e1; border-radius:9px; color:#343430; background:#f7f7f5; font:12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre; }
+    .msg-content code { padding:1px 4px; border-radius:4px; background:#f0f0ed; font:12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .table-wrapper { overflow:auto; margin:14px 0 8px; border:1px solid #e3e3df; border-radius:9px; }
+    .msg-content table { width:100%; min-width:560px; border-collapse:collapse; font-size:12px; }
+    .msg-content th, .msg-content td { padding:8px 10px; border-bottom:1px solid #ededeb; text-align:left; white-space:nowrap; }
+    .msg-content th { color:#676763; background:#f7f7f5; font-size:11px; font-weight:650; }
+    .msg-content tr:last-child td { border-bottom:0; }
+    .msg-content td.num { text-align:right; font-variant-numeric:tabular-nums; }
+    .note { margin-top:7px; color:#858582; font-size:12px; }
+    .sandbox { margin-top:13px; padding:9px 11px; border:1px solid #dbe9df; border-radius:8px; color:#38704a; background:#f4faf5; font-size:12px; }
+    .msg-actions { display:flex; gap:8px; margin-top:15px; }
+    .btn { padding:7px 12px; border:1px solid #dededb; border-radius:7px; color:#454542; background:#fff; font-size:12px; font-weight:580; }
+    .btn:hover { background:#f5f5f3; }
+    .btn-primary { border-color:var(--brand-strong); color:#102000; background:var(--brand); }
+    .btn-primary:hover { background:var(--brand-strong); }
+    /* 重要确认操作：浅色半透明材质，轻微模糊以保持内容层次。 */
+    .btn-confirm { display:inline-flex; align-items:center; gap:7px; padding:8px 13px; border:1px solid rgba(35,35,32,.18); border-radius:11px; color:#20201e; background:rgba(255,255,255,.68); box-shadow:0 2px 11px rgba(27,27,24,.07), inset 0 1px 0 rgba(255,255,255,.92); backdrop-filter:blur(14px) saturate(135%); -webkit-backdrop-filter:blur(14px) saturate(135%); }
+    .btn-confirm::before { width:7px; height:7px; border-radius:50%; background:var(--brand); box-shadow:0 0 0 3px var(--brand-soft); content:""; }
+    .btn-confirm:hover { border-color:rgba(35,35,32,.3); color:#10100f; background:rgba(255,255,255,.88); box-shadow:0 5px 17px rgba(27,27,24,.11), inset 0 1px 0 #fff; transform:translateY(-1px); }
+    .btn-confirm:focus-visible { outline:3px solid var(--focus); outline-offset:2px; }
+    .btn-confirm:disabled { cursor:wait; opacity:.62; transform:none; }
+    .thinking { display:flex; align-items:center; gap:10px; margin:2px 0 22px 39px; color:#81817d; font-size:13px; }
+    .thinking-dots { display:flex; gap:3px; }
+    .thinking-dots span { width:4px; height:4px; border-radius:50%; background:#9b9b97; animation:blink 1.2s infinite; }
+    .thinking-dots span:nth-child(2) { animation-delay:.15s; } .thinking-dots span:nth-child(3) { animation-delay:.3s; }
+    @keyframes blink { 0%, 80%, 100% { opacity:.25; transform:scale(.8); } 40% { opacity:1; transform:scale(1); } }
+    .composer-wrap { padding:16px 28px 22px; background:linear-gradient(to bottom, transparent, var(--panel) 20%); }
+    .composer { display:flex; flex-direction:column; width:min(850px, 100%); min-height:104px; margin:0 auto; padding:14px 12px 10px 17px; border:1px solid var(--line); border-radius:18px; background:var(--panel); box-shadow:0 7px 26px rgba(31,31,28,.09), 0 1px 2px rgba(31,31,28,.05); }
+    .composer:focus-within { border-color:var(--brand); box-shadow:0 8px 29px rgba(31,31,28,.11), 0 0 0 3px var(--focus); }
+    .composer input { width:100%; border:0; outline:0; color:var(--ink); background:transparent; font-size:15px; line-height:31px; }
+    .composer input::placeholder { color:#a2a29e; }
+    .composer-controls { display:flex; align-items:center; gap:7px; margin-top:auto; }
+    .composer-hint { margin-right:auto; color:#989894; font-size:11px; }
+    .send { display:grid; place-items:center; width:34px; height:34px; border:0; border-radius:11px; color:#102000; background:var(--brand); font-size:17px; }
+    .send:hover { background:var(--brand-strong); } .send:disabled { color:var(--muted); background:var(--subtle); cursor:not-allowed; }
+    .inspector { display:flex; flex-direction:column; min-width:0; background:var(--panel-muted); }
+    .inspector-head { display:flex; align-items:center; min-height:52px; padding:0 13px 0 16px; border-bottom:1px solid var(--line); }
+    .inspector-title { font-size:13px; font-weight:620; }
+    .inspector-clear { margin-left:auto; padding:5px 7px; border:0; border-radius:6px; color:#81817d; background:transparent; font-size:11px; }
+    .inspector-clear:hover { color:#3d3d3a; background:#ececea; }
+    .run-status { display:flex; align-items:center; gap:7px; margin:14px 15px 9px; padding:9px 10px; border:1px solid var(--line); border-radius:8px; color:var(--muted); background:var(--panel); font-size:12px; }
+    .run-status-dot { width:7px; height:7px; border-radius:50%; background:var(--muted); } .run-status.loading .run-status-dot, .run-status.success .run-status-dot { background:var(--brand); animation:blink 1.2s infinite; }
+    .debug-content { flex:1; overflow:auto; padding:0 15px 18px; }
+    .debug-empty { padding:26px 6px; color:#999995; font-size:12px; text-align:center; }
+    .debug-entry { margin:8px 0; padding:10px; border:1px solid #e8e8e4; border-radius:8px; background:#fff; }
+    .debug-entry.error { border-color:#f1d8d5; background:#fffafa; } .debug-entry.success { border-color:#dcebe0; }
+    .debug-entry .label { margin-bottom:5px; color:#565652; font-size:11px; font-weight:650; }
+    .debug-entry .content { overflow:auto; max-height:185px; color:#747470; font:11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; word-break:break-word; }
+    .theme-dark .msg-content pre, .theme-dark .msg-content th { color:#d9ddd3; background:#242622; border-color:var(--line); }
+    .theme-dark .msg-content code { background:#292b27; }
+    .theme-dark .table-wrapper, .theme-dark .msg-content th, .theme-dark .msg-content td { border-color:var(--line); }
+    .theme-dark .btn, .theme-dark .btn-confirm, .theme-dark .debug-entry { color:var(--ink); border-color:var(--line); background:rgba(37,39,35,.76); }
+    .theme-dark .btn:hover, .theme-dark .btn-confirm:hover { background:#30322d; }
+    .theme-dark .btn-primary { color:#102000; background:var(--brand); border-color:var(--brand); }
+    .theme-dark .debug-entry.error { border-color:#703a35; background:#2d2020; }
+    .theme-dark .debug-entry.success { border-color:#436529; }
+    .theme-dark .debug-entry .label, .theme-dark .debug-entry .content, .theme-dark .thinking, .theme-dark .note, .theme-dark .empty-sessions, .theme-dark .composer-hint, .theme-dark .side-label, .theme-dark .footer-row { color:var(--muted); }
+    .theme-dark .sandbox { border-color:#42632b; color:#b7ee86; background:#1e2b1a; }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior:auto !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; } }
+    .mobile-inspector { display:none; }
+    @media (max-width:1250px) { :root { --sidebar-width:226px; --inspector-width:300px; } .app { grid-template-columns:var(--sidebar-width) 7px minmax(500px, 1fr) 7px var(--inspector-width); } }
+    @media (max-width:1050px) { body { min-width:760px; } .app { grid-template-columns:var(--sidebar-width) 7px minmax(500px, 1fr); } .inspector, .panel-resizer[data-panel="inspector"] { display:none; } .mobile-inspector { display:grid; } }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <aside class="sidebar">
+      <div class="brand-row"><div class="brand"><span class="brand-mark">F</span><span>Finance Agent</span></div><button class="icon-button" title="搜索会话">⌕</button></div>
+      <button class="new-chat" id="newChat"><span class="plus">＋</span>新建对话</button>
+      <section class="side-section"><div class="side-label"><span>最近对话</span><span id="sessionCount"></span></div><div class="session-list" id="sessionList"><div class="empty-sessions">正在加载会话…</div></div></section>
+      <div class="sidebar-footer"><div class="footer-row"><span class="footer-dot"></span><span>本地开发环境</span></div></div>
+    </aside>
+    <div class="panel-resizer" data-panel="sidebar" role="separator" aria-label="调整会话栏宽度" aria-orientation="vertical" tabindex="0"></div>
+    <section class="workspace">
+      <header class="topbar"><div class="conversation-title" id="conversationTitle">新对话</div><div class="topbar-actions"><button class="icon-button" title="切换深色模式" aria-label="切换深色模式" id="themeToggle">◐</button><button class="icon-button" title="删除当前对话" id="deleteSession">⌫</button><button class="icon-button" title="清空模型可见记忆" id="clearMemory">◌</button><button class="icon-button mobile-inspector" title="运行详情">☷</button></div></header>
+      <div class="conversation" id="conversation"><div class="messages" id="messages"><div class="welcome" id="empty"><div class="welcome-mark">F</div><h1>今天想分析什么？</h1><p>我可以帮你梳理财务数据、准备查询方法，并在确认后运行受控分析。</p><div class="suggestions"><button class="suggestion" data-prompt="统计每个交易状态有多少笔">统计交易状态</button><button class="suggestion" data-prompt="分析最近的交易趋势">分析交易趋势</button><button class="suggestion" data-prompt="查询 Company 5 的 KYC 状态">查询 KYC 状态</button></div></div></div></div>
+      <div class="composer-wrap"><form class="composer" id="form"><input id="input" autocomplete="off" placeholder="向 Finance Agent 提问…"><div class="composer-controls"><span class="composer-hint">Enter 发送</span><button class="send" id="submit" type="submit" title="发送">↑</button></div></form></div>
+    </section>
+    <div class="panel-resizer" data-panel="inspector" role="separator" aria-label="调整运行详情栏宽度" aria-orientation="vertical" tabindex="0"></div>
+    <aside class="inspector"><header class="inspector-head"><span class="inspector-title">运行详情</span><button class="inspector-clear" id="clearDebug">清空</button></header><div class="run-status" id="runStatus"><span class="run-status-dot"></span><span id="runStatusText">等待新的请求</span></div><div class="debug-content" id="debugContent"><div class="debug-empty">规划、校验和执行信息会显示在这里。</div></div></aside>
+  </main>
+  <script>
+    var messagesEl = document.getElementById("messages"), conversationEl = document.getElementById("conversation"), emptyEl = document.getElementById("empty"), inputEl = document.getElementById("input"), submitBtn = document.getElementById("submit"), debugContent = document.getElementById("debugContent"), sessionList = document.getElementById("sessionList"), currentSessionId = null, currentRequestId = null;
+    var titleEl = document.getElementById("conversationTitle"), runStatus = document.getElementById("runStatus"), runStatusText = document.getElementById("runStatusText");
+
+    function escapeHtml(text) { return String(text == null ? "" : text).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;"); }
+    function scrollToBottom() { conversationEl.scrollTop = conversationEl.scrollHeight; }
+    function setRunStatus(text, type) { runStatus.className = "run-status" + (type ? " " + type : ""); runStatusText.textContent = text; }
+    function applyTheme(theme) { var dark=theme === "dark"; document.body.classList.toggle("theme-dark",dark); var toggle=document.getElementById("themeToggle"); toggle.textContent=dark ? "☀" : "◐"; toggle.title=dark ? "切换浅色模式" : "切换深色模式"; toggle.setAttribute("aria-label",toggle.title); }
+    function initializeTheme() { var saved=localStorage.getItem("finance-agent-theme"); applyTheme(saved || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")); }
+    function toggleTheme() { var next=document.body.classList.contains("theme-dark") ? "light" : "dark"; localStorage.setItem("finance-agent-theme",next); applyTheme(next); }
+    function clearMessages() { messagesEl.innerHTML = '<div class="welcome" id="empty"><div class="welcome-mark">F</div><h1>今天想分析什么？</h1><p>我可以帮你梳理财务数据、准备查询方法，并在确认后运行受控分析。</p><div class="suggestions"><button class="suggestion" data-prompt="统计每个交易状态有多少笔">统计交易状态</button><button class="suggestion" data-prompt="分析最近的交易趋势">分析交易趋势</button><button class="suggestion" data-prompt="查询 Company 5 的 KYC 状态">查询 KYC 状态</button></div></div>'; emptyEl = document.getElementById("empty"); bindSuggestions(); }
+    function addMsg(role, html) { if (emptyEl) emptyEl.remove(); var div=document.createElement("article"); div.className="msg "+role; if (role === "bot") { var avatar=document.createElement("div"); avatar.className="msg-avatar"; avatar.textContent="F"; div.appendChild(avatar); } var content=document.createElement("div"); content.className="msg-content"; content.innerHTML=html; div.appendChild(content); messagesEl.appendChild(div); scrollToBottom(); return content; }
+    function addThinking() { if (document.getElementById("thinking")) return; if (emptyEl) emptyEl.remove(); var el=document.createElement("div"); el.className="thinking"; el.id="thinking"; el.innerHTML='<span>正在思考</span><span class="thinking-dots"><span></span><span></span><span></span></span>'; messagesEl.appendChild(el); scrollToBottom(); }
+    function removeThinking() { var el=document.getElementById("thinking"); if (el) el.remove(); }
+    function setLoading(loading) { submitBtn.disabled=loading; submitBtn.textContent=loading ? "·" : "↑"; if (loading) { addThinking(); setRunStatus("正在准备分析…", "loading"); } else { removeThinking(); } }
+    function addDebugEntry(label, content, type) { if (debugContent.querySelector(".debug-empty")) debugContent.innerHTML=""; var entry=document.createElement("div"); entry.className="debug-entry"+(type ? " "+type : ""); entry.innerHTML='<div class="label">'+escapeHtml(label)+'</div><div class="content"></div>'; entry.querySelector(".content").textContent=typeof content === "string" ? content : JSON.stringify(content, null, 2); debugContent.appendChild(entry); debugContent.scrollTop=debugContent.scrollHeight; }
+    function clearDebug() { debugContent.innerHTML='<div class="debug-empty">规划、校验和执行信息会显示在这里。</div>'; setRunStatus("等待新的请求"); }
+    function formatAnswer(answer) { var html=escapeHtml(answer || "未生成回复"); html=html.replace(/```sql\\n([\\s\\S]*?)```/g,function(_,code){return "<pre>"+code.trim()+"</pre>";}); html=html.replace(/```python\\n([\\s\\S]*?)```/g,function(_,code){return "<pre>"+code.trim()+"</pre>";}); html=html.replace(/`([^`]+)`/g,"<code>$1</code>"); return html; }
+    function formatResult(result) { if (!Array.isArray(result) || !result.length) return '<div class="sandbox">查询结果为空</div>'; var rows=result.slice(0,20), cols=Object.keys(rows[0]), html='<div class="table-wrapper"><table><thead><tr>'; cols.forEach(function(c){html+="<th>"+escapeHtml(c)+"</th>";}); html+="</tr></thead><tbody>"; rows.forEach(function(row){html+="<tr>"; cols.forEach(function(c){var v=row[c]; html+='<td class="'+(typeof v === "number" ? "num" : "")+'">'+escapeHtml(typeof v === "number" ? v.toLocaleString(undefined,{maximumFractionDigits:2}) : v)+"</td>";}); html+="</tr>";}); html+="</tbody></table></div>"; if (result.length>20) html+='<div class="note">显示前 20 条，共 '+result.length+' 条</div>'; return html; }
+    function addActions(actions) { var holder=document.createElement("div"); holder.className="msg-actions"; actions.forEach(function(a){var btn=document.createElement("button"); btn.className="btn "+(a.primary ? "btn-primary " : "")+(a.confirm ? "btn-confirm" : ""); btn.textContent=a.label; btn.onclick=function(){ holder.querySelectorAll("button").forEach(function(item){item.disabled=true;}); a.onClick(); }; holder.appendChild(btn);}); var last=messagesEl.querySelector(".msg:last-child .msg-content"); if(last) last.appendChild(holder); }
+
+    async function loadSessions() { try { var res=await fetch("/v1/sessions"), sessions=await res.json(); document.getElementById("sessionCount").textContent=sessions.length || ""; sessionList.innerHTML=""; if(!sessions.length) sessionList.innerHTML='<div class="empty-sessions">还没有保存的对话</div>'; sessions.forEach(function(session){var item=document.createElement("button"); item.className="session"+(session.session_id===currentSessionId ? " active" : ""); item.title=session.title; item.innerHTML='<span class="session-icon">◌</span><span class="session-title">'+escapeHtml(session.title)+"</span>"; item.onclick=function(){switchSession(session.session_id, session.title);}; sessionList.appendChild(item);}); return sessions; } catch(e) { sessionList.innerHTML='<div class="empty-sessions">无法加载会话</div>'; addDebugEntry("会话加载失败",e.message,"error"); return []; } }
+    async function createNewSession() { var res=await fetch("/v1/sessions",{method:"POST"}); if(!res.ok) throw new Error("无法创建会话"); var session=await res.json(); currentSessionId=session.session_id; titleEl.textContent=session.title; clearMessages(); await loadSessions(); setRunStatus("新对话已创建"); return session; }
+    async function switchSession(sessionId, title) { if(!sessionId) return; currentSessionId=sessionId; titleEl.textContent=title || "对话"; clearMessages(); await loadSessions(); try { var res=await fetch("/v1/sessions/"+encodeURIComponent(sessionId)+"/history"), data=await res.json(); data.history.forEach(function(msg){addMsg(msg.role === "user" ? "user" : "bot", msg.role === "user" ? escapeHtml(msg.content) : formatAnswer(msg.content));}); setRunStatus("已切换对话"); } catch(e) { addDebugEntry("历史加载失败",e.message,"error"); } }
+    async function deleteCurrentSession() { if(!currentSessionId) return; if(!confirm("确定要删除当前对话吗？")) return; var deletedId=currentSessionId; var res=await fetch("/v1/sessions/"+encodeURIComponent(deletedId),{method:"DELETE"}); if(!res.ok) throw new Error("无法删除当前对话"); currentSessionId=null; clearMessages(); var sessions=await loadSessions(); if(sessions.length) { await switchSession(sessions[0].session_id,sessions[0].title); } else { await createNewSession(); } setRunStatus("当前对话已删除"); }
+    async function clearMemory() { if(!confirm("确定要清空模型可见记忆吗？")) return; var res=await fetch("/api/clear-memory",{method:"POST"}); var data=await res.json(); addDebugEntry("记忆",data.message,"success"); setRunStatus("已清空模型可见记忆", "success"); }
+
+    function handleResponse(data) { currentRequestId=data.request_id; var html=formatAnswer(data.answer), status=data.status; if(status === "executed_simulated_real" && data.execution_result_card) { html+=formatResult(data.execution_result_card.result)+'<div class="sandbox">沙箱执行完成 · 当前未连接真实数据库</div>'; addMsg("bot",html); setRunStatus("分析已完成", "success"); } else if(status === "method_execution_failed") { html+='<div class="sandbox" style="color:#a2342a">执行失败 · 请检查查询条件</div>'; addMsg("bot",html); setRunStatus("执行失败", "error"); } else { addMsg("bot",html); if(status === "analysis_plan_review_ready") { addActions([{label:"确认计划",primary:true,onClick:function(){approve("analysis-plan",data.request_id);}},{label:"稍后调整",onClick:function(){inputEl.focus();}}]); setRunStatus("等待确认分析计划"); } else if(status === "method_review_ready") { addActions([{label:"确认执行",confirm:true,onClick:function(){approve("method-review",data.request_id);}},{label:"修改方法",onClick:function(){inputEl.focus();}}]); setRunStatus("等待确认执行方法"); } else if(status === "prior_result_authorization_pending") { addActions([{label:"授权执行",primary:true,onClick:function(){approve("prior-result-authorization",data.request_id);}},{label:"取消",onClick:function(){setRunStatus("已取消");}}]); setRunStatus("等待授权使用先前结果"); } else { setRunStatus("已完成", "success"); } } }
+    async function approve(action, requestId) { setLoading(true); addDebugEntry("用户确认",action); try { var res=await fetch("/v1/runs/"+encodeURIComponent(requestId)+"/"+action+"/approve",{method:"POST"}), data=await res.json(); if(!res.ok) throw new Error(data.detail || "操作失败"); if(data.execution_result_card) addDebugEntry("执行结果",data.execution_result_card,"success"); handleResponse(data); } catch(e) { addMsg("bot","操作失败："+escapeHtml(e.message)); addDebugEntry("操作失败",e.message,"error"); setRunStatus("操作失败", "error"); } finally { setLoading(false); } }
+    async function submit() { var text=inputEl.value.trim(); if(!text) return; try { if(!currentSessionId) await createNewSession(); addMsg("user",escapeHtml(text)); inputEl.value=""; setLoading(true); clearDebug(); addDebugEntry("用户问题",text); var source=new EventSource("/v1/runs/stream?question="+encodeURIComponent(text)+"&session_id="+encodeURIComponent(currentSessionId)); source.onmessage=function(event){var payload=JSON.parse(event.data); if(payload.type === "start") { addDebugEntry("请求",payload.message); } else if(payload.type === "response_plan") { addDebugEntry("响应规划",payload.data); } else if(payload.type === "action_validation") { addDebugEntry("安全校验",payload.data); } else if(payload.type === "method_draft") { addDebugEntry("方法草稿",payload.data); } else if(payload.type === "sql") { addDebugEntry("SQL",payload.data); } else if(payload.type === "errors") { addDebugEntry("错误",payload.data,"error"); } else if(payload.type === "complete") { handleResponse(payload.data); source.close(); setLoading(false); loadSessions(); } else if(payload.type === "error") { addMsg("bot","请求失败："+escapeHtml(payload.message)); addDebugEntry("请求失败",payload.message,"error"); source.close(); setLoading(false); setRunStatus("请求失败", "error"); }}; source.onerror=function(){ if(source.readyState !== EventSource.CLOSED) { addDebugEntry("连接", "SSE 连接已断开", "error"); setRunStatus("连接已断开", "error"); } source.close(); setLoading(false); }; } catch(e) { addMsg("bot","请求失败："+escapeHtml(e.message)); setLoading(false); } }
+    function bindPanelResizers() { document.querySelectorAll(".panel-resizer").forEach(function(resizer){ var panel=resizer.dataset.panel; function resize(clientX) { var min=panel === "sidebar" ? 180 : 250, max=panel === "sidebar" ? 420 : 560, edge=panel === "sidebar" ? clientX : window.innerWidth-clientX; var workspaceMin=window.innerWidth < 1050 ? 500 : 540, opposite=window.innerWidth < 1050 ? 0 : parseInt(getComputedStyle(document.documentElement).getPropertyValue(panel === "sidebar" ? "--inspector-width" : "--sidebar-width"),10); max=Math.min(max,window.innerWidth-workspaceMin-opposite-14); var width=Math.max(min,Math.min(max,edge)); document.documentElement.style.setProperty(panel === "sidebar" ? "--sidebar-width" : "--inspector-width",width+"px"); } resizer.addEventListener("pointerdown",function(event){ event.preventDefault(); resizer.classList.add("dragging"); document.body.classList.add("is-resizing"); resizer.setPointerCapture(event.pointerId); var move=function(e){resize(e.clientX);}; var stop=function(){resizer.classList.remove("dragging");document.body.classList.remove("is-resizing");resizer.removeEventListener("pointermove",move);resizer.removeEventListener("pointerup",stop);resizer.removeEventListener("pointercancel",stop);}; resizer.addEventListener("pointermove",move);resizer.addEventListener("pointerup",stop);resizer.addEventListener("pointercancel",stop); }); resizer.addEventListener("keydown",function(event){if(event.key !== "ArrowLeft" && event.key !== "ArrowRight") return; event.preventDefault(); var current=parseInt(getComputedStyle(document.documentElement).getPropertyValue(panel === "sidebar" ? "--sidebar-width" : "--inspector-width"),10), delta=(event.key === "ArrowRight" ? 16 : -16) * (panel === "sidebar" ? 1 : -1); document.documentElement.style.setProperty(panel === "sidebar" ? "--sidebar-width" : "--inspector-width",Math.max(panel === "sidebar" ? 180 : 250,Math.min(panel === "sidebar" ? 420 : 560,current+delta))+"px"); }); }); }
+    function bindSuggestions(){ document.querySelectorAll(".suggestion").forEach(function(btn){btn.onclick=function(){inputEl.value=btn.dataset.prompt; submit();};}); }
+    document.getElementById("form").addEventListener("submit",function(e){e.preventDefault();submit();}); document.getElementById("newChat").onclick=function(){createNewSession().catch(function(e){addDebugEntry("新建会话失败",e.message,"error");});}; document.getElementById("deleteSession").onclick=function(){deleteCurrentSession().catch(function(e){addDebugEntry("删除会话失败",e.message,"error");});}; document.getElementById("themeToggle").onclick=toggleTheme; document.getElementById("clearMemory").onclick=clearMemory; document.getElementById("clearDebug").onclick=clearDebug; initializeTheme(); bindPanelResizers(); bindSuggestions();
+    loadSessions().then(function(sessions){if(sessions.length){switchSession(sessions[0].session_id,sessions[0].title);} else {createNewSession().catch(function(e){addDebugEntry("初始化失败",e.message,"error");});}});
+  </script>
+</body>
+</html>

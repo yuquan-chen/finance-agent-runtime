@@ -59,6 +59,7 @@ from finance_agent.renderer.method_review_renderer import (
 from finance_agent.renderer.reply_generator import generate_reply
 from finance_agent.renderer.result_narrator import narrate_execution_result
 from finance_agent.sandbox.mock_sandbox import run_mock_dry_run, run_simulated_real_execution
+from finance_agent.session.manager import SessionManager, get_session_manager
 from finance_agent.skills.registry import SkillRegistry, load_skill_registry
 
 
@@ -78,6 +79,7 @@ class FinanceAgentRuntime:
         business_term_registry: BusinessTermRegistry | None = None,
         table_registry: TableRegistry | None = None,
         llm_provider: LlmProvider | None = None,
+        session_manager: SessionManager | None = None,
     ):
         self.settings = settings or get_settings()
         self.catalog = catalog or load_catalog(self.settings.catalog_path)
@@ -95,6 +97,7 @@ class FinanceAgentRuntime:
         self.private_result_store = PrivateResultStore(self.settings.private_result_store_path)
         self.public_memory_store = PublicMemoryStore(self.settings.public_memory_path)
         self.memory_store = MemoryStore(self.settings.public_memory_path.parent / "public_memory")
+        self.session_manager = session_manager or get_session_manager()
         self.checkpointer = MemorySaver()
         self.executor = self._build_executor()
         self.graph = self._build_graph()
@@ -158,31 +161,33 @@ class FinanceAgentRuntime:
         graph.add_edge("audit", END)
         return graph.compile(checkpointer=self.checkpointer)
 
-    async def invoke(self, question: str, thread_id: str | None = None) -> AgentState:
-        # 生成 thread_id（如果没有提供）
-        if not thread_id:
-            thread_id = str(uuid.uuid4())
+    async def invoke(self, question: str, session_id: str | None = None) -> AgentState:
+        # 如果没有 session_id，创建新的 session
+        if not session_id:
+            session = self.session_manager.create_session()
+            session_id = session["session_id"]
+        else:
+            # 确保 session 存在
+            session = self.session_manager.get_session(session_id)
+            if session is None:
+                session = self.session_manager.create_session()
+                session_id = session["session_id"]
 
-        # 从 checkpointer 读取历史状态
-        config = {"configurable": {"thread_id": thread_id}}
-        conversation_history = []
-
-        try:
-            # 尝试获取之前的 checkpoint
-            checkpoint = self.checkpointer.get(config)
-            if checkpoint:
-                # 从 checkpoint 中提取对话历史
-                state = checkpoint.get("channel_values", {})
-                if "conversation_history" in state:
-                    conversation_history = state["conversation_history"]
-        except Exception:
-            pass
+        # 从 SessionManager 读取对话历史
+        conversation_history = self.session_manager.get_conversation_history(session_id)
 
         # 添加当前用户消息到历史
         conversation_history.append({"role": "user", "content": question})
 
+        # 保存用户消息到 session
+        self.session_manager.add_message(session_id, "user", question)
+
+        # 使用 session_id 作为 thread_id（保持兼容性）
+        config = {"configurable": {"thread_id": session_id}}
+
         initial: AgentState = {
             "request_id": str(uuid.uuid4()),
+            "session_id": session_id,
             "user_query": question,
             "status": "started",
             "errors": [],
@@ -192,8 +197,15 @@ class FinanceAgentRuntime:
             "repair_history": [],
         }
 
-        # 使用 thread_id 调用图
-        return await self.graph.ainvoke(initial, config=config)
+        # 调用图
+        result = await self.graph.ainvoke(initial, config=config)
+
+        # 保存 assistant 回复到 session
+        answer = result.get("answer")
+        if answer:
+            self.session_manager.add_message(session_id, "assistant", answer)
+
+        return result
 
     async def approve_method_review(self, state: AgentState) -> AgentState:
         """合并方法确认和数据授权为一步：确认后直接执行。"""
@@ -390,6 +402,7 @@ class FinanceAgentRuntime:
             business_term_registry=self.business_term_registry,
             table_manifest=self.table_registry.manifest_for_llm(),
             relevant_memories=memory_context,
+            table_detail_level="summary",  # 第一层：只发送表名和描述
         )
         legacy_decision = response_plan_to_tool_decision(plan)
         # 更新 sent_memory_count，下次只发增量
@@ -710,7 +723,7 @@ class FinanceAgentRuntime:
 
     @staticmethod
     def _extract_fields_from_sql(sql: str) -> list[str]:
-        """从 SQL 中提取 table.field 格式的字段引用（粗略提取）。"""
+        """从 SELECT 表达式中提取字段引用，避免函数参数被截断成伪字段。"""
         import re
 
         # 解析表别名：FROM account a → {"a": "account"}
@@ -728,19 +741,35 @@ class FinanceAgentRuntime:
         select_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql, re.IGNORECASE | re.DOTALL)
         if not select_match:
             return []
-        fields = []
-        for part in select_match.group(1).split(","):
-            part = part.strip()
-            # 去掉 AS 别名
-            part = re.sub(r"\s+AS\s+\w+", "", part, flags=re.IGNORECASE).strip()
-            if "." in part:
-                # 处理 alias.column → table.column
-                prefix, field = part.split(".", 1)
-                table_name = alias_map.get(prefix.lower(), prefix)
-                fields.append(f"{table_name}.{field}")
-            elif part and not part.startswith("*") and not part.startswith("("):
-                fields.append(f"{main_table}.{part}")
-        return fields
+        fields: list[str] = []
+
+        def add(reference: str) -> None:
+            reference = reference.strip()
+            if not reference or reference == "*":
+                return
+            if "." in reference:
+                prefix, field = reference.split(".", 1)
+                fields.append(f"{alias_map.get(prefix.lower(), prefix)}.{field}")
+            else:
+                fields.append(f"{main_table}.{reference}")
+
+        select_sql = select_match.group(1)
+        direct_pattern = r"(?:^|,)\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*(?:AS\s+\w+)?\s*(?=,|$)"
+        for match in re.finditer(direct_pattern, select_sql, re.IGNORECASE):
+            add(match.group(1))
+        for match in re.finditer(
+            r"(?:SUM|AVG|MIN|MAX)\s*\(\s*(?:COALESCE\s*\(\s*)?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+            select_sql,
+            re.IGNORECASE,
+        ):
+            add(match.group(1))
+        for match in re.finditer(
+            r"DATE_TRUNC\s*\(\s*'[^']+'\s*,\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+            select_sql,
+            re.IGNORECASE,
+        ):
+            add(match.group(1))
+        return list(dict.fromkeys(fields))
 
     @staticmethod
     def _extract_fields_from_code(code: str) -> list[str]:
