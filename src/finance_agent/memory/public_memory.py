@@ -53,6 +53,7 @@ class PublicMemoryStore:
         for entry in self.latest(limit, session_id=session_id):
             entries.append({
                 "type": "memory",
+                "result_ref": entry.result_ref,
                 "name": entry.method_name,
                 "description": f"之前的查询: {entry.user_query or '未知'}",
                 "content": f"SQL: {entry.sql_template or '无'}\n结果: {entry.result_summary or '无'}",

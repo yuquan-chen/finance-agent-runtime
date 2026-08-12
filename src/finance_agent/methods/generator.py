@@ -190,9 +190,18 @@ def _extract_fields_from_sql(sql: str, table: str) -> list[str]:
 
     def add(reference: str) -> None:
         reference = reference.strip()
-        if not reference or reference == "*":
+        if not reference:
+            return
+        if reference == "*":
+            fields.append(f"{detected_table}.*")
             return
         fields.append(reference if "." in reference else f"{detected_table}.{reference}")
+
+    # SELECT * 明确表示读取主表的全部字段，不能在确认卡中显示为“未指定”。
+    if re.search(r"(?:^|,)\s*\*\s*(?:,|$)", select_sql):
+        fields.append(f"{detected_table}.*")
+    for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.\*", select_sql):
+        fields.append(f"{match.group(1)}.*")
 
     # 直接选择的字段，例如 SELECT status, card_channel ...
     direct_pattern = r"(?:^|,)\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*(?:AS\s+\w+)?\s*(?=,|$)"

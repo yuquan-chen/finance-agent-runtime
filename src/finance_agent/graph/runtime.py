@@ -182,11 +182,13 @@ class FinanceAgentRuntime:
         # 保存用户消息到 session
         self.session_manager.add_message(session_id, "user", question)
 
-        # 使用 session_id 作为 thread_id（保持兼容性）
-        config = {"configurable": {"thread_id": session_id}}
+        # 每次运行使用独立的图状态。会话历史已由 SessionManager 持久化，
+        # 不能让上一次运行的 method_draft / SQL 通过 checkpointer 泄漏到本次请求。
+        request_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": f"run_{request_id}"}}
 
         initial: AgentState = {
-            "request_id": str(uuid.uuid4()),
+            "request_id": request_id,
             "session_id": session_id,
             "user_query": question,
             "status": "started",
@@ -273,7 +275,7 @@ class FinanceAgentRuntime:
                         required_fields=self._extract_fields_from_sql(repaired_sql),
                         output_schema={},
                         risk_level="medium",
-                        logic_summary=[f"LLM 修复 SQL (attempt {attempt + 1}): {last_error}"],
+                        logic_summary=[f"已完成查询校验与调整：{user_goal}"],
                     )
                     state = {
                         **state,
@@ -704,7 +706,7 @@ class FinanceAgentRuntime:
         alias_map = {}
         from_match = re.findall(r"(?:FROM|JOIN)\s+(\w+)\s+(?:AS\s+)?(\w+)", sql, re.IGNORECASE)
         for table, alias in from_match:
-            if table.lower() not in ("select", "where", "and", "or", "on", "as"):
+            if table.lower() not in ("select", "where", "and", "or", "on", "as") and alias.lower() not in ("where", "join", "on", "order", "group", "limit"):
                 alias_map[alias.lower()] = table
 
         # 获取主表名
@@ -728,6 +730,11 @@ class FinanceAgentRuntime:
                 fields.append(f"{main_table}.{reference}")
 
         select_sql = select_match.group(1)
+        # SELECT * 不是“未指定字段”：它明确表示读取主表的全部字段。
+        if re.search(r"(?:^|,)\s*\*\s*(?:,|$)", select_sql):
+            fields.append(f"{main_table}.*")
+        for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.\*", select_sql):
+            fields.append(f"{alias_map.get(match.group(1).lower(), match.group(1))}.*")
         direct_pattern = r"(?:^|,)\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*(?:AS\s+\w+)?\s*(?=,|$)"
         for match in re.finditer(direct_pattern, select_sql, re.IGNORECASE):
             add(match.group(1))
@@ -876,7 +883,7 @@ class FinanceAgentRuntime:
                     required_fields=self._extract_fields_from_sql(repaired_sql),
                     output_schema={},
                     risk_level="medium",
-                    logic_summary=[f"LLM 修复 SQL (attempt {attempts}): {error_summary}"],
+                    logic_summary=[f"已完成查询校验与调整：{user_goal}"],
                 )
                 return {
                     **state,

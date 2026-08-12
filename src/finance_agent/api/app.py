@@ -63,6 +63,13 @@ app = FastAPI(title="Finance Agent Runtime", version=__version__)
 
 PENDING_RUNS: dict[str, dict[str, Any]] = {}
 
+PENDING_REVIEW_STATUSES = {
+    "analysis_plan_review_ready",
+    "method_review_ready",
+    "data_authorization_pending",
+    "prior_result_authorization_pending",
+}
+
 
 CHAT_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -580,8 +587,7 @@ async def create_run(request: RunRequest) -> RunResponse:
     # 不再清除 pending runs，让每个请求独立管理自己的生命周期
     state = await runtime().invoke(request.question, session_id=request.session_id)
     request_id = state.get("request_id", "")
-    if state.get("status") in {"analysis_plan_review_ready", "method_review_ready", "data_authorization_pending", "prior_result_authorization_pending"} and request_id:
-        PENDING_RUNS[request_id] = dict(state)
+    _sync_pending_review(state)
     return _response_from_state(state)
 
 
@@ -616,16 +622,13 @@ async def create_run_stream(question: str, session_id: str | None = None):
             if state.get("errors"):
                 yield f"data: {json.dumps({'type': 'errors', 'data': state['errors']})}\n\n"
 
+            # 先把待确认卡/运行详情写入 session，再通知浏览器完成。
+            # 否则用户在收到卡片后立刻刷新会中断 SSE 生成器，导致状态尚未落盘。
+            _sync_pending_review(state)
+
             # 发送最终结果
             response = _response_from_state(state)
             yield f"data: {json.dumps({'type': 'complete', 'data': response.model_dump()})}\n\n"
-
-            # 保存 pending run，并按 session 缓存最新的待确认状态。
-            request_id = state.get("request_id", "")
-            if state.get("status") in {"analysis_plan_review_ready", "method_review_ready", "data_authorization_pending", "prior_result_authorization_pending"} and request_id:
-                PENDING_RUNS[request_id] = dict(state)
-                if session_id:
-                    PENDING_RUNS[session_id] = dict(state)
 
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -650,7 +653,7 @@ async def approve_analysis_plan(request_id: str) -> RunResponse:
         state = await runtime().approve_analysis_plan(state)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    PENDING_RUNS[request_id] = state
+    _sync_pending_review(state)
     return _response_from_state(state)
 
 
@@ -670,7 +673,7 @@ async def approve_method_review(request_id: str) -> RunResponse:
         state = await runtime().approve_method_review(state)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    PENDING_RUNS[request_id] = state
+    _sync_pending_review(state)
     return _response_from_state(state)
 
 
@@ -685,7 +688,7 @@ async def approve_data_authorization(request_id: str) -> RunResponse:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail={"errors": [str(exc)]}) from exc
-    PENDING_RUNS[request_id] = state
+    _sync_pending_review(state)
     return _response_from_state(state)
 
 
@@ -700,7 +703,7 @@ async def approve_prior_result_authorization(request_id: str) -> RunResponse:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail={"errors": [str(exc)]}) from exc
-    PENDING_RUNS[request_id] = state
+    _sync_pending_review(state)
     return _response_from_state(state)
 
 
@@ -800,7 +803,85 @@ async def set_session_pinned(session_id: str, pinned: bool = True):
 async def get_session_history(session_id: str, limit: int | None = None):
     """获取 session 的对话历史。"""
     history = runtime().session_manager.get_conversation_history(session_id, limit)
-    return {"session_id": session_id, "history": history}
+    pending_review = runtime().session_manager.get_pending_review(session_id)
+    # 兼容本次升级前已在内存中等待确认的会话：首次读取历史时补写安全卡片。
+    if pending_review is None:
+        in_memory_state = PENDING_RUNS.get(session_id)
+        if in_memory_state and in_memory_state.get("status") in PENDING_REVIEW_STATUSES:
+            _sync_pending_review(in_memory_state)
+            pending_review = runtime().session_manager.get_pending_review(session_id)
+    return {
+        "session_id": session_id,
+        "history": history,
+        "pending_review": pending_review,
+        "run_detail": runtime().session_manager.get_run_detail(session_id),
+    }
+
+
+def _sync_pending_review(state: dict[str, Any]) -> None:
+    """同步内存中的可确认状态与 session 中用于界面恢复的安全卡片。"""
+    request_id = state.get("request_id", "")
+    session_id = state.get("session_id", "")
+    is_pending = state.get("status") in PENDING_REVIEW_STATUSES and bool(request_id)
+
+    if session_id:
+        runtime().session_manager.set_run_detail(session_id, _safe_run_detail(state))
+
+    if is_pending:
+        PENDING_RUNS[request_id] = dict(state)
+        if session_id:
+            PENDING_RUNS[session_id] = dict(state)
+            runtime().session_manager.set_pending_review(
+                session_id,
+                _response_from_state(state).model_dump(mode="json"),
+            )
+        return
+
+    if request_id:
+        PENDING_RUNS.pop(request_id, None)
+    if session_id:
+        PENDING_RUNS.pop(session_id, None)
+        runtime().session_manager.set_pending_review(session_id, None)
+
+
+def _safe_run_detail(state: dict[str, Any]) -> dict[str, Any]:
+    """构建可在右侧面板恢复的运行追踪，严格排除结果数据与 result_ref。"""
+    entries: list[dict[str, Any]] = []
+    for label, key in (
+        ("响应规划", "response_plan"),
+        ("安全校验", "action_validation"),
+        ("方法草稿", "method_draft"),
+        ("SQL", "sql"),
+    ):
+        value = state.get(key)
+        if value:
+            entries.append({"label": label, "content": value})
+    if state.get("errors"):
+        entries.append({"label": "错误", "content": state["errors"], "type": "error"})
+    execution = state.get("execution_result_card")
+    if execution:
+        entries.append(
+            {
+                "label": "执行完成",
+                "content": {
+                    "row_count": execution.get("row_count"),
+                    "execution_mode": execution.get("execution_mode"),
+                    "real_database_used": execution.get("real_database_used", False),
+                },
+                "type": "success",
+            }
+        )
+
+    status = state.get("status", "")
+    status_text = {
+        "analysis_plan_review_ready": "等待确认分析计划",
+        "method_review_ready": "等待确认执行方法",
+        "prior_result_authorization_pending": "等待授权使用先前结果",
+        "executed_simulated_real": "分析已完成",
+        "method_execution_failed": "执行失败",
+    }.get(status, "已完成")
+    status_type = "error" if status == "method_execution_failed" else ("success" if status == "executed_simulated_real" else "")
+    return {"status": status, "status_text": status_text, "status_type": status_type, "entries": entries}
 
 
 def _response_from_state(state: dict[str, Any]) -> RunResponse:

@@ -120,7 +120,7 @@ INSTRUCTIONS = """# 角色
   "method_proposal": {
     "entity_id": "匹配的能力/技能 id，无匹配留空",
     "entity_type": "capability 或 skill，无匹配留空",
-    "result_refs": ["引用的先前 result_ref"],
+    "result_refs": ["仅可填 prior_results 中原样提供的 result_xxx"],
     "goal": "分析目标",
     "preferred_runtime": "sql | python | auto",
     "reason": "简短原因",
@@ -186,6 +186,11 @@ skill > capability > operations > 自写 SQL
 - 例如用户说"查询 Company 10 的 KYC 状态"，则：
   - SQL: SELECT ... WHERE legal_name = :customer_name
   - params: {"customer_name": "Company 10"}  ← 保持原样，不要改成 "company10"
+
+# 先前结果引用规则
+- result_refs 只能填写 prior_results.entries 中原样出现的 result_xxx；方法名（如 llm_group_by）不是 result_ref。
+- 用户要求修改原查询的筛选、字段或排序时，result_refs 留空并生成新的受控 SQL。
+- 只有完全基于已授权结果做后续计算、且不需要重新读取数据库时，才使用 result_refs。
 """
 
 # Layer 2: Context — 纯数据索引，不加任何指导语
@@ -368,10 +373,17 @@ def validate_response_plan(
             user_goal=message.strip(),
         )
 
-    # 规范化 result_refs
-    proposal.result_refs = _normalize_result_refs(proposal)
+    # 只接受私有结果库实际使用的 result_xxx 引用。方法名、skill 名等
+    # 不得触发 prior-result 路径，否则会把一次新查询错误地路由为旧结果计算。
+    normalized_refs, invalid_refs = _normalize_result_refs(proposal)
+    proposal.result_refs = normalized_refs
+    if invalid_refs:
+        proposal.reason = proposal.reason or "忽略了无效的先前结果引用，按新查询处理"
 
-    return _validate_proposal(proposal, message, operation_registry, skill_registry)
+    validation = _validate_proposal(proposal, message, operation_registry, skill_registry)
+    if invalid_refs:
+        validation.warnings.append(f"忽略无效 result_ref: {', '.join(invalid_refs)}")
+    return validation
 
 
 # ---------------------------------------------------------------------------
@@ -484,15 +496,20 @@ def _repair_to_proposal(message: str) -> MethodProposal | None:
     return None
 
 
-def _normalize_result_refs(proposal: MethodProposal) -> list[str]:
-    """规范化 result_refs：去重、去 memory_ 前缀。"""
-    refs = []
+def _normalize_result_refs(proposal: MethodProposal) -> tuple[list[str], list[str]]:
+    """规范化并校验 result_refs，只保留私有结果库的 result_xxx 句柄。"""
+    refs: list[str] = []
+    invalid: list[str] = []
     for r in proposal.result_refs:
         if r.startswith("memory_"):
             r = r.removeprefix("memory_")
+        if not re.fullmatch(r"result_[A-Za-z0-9]+", r):
+            if r not in invalid:
+                invalid.append(r)
+            continue
         if r not in refs:
             refs.append(r)
-    return refs
+    return refs, invalid
 
 
 def _looks_like_skill(entity_id: str) -> bool:
@@ -630,5 +647,4 @@ def infer_skill_id_for_message(message: str) -> str | None:
     if any(term in message for term in ["卡渠道", "渠道表现", "渠道分析"]):
         return "channel_performance_analysis"
     return None
-
 

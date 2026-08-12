@@ -104,12 +104,13 @@ def _prepare_sql(sql: str, params: dict[str, Any] | None = None) -> tuple[str, d
     # 例如：WHERE legal_name = :customer_name → WHERE legal_name ILIKE :customer_name
     prepared = re.sub(r"(\w+)\s*=\s*(:[a-zA-Z_][a-zA-Z0-9_]*)", r"\1 ILIKE \2", prepared)
 
-    # 参数值模糊处理：在字母和数字之间插入 %，并用 % 包裹
-    # 例如：'Company5' → '%Company%5%'，可以匹配 'Company 5'
+    # 参数值模糊处理：在字母和数字之间、以及任意连续空白处插入 %，并用 % 包裹。
+    # 例如：'Company5' / 'Company  5' 都会转换为 '%Company%5%'，
+    # 可以匹配存储值 'Company 5'。ILIKE 负责大小写不敏感比较。
     if params:
         for key in params:
             if isinstance(params[key], str):
-                val = params[key]
+                val = re.sub(r"\s+", "%", params[key].strip())
                 # 在字母→数字、数字→字母之间插入 %
                 val = re.sub(r"([a-zA-Z])(\d)", r"\1%\2", val)
                 val = re.sub(r"(\d)([a-zA-Z])", r"\1%\2", val)

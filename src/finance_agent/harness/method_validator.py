@@ -189,7 +189,11 @@ def _validate_sql_column_references(sql: str, visible_catalog: Catalog, table_re
             }
         )
 
-    referenced_tables = [match.lower() for match in re.findall(r"(?:FROM|JOIN)\s+(\w+)", sql, re.IGNORECASE)]
+    # 命名参数不是字段。参数名即使恰好与其它表的列同名，
+    # 也不能把它误判为本次查询引用了错误字段。
+    sql_without_parameters = _strip_parameters(sql)
+
+    referenced_tables = [match.lower() for match in re.findall(r"(?:FROM|JOIN)\s+(\w+)", sql_without_parameters, re.IGNORECASE)]
     known_referenced = {name: all_tables[name] for name in referenced_tables if name in all_tables}
     if not known_referenced:
         return []
@@ -200,12 +204,12 @@ def _validate_sql_column_references(sql: str, visible_catalog: Catalog, table_re
         "limit", "offset", "having", "distinct", "count", "sum", "avg", "min", "max", "coalesce", "date_trunc",
         "current_date", "interval", "null", "is", "not", "in", "like", "case", "when", "then", "else", "end",
     }
-    select_aliases = {alias.lower() for alias in re.findall(r"\bAS\s+(\w+)", sql, re.IGNORECASE)}
+    select_aliases = {alias.lower() for alias in re.findall(r"\bAS\s+(\w+)", sql_without_parameters, re.IGNORECASE)}
     # 所有已知的列名，只要出现在 SQL 中，就必须属于本次 FROM/JOIN 的任一表。
     available_columns = set().union(*known_referenced.values())
     all_known_columns = set().union(*all_tables.values()) if all_tables else set()
     for field in sorted(all_known_columns - available_columns - sql_keywords - select_aliases):
-        if re.search(rf"\b{re.escape(field)}\b", sql, re.IGNORECASE):
+        if re.search(rf"\b{re.escape(field)}\b", sql_without_parameters, re.IGNORECASE):
             errors.append(
                 f"SQL 字段错误：'{field}' 不属于本次查询的表 "
                 f"({', '.join(referenced_tables)})。"

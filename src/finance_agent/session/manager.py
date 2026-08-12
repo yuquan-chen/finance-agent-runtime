@@ -36,6 +36,10 @@ class SessionManager:
             "created_at": now,
             "updated_at": now,
             "conversation_history": [],
+            # 待确认的计划/方法仅保存安全的 UI 数据，不保存执行结果。
+            "pending_review": None,
+            # 右侧运行详情仅保存最近一次运行的安全追踪，不保存结果行。
+            "run_detail": None,
             "metadata": {},
         }
 
@@ -132,6 +136,28 @@ class SessionManager:
         )
 
         return session_data
+
+    def set_pending_review(self, session_id: str, review: dict[str, Any] | None) -> dict[str, Any] | None:
+        """保存或清除会话中尚未确认的安全审查卡片数据。"""
+        return self.update_session(session_id, {"pending_review": review})
+
+    def get_pending_review(self, session_id: str) -> dict[str, Any] | None:
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return None
+        review = session_data.get("pending_review")
+        return review if isinstance(review, dict) else None
+
+    def set_run_detail(self, session_id: str, detail: dict[str, Any] | None) -> dict[str, Any] | None:
+        """保存或清除右侧面板的安全运行追踪。"""
+        return self.update_session(session_id, {"run_detail": detail})
+
+    def get_run_detail(self, session_id: str) -> dict[str, Any] | None:
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return None
+        detail = session_data.get("run_detail")
+        return detail if isinstance(detail, dict) else None
 
     def delete_session(self, session_id: str) -> bool:
         """删除 session。"""
