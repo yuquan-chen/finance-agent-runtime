@@ -120,8 +120,8 @@ INSTRUCTIONS = """# 角色
   "method_proposal": {
     "entity_id": "匹配的能力/技能 id，无匹配留空",
     "entity_type": "capability 或 skill，无匹配留空",
-    "result_refs": ["仅可填 prior_results 中原样提供的 result_xxx"],
-    "goal": "分析目标",
+    "result_refs": [],
+    "goal": "不包含用户实际筛选值的分析目标",
     "preferred_runtime": "sql | python | auto",
     "reason": "简短原因",
     "sql": null,
@@ -149,48 +149,28 @@ INSTRUCTIONS = """# 角色
 - 涉及交易/金额/状态/渠道/客户的问题
 
 # 匹配优先级
-skill > capability > operations > 自写 SQL
+skill > capability > operations > 新查询
 
 1. 先看 context.skills，description 匹配就填 entity_type="skill"
 2. 再看 context.capabilities，匹配就填 entity_type="capability"
 3. 再看 context.operations，匹配就 entity_id 留空，reason 说明操作名
-4. 都不匹配 → entity_id 留空，sql 字段写 SQL
+4. 都不匹配 → entity_id 留空，并把合并后的完整分析目标写入 goal。
 
-# 自写 SQL 规则
-当通用操作不覆盖用户需求时，在 sql 字段写 SQL：
-1. 只写 SELECT，绝不写 INSERT/UPDATE/DELETE
-2. 【强制】表名必须来自 context.table_manifest 中的 name 字段，禁止使用任何不在列表中的表名（如 customers、users、prior_result 等不存在的表）
-2.1. 【强制】必须根据 table_manifest 中的 description 字段选择正确的表！description 说明了表的用途，选择错误的表会导致查询结果为空
-3. 【强制】字段名必须来自 context.table_manifest 中对应表的 columns 列表，不要猜测字段名
-4. 使用 context.business_terms 理解业务术语
-5. 多表用 JOIN，关系参考 table_manifest 中的 relationships
-6. 【强制】参数必须用 :param_name 格式，禁止写死具体值！例如：WHERE legal_name = :customer_name，而不是 WHERE legal_name = 'company1'
-7. 字段格式：column_name(type): description，使用 column_name 部分
-8. 重要：仔细检查 table_manifest 中的字段名，不要假设字段名（如 account_id 可能不存在，可能是 identifier_id）
-9. KYC/KYB 相关查询使用 account 表（包含 kyc_status, card_kyb_status, cw_kyb_status, va_kyb_status, acquiring_kyb_status 字段）
-9.1. 【强制】消费相关查询（消费、退款、冲正等卡交易）必须使用 card_transaction 表，不要使用 transaction 表！transaction 表只记录余额变动
-10. 【强制】注意字段类型！varchar/text 类型的字段（如 status、type、kyc_status）只能用于 WHERE/GROUP BY/ORDER BY，绝对不能用于 SUM/AVG 等数值计算！
-11. 【强制】先理解用户意图再写 SQL！用户问"查询 company1 的 KYC 状态"→ 写简单的 SELECT ... WHERE legal_name = :customer_name，不要写 GROUP BY/SUM 等聚合操作！
-
-# 查询 vs 统计 的区别
-- 查询单个客户：SELECT fields FROM table WHERE condition LIMIT 1（简单，无聚合）
-- 统计汇总：SELECT field, COUNT(*) FROM table GROUP BY field（聚合，用于分析）
-
-用户问"查询 company1 的 KYC 状态"是【查询】，不是【统计】！
+# SQL 生成边界
+- 你绝不生成 SQL：sql 必须始终为 null。
+- 只有后续拿到完整 schema 的查询生成器可以生成 SQL；这样确认卡和执行器只有一个 SQL 来源。
+- 用户补充筛选、字段、时间或排序要求时，结合最近聊天消息，把原需求和新要求合并到 goal。
+- 【连续查询强制规则】如果最近一条消息只是补充、修改或指代上一条数据请求（例如“按金额排序”“改成近三个月”“只看失败的”“再加上渠道”），必须继承上一条请求的查询对象、时间范围和筛选条件，生成一条完整的新 goal；不得把它当成新的、信息不足的问题，也不得要求用户重复主体。
+- 补充排序/字段/时间时，保留上一条请求中仍然有效的 params；只有用户明确替换筛选值时才替换对应 params。
+- 例如：上一条“查询 Company 11 近一年的付款记录”，当前“按金额排序吧” → goal 必须为“查询指定公司近一年的付款记录，并按金额降序排序”，params 仍为 {"customer_name": "Company 11"}。
 
 # 命名参数规则
-- SQL 中用 :param_name 格式定义参数
-- params 字段存储参数的实际值
-- 从用户输入中提取参数值，不要写死在 SQL 中
+- params 字段只存储用户提供、将用于筛选的数据值；排序字段、"近一年"这类查询语义不要放入 params。
+- goal 必须使用脱值描述，绝不能复述 params 中的实际值。例如用户说"查询 Company 10 的 KYC 状态"，goal 写"查询指定公司的 KYC 状态"。
+- 从用户输入中提取参数值，不要写死在 goal 中，更不要写 SQL 中
 - 【强制】不要改变参数值的大小写！用户输入什么就保留什么
-- 例如用户说"查询 Company 10 的 KYC 状态"，则：
-  - SQL: SELECT ... WHERE legal_name = :customer_name
-  - params: {"customer_name": "Company 10"}  ← 保持原样，不要改成 "company10"
-
-# 先前结果引用规则
-- result_refs 只能填写 prior_results.entries 中原样出现的 result_xxx；方法名（如 llm_group_by）不是 result_ref。
-- 用户要求修改原查询的筛选、字段或排序时，result_refs 留空并生成新的受控 SQL。
-- 只有完全基于已授权结果做后续计算、且不需要重新读取数据库时，才使用 result_refs。
+- 例如用户说"查询 Company 10 的 KYC 状态"，则 params: {"customer_name": "Company 10"}。
+- result_refs 必须始终为空；内部结果句柄不属于你的输出。
 """
 
 # Layer 2: Context — 纯数据索引，不加任何指导语
@@ -647,4 +627,3 @@ def infer_skill_id_for_message(message: str) -> str | None:
     if any(term in message for term in ["卡渠道", "渠道表现", "渠道分析"]):
         return "channel_performance_analysis"
     return None
-

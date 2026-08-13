@@ -67,7 +67,7 @@ def prune_catalog(query: str, catalog: Catalog, policy: Policy, max_tables: int 
     )
     selected_tables = [table for score, table in scored if score > 0][:max_tables] or catalog.tables[:max_tables]
     # 客户名称过滤需要 account.legal_name；为交易类查询补上账户表，让规划器能生成合法 JOIN。
-    needs_account = any(token in lowered for token in ("company", "person", "客户", "企业"))
+    needs_account = any(token in lowered for token in ("company", "person", "客户", "公司", "企业"))
     has_transaction = any(table.name in {"payout_transaction", "pay_transaction", "card_transaction"} for table in selected_tables)
     account = catalog.table("account")
     if needs_account and has_transaction and account and account not in selected_tables:

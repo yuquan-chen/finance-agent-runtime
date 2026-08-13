@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 
@@ -255,8 +256,15 @@ class FinanceAgentRuntime:
             if attempt < max_attempts - 1 and self._can_repair(state):
                 current_sql = state.get("sql") or (state.get("method_draft") or {}).get("sql_template", "")
                 user_goal = state.get("action_user_goal") or state["user_query"]
+                proposal = (state.get("action_validation") or {}).get("proposal") or {}
+                sql_input_slots = state.get("sql_input_slots") or self._sql_input_slots(proposal.get("params") or {})
+                sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, proposal.get("params") or {})
                 repaired_sql = self._call_llm_for_repair(
-                    user_goal, current_sql, last_error, state.get("visible_catalog")
+                    sql_planning_goal,
+                    current_sql,
+                    last_error,
+                    state.get("visible_catalog"),
+                    input_slots=[{"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]} for slot in sql_input_slots],
                 )
 
                 if repaired_sql:
@@ -272,6 +280,7 @@ class FinanceAgentRuntime:
                         table=table_name,
                         data_source="table",
                         sql_template=repaired_sql,
+                        params=self._bound_input_params(state),
                         required_fields=self._extract_fields_from_sql(repaired_sql),
                         output_schema={},
                         risk_level="medium",
@@ -411,6 +420,18 @@ class FinanceAgentRuntime:
                 for m in relevant_memories
             ]
 
+        # 当前消息会由响应规划器单独附加；这里只传此前的用户需求。
+        # 结果解读的 assistant 消息可能包含真实数据，不能作为后续规划 LLM 的上下文。
+        # 连续查询只需回看用户原始问题和后续补充（例如“按金额排序”）。
+        conversation_history = list(state.get("conversation_history", []))
+        if (
+            conversation_history
+            and conversation_history[-1].get("role") == "user"
+            and conversation_history[-1].get("content") == state["user_query"]
+        ):
+            conversation_history.pop()
+        conversation_history = self._llm_safe_user_history(conversation_history)
+
         plan = plan_response_with_llm_and_registry(
             state["user_query"],
             self.settings,
@@ -423,6 +444,7 @@ class FinanceAgentRuntime:
             business_term_registry=self.business_term_registry,
             table_manifest=self.table_registry.manifest_for_llm(),
             relevant_memories=memory_context,
+            conversation_messages=conversation_history,
             table_detail_level="summary",  # 第一层：只发送表名和描述
         )
         legacy_decision = response_plan_to_tool_decision(plan)
@@ -513,19 +535,26 @@ class FinanceAgentRuntime:
         visible = Catalog.model_validate(state["visible_catalog"])
         errors = list(state.get("errors", []))
         user_goal = state.get("action_user_goal") or state["user_query"]
+        proposal = (state.get("action_validation") or {}).get("proposal") or {}
+        sql_input_slots = self._sql_input_slots(proposal.get("params") or {})
+        sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, proposal.get("params") or {})
         action_context = {
-            "action_validation": state.get("action_validation"),
-            "response_plan": state.get("response_plan"),
+            # 不传完整 response_plan / action_validation：其中可能有用户真实筛选值。
+            "route": (state.get("action_validation") or {}).get("route"),
+            "entity_id": proposal.get("entity_id"),
+            "entity_type": proposal.get("entity_type"),
+            "preferred_runtime": proposal.get("preferred_runtime"),
             "selected_skill_detail": state.get("selected_skill_detail"),
         }
         try:
             plan = plan_analysis_with_lmstudio(
-                user_goal,
+                sql_planning_goal,
                 visible,
                 self.operation_registry,
                 self.settings,
                 self.llm_provider,
                 action_context=action_context,
+                input_slots=[{"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]} for slot in sql_input_slots],
                 handler_manifest=self.handler_registry.manifest_for_llm(),
                 business_term_manifest=self.business_term_registry.manifest_for_llm(),
             )
@@ -540,9 +569,69 @@ class FinanceAgentRuntime:
         return {
             **state,
             "analysis_plan": plan.model_dump(mode="json"),
+            "sql_input_slots": sql_input_slots,
             "planner_used": planner_used,
             "status": "analysis_planned",
             "errors": errors,
+        }
+
+    @staticmethod
+    def _llm_safe_user_history(
+        conversation_history: list[dict[str, Any]],
+        limit: int = 10,
+    ) -> list[dict[str, str]]:
+        """为规划阶段构造可发送给 LLM 的历史：仅保留近期用户输入。"""
+        return [
+            {"role": "user", "content": str(message["content"])}
+            for message in conversation_history
+            if message.get("role") == "user" and isinstance(message.get("content"), str)
+        ][-limit:]
+
+    @staticmethod
+    def _sql_input_slots(params: dict[str, Any]) -> list[dict[str, str]]:
+        """Create opaque slots for SQL planning; values never leave the backend boundary."""
+        slots: list[dict[str, str]] = []
+        for index, (source_name, value) in enumerate(sorted(params.items()), start=1):
+            if value is None:
+                continue
+            value_type = "number" if isinstance(value, (int, float)) and not isinstance(value, bool) else "text"
+            slots.append(
+                {
+                    "id": f"input_{index}",
+                    "source_param": str(source_name),
+                    "type": value_type,
+                    # Intent label only; neither a parameter name nor a value.
+                    "semantic": str(source_name).replace("_", " "),
+                }
+            )
+        return slots
+
+    @staticmethod
+    def _redact_sql_planning_goal(
+        goal: str,
+        slots: list[dict[str, str]],
+        params: dict[str, Any],
+    ) -> str:
+        """Remove known user values before they reach the SQL-planning LLM."""
+        redacted = goal
+        for slot in slots:
+            value = params.get(slot["source_param"])
+            if isinstance(value, str) and value.strip():
+                redacted = re.sub(re.escape(value), f"[{slot['id']}]", redacted, flags=re.IGNORECASE)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                redacted = redacted.replace(str(value), f"[{slot['id']}]")
+        return redacted
+
+    @staticmethod
+    def _bound_input_params(state: AgentState) -> dict[str, Any]:
+        """Map opaque SQL slots back to values only after SQL planning is complete."""
+        proposal = (state.get("action_validation") or {}).get("proposal") or {}
+        proposal_params = proposal.get("params") or {}
+        slots = state.get("sql_input_slots") or FinanceAgentRuntime._sql_input_slots(proposal_params)
+        return {
+            slot["id"]: proposal_params[slot["source_param"]]
+            for slot in slots
+            if slot.get("source_param") in proposal_params
         }
 
     @staticmethod
@@ -666,20 +755,13 @@ class FinanceAgentRuntime:
             # ResponsePlan 中的 SQL / 代码只是意图提示，不能绕过 schema 约束。
             # 唯一可执行来源是已加载可见元数据后的 AnalysisPlan.steps。
             proposal = (state.get("action_validation") or {}).get("proposal") or {}
-            proposal_params = proposal.get("params") or {}
             plan = AnalysisPlan.model_validate(state["analysis_plan"])
             methods = generate_method_drafts(plan, self.handler_registry)
-            # 参数值可作为用户意图的一部分复用，但只能绑定到 schema 生成且实际引用了该参数的方法。
+            # SQL 规划器只能看到 input_N 槽位；到这里才把真实值映射回来。
+            # 校验器会要求每个槽位都被 SQL 引用，避免参数被悄悄丢弃。
+            bound_params = self._bound_input_params(state)
             methods = [
-                method.model_copy(
-                    update={
-                        "params": {
-                            name: value
-                            for name, value in proposal_params.items()
-                            if method.sql_template and f":{name}" in method.sql_template
-                        }
-                    }
-                )
+                method.model_copy(update={"params": bound_params})
                 for method in methods
             ]
             method = methods[0]
@@ -860,10 +942,17 @@ class FinanceAgentRuntime:
             # 获取当前的 SQL
             current_sql = state.get("sql") or (state.get("method_draft") or {}).get("sql_template", "")
             user_goal = state.get("action_user_goal") or state["user_query"]
+            proposal = (state.get("action_validation") or {}).get("proposal") or {}
+            sql_input_slots = state.get("sql_input_slots") or self._sql_input_slots(proposal.get("params") or {})
+            sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, proposal.get("params") or {})
 
             # 调用 LLM 修复 SQL
             repaired_sql = self._call_llm_for_repair(
-                user_goal, current_sql, error_summary, state.get("visible_catalog")
+                sql_planning_goal,
+                current_sql,
+                error_summary,
+                state.get("visible_catalog"),
+                input_slots=[{"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]} for slot in sql_input_slots],
             )
 
             if repaired_sql:
@@ -880,6 +969,7 @@ class FinanceAgentRuntime:
                     table=table_name,
                     data_source="table",
                     sql_template=repaired_sql,
+                    params=self._bound_input_params(state),
                     required_fields=self._extract_fields_from_sql(repaired_sql),
                     output_schema={},
                     risk_level="medium",
@@ -938,6 +1028,7 @@ class FinanceAgentRuntime:
                     table=table_name,
                     data_source="table",
                     sql_template=llm_sql,
+                    params=self._bound_input_params(state),
                     required_fields=self._extract_fields_from_sql(llm_sql),
                     output_schema={},
                     risk_level="medium",
@@ -983,6 +1074,7 @@ class FinanceAgentRuntime:
         current_sql: str,
         error_summary: str,
         visible_catalog: dict[str, Any] | None = None,
+        input_slots: list[dict[str, str]] | None = None,
     ) -> str | None:
         """调用 LLM 修复 SQL。"""
         try:
@@ -1006,6 +1098,10 @@ class FinanceAgentRuntime:
 2. 只能使用下方列出的表名和字段名；不得猜测替代表或字段
 3. 使用 PostgreSQL 语法
 4. 如果需要多表查询，使用 JOIN
+5. 只能使用下方 input_slots 里的 :input_N 占位符，绝不把筛选实际值写成 SQL 字符串
+
+可用 input_slots:
+{input_slots or []}
 
 可用的表结构:
 {table_info}

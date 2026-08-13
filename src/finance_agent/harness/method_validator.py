@@ -67,12 +67,9 @@ def validate_method_draft(
                 continue
             # 检查字段是否可见
             if field not in all_visible_fields[table_name]:
-                # 对于自定义 SQL，字段不可见只是警告，不是错误
-                # 因为 LLM 可能生成了使用不存在字段的 SQL，沙箱会捕获这个错误
-                if method.name.startswith("llm_custom"):
-                    warnings.append(f"required field is not visible (will be validated in sandbox): {qualified}")
-                else:
-                    errors.append(f"required field is not visible: {qualified}")
+                # 未在 schema 中出现的字段一律阻止。把错误留给沙箱会导致
+                # 用户看到无效候选 SQL，也让自动修复链路晚了一步。
+                errors.append(f"required field is not visible: {qualified}")
                 continue
             # 检查字段是否敏感
             table = visible_catalog.table(table_name)
@@ -85,6 +82,7 @@ def validate_method_draft(
         if not method.sql_template:
             errors.append("sql method requires sql_template")
         else:
+            errors.extend(_validate_sql_parameter_bindings(method.sql_template, method.params))
             try:
                 assert_readonly_sql(_strip_parameters(method.sql_template), policy)
             except Exception as exc:
@@ -109,6 +107,33 @@ def validate_method_draft(
 
 def _strip_parameters(sql: str) -> str:
     return re.sub(r":[A-Za-z_][A-Za-z0-9_]*", "NULL", sql)
+
+
+def _validate_sql_parameter_bindings(sql: str, params: dict[str, object]) -> list[str]:
+    """Ensure user values can only enter a query through declared SQL placeholders."""
+    placeholders = set(re.findall(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", sql))
+    bound_names = set(params)
+    errors: list[str] = []
+
+    missing = sorted(placeholders - bound_names)
+    unused = sorted(bound_names - placeholders)
+    if missing:
+        errors.append(f"sql placeholders have no bound value: {', '.join(missing)}")
+    if unused:
+        errors.append(f"bound input values are not referenced by SQL: {', '.join(unused)}")
+
+    # The SQL planner receives no input values. If a value nevertheless appears as a
+    # string literal, reject it instead of relying on prompt compliance.
+    string_literals = [match.group(1).replace("''", "'") for match in re.finditer(r"'((?:''|[^'])*)'", sql)]
+    for name, value in params.items():
+        if isinstance(value, str) and value.strip():
+            normalized_value = re.sub(r"\s+", " ", value.strip()).casefold()
+            for literal in string_literals:
+                normalized_literal = re.sub(r"\s+", " ", literal.strip()).casefold()
+                if normalized_literal == normalized_value:
+                    errors.append(f"user input value must use a placeholder, not a SQL literal: {name}")
+                    break
+    return errors
 
 
 # 状态类字段（字符串类型，不能用于数值计算）

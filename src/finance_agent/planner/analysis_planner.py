@@ -42,11 +42,14 @@ SYSTEM_PROMPT = """# 角色
 
 # 关键规则
 1. 每个步骤必须有 sql 字段，写完整的 SELECT 语句
+1.1 你是唯一生成 SQL 模板的阶段。必须以 user_query（已合并且已脱值的目标）为准；你不会收到原始对话或真实参数值。
+1.2 用户要求查看某个主体的交易/付款等明细记录（没有明确指定返回字段）时，使用主表别名的 ``SELECT p.*``，不要自行枚举列名；JOIN 的表只用于过滤时不选取其列。这样读取范围明确且不会猜测字段。
 2. 表名和字段名只能来自 context.visible_metadata；不要猜测或使用未展示的表/字段
 3. 只写 SELECT，绝不写 INSERT/UPDATE/DELETE
 4. 多表用 JOIN，关系参考 visible_metadata 中的 relationships
 5. 业务术语参考 context.business_terms（如"消费"= type='consumption'）
-6. 参数用 :param_name 格式
+6. 参数只能使用 context.input_slots 中提供的 :input_N 占位符。绝不猜测、复述或写入任何真实筛选值；需要按值筛选时必须引用一个 input_slot。必须根据 slot 的 type 和 semantic 选择兼容字段：公司名称等 text slot 应匹配名称字段，不能匹配 UUID/金额/日期字段；UUID slot 才能匹配 UUID 字段。
+7. 文本字段的模糊、不区分大小写匹配必须显式写 ILIKE :input_N；其他字段保持正确的类型比较，不能把 UUID/数值字段写成 ILIKE。
 
 # 步骤设计原则
 - 从宏观到微观：先看整体趋势，再拆维度
@@ -128,10 +131,15 @@ def plan_analysis_with_lmstudio(
     handler_manifest: list[dict[str, str]] | None = None,
     business_term_manifest: list[dict[str, Any]] | None = None,
     table_manifest: list[dict[str, Any]] | None = None,
+    conversation_history: list[dict[str, Any]] | None = None,
+    input_slots: list[dict[str, str]] | None = None,
 ) -> AnalysisPlan:
     payload: dict[str, Any] = {
         "user_query": query,
         "action_context": action_context or {},
+        # SQL 规划器不接收原始对话；连续需求已在第一层合并为脱值 user_query。
+        "conversation_history": [],
+        "input_slots": input_slots or [],
         "visible_metadata": _catalog_payload(visible_catalog),
         "operation_registry": _operation_payload(operation_registry),
         "analysis_plan_schema": {
