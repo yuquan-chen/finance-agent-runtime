@@ -13,6 +13,7 @@ class PublicMemoryEntry(BaseModel):
     request_id: str
     session_id: str = ""
     result_ref: str
+    plan_result_ref: str | None = None
     method_name: str
     method_type: str
     fields: list[str]
@@ -22,7 +23,7 @@ class PublicMemoryEntry(BaseModel):
     values_visible_to_llm: bool = False
     # 新增：SQL 和查询结果摘要
     sql_template: str | None = None
-    # 已脱敏的业务目标，供 A 路径重新生成 SQL；不保存真实结果值。
+    # 已脱敏的业务目标，供重新生成查询路径重新生成 SQL；不保存真实结果值。
     goal: str | None = None
     user_query: str | None = None
     result_summary: str | None = None  # 查询结果的文字摘要
@@ -59,10 +60,11 @@ class PublicMemoryStore:
                 "query_candidate": candidate,
                 "name": entry.method_name,
                 "description": f"之前的查询候选 {candidate}",
-                # 参数化 SQL 可以作为 A 路径的参考；真实参数和结果值不进入 LLM。
+                # 参数化 SQL 可以作为重新生成查询路径的参考；真实参数和结果值不进入 LLM。
                 "content": f"SQL 模板: {entry.sql_template or '无'}\n结果结构摘要: {entry.result_summary or '无'}",
                 "goal": entry.goal or "",
                 "sql_template": entry.sql_template or "",
+                "plan_result_ref": entry.plan_result_ref,
                 "fields": entry.fields,
                 "row_count": entry.row_count,
                 "result_shape": entry.result_shape,

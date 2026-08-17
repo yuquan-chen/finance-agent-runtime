@@ -19,6 +19,8 @@ class AgentState(MessagesState):
     public_memory_context: list[dict[str, Any]]
     public_memory_entry: dict[str, Any]
     result_ref: str
+    plan_result_ref: str
+    result_refs: list[str]
     response_plan: dict[str, Any]
     action_validation: dict[str, Any]
     selected_skill_detail: dict[str, Any]

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -36,8 +37,12 @@ class SessionManager:
             "created_at": now,
             "updated_at": now,
             "conversation_history": [],
+            # 当前用户可见的真实结果与解读；不属于普通模型上下文。
+            "private_analysis": [],
             # 待确认的计划/方法仅保存安全的 UI 数据，不保存执行结果。
             "pending_review": None,
+            # 待确认运行的可恢复状态；不包含执行后的真实结果。
+            "pending_run_state": None,
             # 右侧运行详情仅保存最近一次运行的安全追踪，不保存结果行。
             "run_detail": None,
             "metadata": {},
@@ -137,6 +142,43 @@ class SessionManager:
 
         return session_data
 
+    def add_private_analysis(self, session_id: str, analysis: dict[str, Any]) -> dict[str, Any] | None:
+        """保存当前用户可见的真实结果与解读，不写入普通 conversation_history。"""
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return None
+
+        entry = {
+            "analysis_id": analysis.get("analysis_id") or f"analysis_{uuid.uuid4().hex}",
+            "request_id": analysis.get("request_id", ""),
+            "answer": analysis.get("answer", ""),
+            "result_ref": analysis.get("result_ref"),
+            "result_refs": list(analysis.get("result_refs") or []),
+            "plan_result_ref": analysis.get("plan_result_ref"),
+            "execution_result_card": analysis.get("execution_result_card"),
+            "execution_result_cards": list(analysis.get("execution_result_cards") or []),
+            "result_narration": analysis.get("result_narration"),
+            "result_narrations": list(analysis.get("result_narrations") or []),
+            "created_at": analysis.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        session_data.setdefault("private_analysis", []).append(entry)
+        session_data["updated_at"] = datetime.now().isoformat()
+        self._session_path(session_id).write_text(
+            json.dumps(session_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return entry
+
+    def get_private_analysis(self, session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+        """获取当前用户可见的私有分析；该数据不送入任何普通 LLM。"""
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return []
+        analyses = session_data.get("private_analysis", [])
+        if not isinstance(analyses, list):
+            return []
+        return analyses[-limit:] if limit is not None else analyses
+
     def set_pending_review(self, session_id: str, review: dict[str, Any] | None) -> dict[str, Any] | None:
         """保存或清除会话中尚未确认的安全审查卡片数据。"""
         return self.update_session(session_id, {"pending_review": review})
@@ -147,6 +189,17 @@ class SessionManager:
             return None
         review = session_data.get("pending_review")
         return review if isinstance(review, dict) else None
+
+    def set_pending_run_state(self, session_id: str, state: dict[str, Any] | None) -> dict[str, Any] | None:
+        """持久化可恢复的待确认运行状态，不保存执行结果行。"""
+        return self.update_session(session_id, {"pending_run_state": state})
+
+    def get_pending_run_state(self, session_id: str) -> dict[str, Any] | None:
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return None
+        state = session_data.get("pending_run_state")
+        return state if isinstance(state, dict) else None
 
     def set_run_detail(self, session_id: str, detail: dict[str, Any] | None) -> dict[str, Any] | None:
         """保存或清除右侧面板的安全运行追踪。"""

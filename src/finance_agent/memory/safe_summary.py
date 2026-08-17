@@ -16,6 +16,7 @@ def build_public_memory_entry(
     execution_card: ExecutionResultCard,
     private_record: PrivateResultRecord,
     user_query: str | None = None,
+    plan_result_ref: str | None = None,
 ) -> PublicMemoryEntry:
     # 构建查询结果摘要
     result_summary = _build_result_summary(execution_card.result, execution_card.row_count)
@@ -25,6 +26,7 @@ def build_public_memory_entry(
         request_id=request_id,
         session_id=session_id,
         result_ref=private_record.result_ref,
+        plan_result_ref=plan_result_ref,
         method_name=method.name,
         method_type=method.method_type,
         fields=execution_card.data_authorization.fields,

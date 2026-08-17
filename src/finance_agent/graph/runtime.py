@@ -205,7 +205,8 @@ class FinanceAgentRuntime:
         # 调用图
         result = await self.graph.ainvoke(initial, config=config)
 
-        # 保存 assistant 回复到 session
+        # 普通回复进入 conversation_history。执行结果由对应的授权执行方法
+        # 写入独立的 private_analysis，供当前用户刷新后查看，但不进入普通模型上下文。
         answer = result.get("answer")
         if answer:
             self.session_manager.add_message(session_id, "assistant", answer)
@@ -275,6 +276,9 @@ class FinanceAgentRuntime:
             if len(final_methods) > 1
             else build_data_authorization_card(final_methods[0], row_limit=self.policy.max_rows)
         )
+        # 一个方法集合对应一个稳定的聚合引用；各步骤仍保留自己的 result_ref。
+        # 聚合引用不包含结果值，只绑定本次请求和最终授权方法集合。
+        plan_result_ref = f"plan_{stable_hash({'request_id': state['request_id'], 'method_set_hash': aggregate_authorization.method_hash})}"
         for index, (method, execution) in enumerate(zip(final_methods, executions, strict=True), start=1):
             # 修复后的 SQL 可能与确认时不同，因此基于所有最终方法重新生成授权信息。
             # 多 draft 仍共享一张确认范围卡，但每个步骤保留独立结果卡。
@@ -293,7 +297,9 @@ class FinanceAgentRuntime:
                     "real_database_used": card.real_database_used,
                     "method_set_size": len(original_methods),
                     "method_index": index,
-                    # 仅供后端下一轮 A 路径恢复参数；不进入任何 LLM 上下文。
+                    "plan_result_ref": plan_result_ref,
+                    "method_set_hash": aggregate_authorization.method_hash,
+                    # 仅供后端下一轮重新生成查询路径恢复参数；不进入任何 LLM 上下文。
                     "source_params": source_params,
                 },
             )
@@ -305,6 +311,7 @@ class FinanceAgentRuntime:
                     execution_card=card,
                     private_record=private_record,
                     user_query=state.get("user_query"),
+                    plan_result_ref=plan_result_ref,
                 )
             )
 
@@ -345,6 +352,8 @@ class FinanceAgentRuntime:
             **state,
             "status": "method_execution_failed" if failures else "executed_simulated_real",
             "result_ref": private_records[0].result_ref,
+            "result_refs": [record.result_ref for record in private_records],
+            "plan_result_ref": plan_result_ref,
             "public_memory_entry": public_data[0],
             "execution_result_card": card_data[0],
             "execution_result_cards": card_data,
@@ -358,7 +367,9 @@ class FinanceAgentRuntime:
             "answer": "\n\n".join(answer_parts),
             "errors": state.get("errors", []) + failures,
         }
-        return self.audit(next_state)
+        audited = self.audit(next_state)
+        self._persist_private_analysis(audited)
+        return audited
 
     def _execute_one_method_with_repair(
         self,
@@ -606,8 +617,8 @@ class FinanceAgentRuntime:
         validation = state["action_validation"]
         if validation.get("route") != "method_flow":
             return "direct_response"
-        # 统一走 A 路径：后续请求只参考安全的历史查询记录，重新生成
-        # 完整 SQL 并重新查询当前数据。旧的 result_ref/B 路径保留在图中
+        # 统一走重新生成查询路径：后续请求只参考安全的历史查询记录，重新生成
+        # 完整 SQL 并重新查询当前数据。旧的直接基于历史结果计算路径保留在图中
         # 仅用于兼容历史 checkpoint，但新请求不可再进入该路径。
         return "method_flow"
 
@@ -1550,7 +1561,7 @@ class FinanceAgentRuntime:
         )
         # 兼容旧 B 接口时也不把 prior result 行发送给普通回复 LLM。
         answer = render_user_narration(narration)
-        return self.audit(
+        audited = self.audit(
             {
                 **state,
                 "status": "executed_simulated_real",
@@ -1565,10 +1576,33 @@ class FinanceAgentRuntime:
                 "answer": answer,
             }
         )
+        self._persist_private_analysis(audited)
+        return audited
 
     @staticmethod
     def _can_repair(state: AgentState) -> bool:
         return state.get("repair_attempts", 0) < MAX_METHOD_REPAIR_ATTEMPTS
+
+    def _persist_private_analysis(self, state: AgentState) -> None:
+        """保存真实结果与解读到用户可见私有区，不写入普通会话历史。"""
+        if not state.get("session_id") or not state.get("answer"):
+            return
+        if not (state.get("result_narrations") or state.get("execution_result_cards") or state.get("execution_result_card")):
+            return
+        self.session_manager.add_private_analysis(
+            state["session_id"],
+            {
+                "request_id": state.get("request_id", ""),
+                "answer": state.get("answer", ""),
+                "result_ref": state.get("result_ref"),
+                "result_refs": state.get("result_refs"),
+                "plan_result_ref": state.get("plan_result_ref"),
+                "execution_result_card": state.get("execution_result_card"),
+                "execution_result_cards": state.get("execution_result_cards"),
+                "result_narration": state.get("result_narration"),
+                "result_narrations": state.get("result_narrations"),
+            },
+        )
 
     async def _prepare_method_after_analysis_plan(self, state: AgentState) -> AgentState:
         next_state = self.generate_method(state)
@@ -1649,6 +1683,8 @@ class FinanceAgentRuntime:
                 for item in (state.get("result_narrations") or [])
             ],
             "result_ref": state.get("result_ref"),
+            "result_refs": state.get("result_refs"),
+            "plan_result_ref": state.get("plan_result_ref"),
             "referenced_result_ref": state.get("referenced_result_ref"),
             "public_memory_entry": state.get("public_memory_entry"),
             "public_memory_context": state.get("public_memory_context"),
@@ -1672,10 +1708,16 @@ class FinanceAgentRuntime:
         except Exception as e:
             event["memory_extraction_error"] = str(e)
 
-        # 更新对话历史（保存到状态，LangGraph checkpointer 会自动持久化）
+        # 更新普通对话历史（保存到状态，LangGraph checkpointer 会自动持久化）。
+        # 真实结果解读只保存在 private_analysis，不得进入普通上下文状态。
         conversation_history = state.get("conversation_history", [])
         answer = state.get("answer")
-        if answer:
+        has_private_result = bool(
+            state.get("result_narrations")
+            or state.get("execution_result_cards")
+            or state.get("execution_result_card")
+        )
+        if answer and not has_private_result:
             conversation_history.append({"role": "assistant", "content": answer})
 
         return {**state, "audit": audit, "conversation_history": conversation_history}

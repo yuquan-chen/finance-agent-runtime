@@ -28,6 +28,8 @@ class RunResponse(BaseModel):
     answer: str | None = None
     errors: list[str] = []
     result_ref: str | None = None
+    plan_result_ref: str | None = None
+    result_refs: list[str] | None = None
     referenced_result_ref: str | None = None
     public_memory_entry: dict[str, Any] | None = None
     public_memory_context: list[dict[str, Any]] | None = None
@@ -651,7 +653,7 @@ async def create_run_stream(question: str, session_id: str | None = None):
 
 @app.post("/v1/runs/{request_id}/analysis-plan/approve", response_model=RunResponse)
 async def approve_analysis_plan(request_id: str) -> RunResponse:
-    state = PENDING_RUNS.get(request_id)
+    state = _load_pending_run(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="pending analysis plan review not found")
     try:
@@ -665,7 +667,7 @@ async def approve_analysis_plan(request_id: str) -> RunResponse:
 @app.post("/v1/runs/{request_id}/method-review/approve", response_model=RunResponse)
 async def approve_method_review(request_id: str) -> RunResponse:
     # 优先使用 request_id；兼容旧版 thread_ 缓存键。
-    state = PENDING_RUNS.get(request_id)
+    state = _load_pending_run(request_id)
     if state is None:
         # 兼容旧版 thread_ 缓存键。
         for key, value in PENDING_RUNS.items():
@@ -685,7 +687,7 @@ async def approve_method_review(request_id: str) -> RunResponse:
 @app.post("/v1/runs/{request_id}/method-review/revise", response_model=RunResponse)
 async def revise_method_review(request_id: str, request: MethodReviewRevisionRequest) -> RunResponse:
     """修订待确认的方法集合；修订后仍需用户再次确认执行。"""
-    state = PENDING_RUNS.get(request_id)
+    state = _load_pending_run(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="pending method review not found")
     try:
@@ -704,7 +706,7 @@ async def revise_method_review(request_id: str, request: MethodReviewRevisionReq
 
 @app.post("/v1/runs/{request_id}/data-authorization/approve", response_model=RunResponse)
 async def approve_data_authorization(request_id: str) -> RunResponse:
-    state = PENDING_RUNS.get(request_id)
+    state = _load_pending_run(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="pending run not found")
     try:
@@ -719,7 +721,7 @@ async def approve_data_authorization(request_id: str) -> RunResponse:
 
 @app.post("/v1/runs/{request_id}/prior-result-authorization/approve", response_model=RunResponse)
 async def approve_prior_result_authorization(request_id: str) -> RunResponse:
-    state = PENDING_RUNS.get(request_id)
+    state = _load_pending_run(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="pending run not found")
     try:
@@ -829,6 +831,10 @@ async def get_session_history(session_id: str, limit: int | None = None):
     """获取 session 的对话历史。"""
     history = runtime().session_manager.get_conversation_history(session_id, limit)
     pending_review = runtime().session_manager.get_pending_review(session_id)
+    persisted_state = runtime().session_manager.get_pending_run_state(session_id)
+    if persisted_state and persisted_state.get("request_id"):
+        PENDING_RUNS[persisted_state["request_id"]] = dict(persisted_state)
+        PENDING_RUNS[session_id] = dict(persisted_state)
     # 兼容本次升级前已在内存中等待确认的会话：首次读取历史时补写安全卡片。
     if pending_review is None:
         in_memory_state = PENDING_RUNS.get(session_id)
@@ -838,6 +844,7 @@ async def get_session_history(session_id: str, limit: int | None = None):
     return {
         "session_id": session_id,
         "history": history,
+        "private_analysis": runtime().session_manager.get_private_analysis(session_id),
         "pending_review": pending_review,
         "run_detail": runtime().session_manager.get_run_detail(session_id),
     }
@@ -856,6 +863,10 @@ def _sync_pending_review(state: dict[str, Any]) -> None:
         PENDING_RUNS[request_id] = dict(state)
         if session_id:
             PENDING_RUNS[session_id] = dict(state)
+            runtime().session_manager.set_pending_run_state(
+                session_id,
+                _persistable_pending_state(state),
+            )
             runtime().session_manager.set_pending_review(
                 session_id,
                 _response_from_state(state).model_dump(mode="json"),
@@ -866,7 +877,38 @@ def _sync_pending_review(state: dict[str, Any]) -> None:
         PENDING_RUNS.pop(request_id, None)
     if session_id:
         PENDING_RUNS.pop(session_id, None)
+        runtime().session_manager.set_pending_run_state(session_id, None)
         runtime().session_manager.set_pending_review(session_id, None)
+
+
+def _persistable_pending_state(state: dict[str, Any]) -> dict[str, Any]:
+    """保存待确认所需状态，排除执行结果和私有分析内容。"""
+    excluded = {
+        "result", "rows", "referenced_result_data", "execution_result_card",
+        "execution_result_cards", "result_narration", "result_narrations",
+        "private_analysis", "public_memory_entry", "public_memory_entries",
+    }
+    return {
+        key: value
+        for key, value in state.items()
+        if key not in excluded
+    }
+
+
+def _load_pending_run(request_id: str) -> dict[str, Any] | None:
+    """优先读内存；服务重启后从 session 持久化状态恢复。"""
+    state = PENDING_RUNS.get(request_id)
+    if state is not None:
+        return state
+    manager = runtime().session_manager
+    for session in manager.list_sessions():
+        candidate = manager.get_pending_run_state(session["session_id"])
+        if candidate and candidate.get("request_id") == request_id:
+            PENDING_RUNS[request_id] = dict(candidate)
+            if candidate.get("session_id"):
+                PENDING_RUNS[candidate["session_id"]] = dict(candidate)
+            return candidate
+    return None
 
 
 def _safe_run_detail(state: dict[str, Any]) -> dict[str, Any]:
@@ -930,6 +972,8 @@ def _response_from_state(state: dict[str, Any]) -> RunResponse:
         answer=state.get("answer"),
         errors=state.get("errors", []),
         result_ref=state.get("result_ref"),
+        plan_result_ref=state.get("plan_result_ref"),
+        result_refs=state.get("result_refs"),
         referenced_result_ref=state.get("referenced_result_ref"),
         public_memory_entry=state.get("public_memory_entry"),
         public_memory_context=state.get("public_memory_context"),
