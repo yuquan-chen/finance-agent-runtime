@@ -22,6 +22,8 @@ class PublicMemoryEntry(BaseModel):
     values_visible_to_llm: bool = False
     # 新增：SQL 和查询结果摘要
     sql_template: str | None = None
+    # 已脱敏的业务目标，供 A 路径重新生成 SQL；不保存真实结果值。
+    goal: str | None = None
     user_query: str | None = None
     result_summary: str | None = None  # 查询结果的文字摘要
     created_at: str = Field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
@@ -50,15 +52,20 @@ class PublicMemoryStore:
     def context_for_llm(self, session_id: str, limit: int = 5) -> list[dict[str, Any]]:
         """返回 memory 条目，用于注入到 LLM 上下文。"""
         entries = []
-        for entry in self.latest(limit, session_id=session_id):
+        for candidate, entry in enumerate(self.latest(limit, session_id=session_id), start=1):
             entries.append({
                 "type": "memory",
-                "result_ref": entry.result_ref,
+                # 编号只在本次上下文中有效，按最新到最旧排列；LLM 不生成内部 result_ref。
+                "query_candidate": candidate,
                 "name": entry.method_name,
-                "description": f"之前的查询: {entry.user_query or '未知'}",
-                "content": f"SQL: {entry.sql_template or '无'}\n结果: {entry.result_summary or '无'}",
+                "description": f"之前的查询候选 {candidate}",
+                # 参数化 SQL 可以作为 A 路径的参考；真实参数和结果值不进入 LLM。
+                "content": f"SQL 模板: {entry.sql_template or '无'}\n结果结构摘要: {entry.result_summary or '无'}",
+                "goal": entry.goal or "",
+                "sql_template": entry.sql_template or "",
                 "fields": entry.fields,
                 "row_count": entry.row_count,
+                "result_shape": entry.result_shape,
             })
         return entries
 

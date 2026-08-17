@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from finance_agent.harness.analysis_schema import ExecutionResultCard, MethodDraft
@@ -32,6 +33,7 @@ def build_public_memory_entry(
         real_database_used=execution_card.real_database_used,
         values_visible_to_llm=False,
         sql_template=method.sql_template,
+        goal=_redact_goal(method.goal, method.params),
         user_query=user_query,
         result_summary=result_summary,
     )
@@ -48,6 +50,15 @@ def _build_result_summary(result: dict[str, Any] | list[dict[str, Any]], row_cou
         keys = list(result.keys())
         return f"返回对象，字段: {', '.join(keys[:5])}"
     return "查询完成"
+
+
+def _redact_goal(goal: str, params: dict[str, Any] | None) -> str:
+    """Keep user values in the private method, but remove them from safe memory."""
+    redacted = goal or ""
+    for value in sorted((str(value) for value in (params or {}).values() if value is not None), key=len, reverse=True):
+        if value.strip():
+            redacted = re.sub(re.escape(value), "[参数]", redacted, flags=re.IGNORECASE)
+    return redacted
 
 
 def infer_result_shape(result: dict[str, Any] | list[dict[str, Any]]) -> dict[str, Any]:

@@ -79,6 +79,19 @@ class MethodReviewCard(BaseModel):
     approval_required: bool = True
 
 
+class MethodSetReviewCard(BaseModel):
+    """一次确认所覆盖的方法集合；steps 保留每个方法的审查信息。"""
+
+    method_name: str = "method_set"
+    method_type: str = "method_set"
+    goal: str
+    steps: list[MethodReviewCard] = Field(default_factory=list)
+    required_fields: list[str] = Field(default_factory=list)
+    logic_summary: list[str] = Field(default_factory=list)
+    risk_level: str = "low"
+    approval_required: bool = True
+
+
 class AnalysisPlanReviewCard(BaseModel):
     goal: str
     skill_id: str | None = None

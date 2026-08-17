@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from typing import Any
 
@@ -16,6 +17,7 @@ SYSTEM_PROMPT = """你是一个友好的数据分析助手。根据系统数据�
 
 关于 SQL 的解读：
 - 【强制】如果系统提供了 SQL，必须使用系统提供的 SQL，不要自己生成新的 SQL！
+- SQL 必须放在 ```sql 代码块中；不要在普通文字中重复或改写 SQL。
 - 展示 SQL 后，用一句话简单说明这个查询会做什么
 - 用通俗的语言解释，比如"按 status 分组，统计每个状态有多少笔交易"
 - 不要说"分析思路"、"可以发现什么"这种话，直接说查询做了什么
@@ -28,8 +30,8 @@ SYSTEM_PROMPT = """你是一个友好的数据分析助手。根据系统数据�
 关于上下文：
 - 系统会提供【之前的查询记录】，这是用户之前做过的查询
 - 理解用户意图时，要结合之前的查询记录
-- 当用户说"排序一下"、"筛选一下"、"按XX分组"等操作性指令时，是指对之前的查询结果进行操作
-- 修改 SQL 时，基于之前的 SQL 进行修改，不要生成全新的查询
+- 当用户说"排序一下"、"筛选一下"、"按XX分组"等操作性指令时，结合正确的历史查询目标和参数化 SQL 重新生成查询
+- 后续查询默认按当前最新数据重新执行，不直接读取或计算上一次结果
 
 关于结果展示：
 - 【强制】如果查询结果为空，必须说"查询结果为空"，不能编造数据
@@ -182,7 +184,93 @@ async def generate_reply(
         llm_messages,
         temperature=0.7,
     )
-    return response.content.strip()
+    # SQL 只能来自结构化方法，不能由回复 LLM 重新改写。
+    # 回复模型仍然负责自然语言解释，但代码块会在返回前同步到唯一事实源。
+    return _synchronize_review_sql(response.content.strip(), context)
+
+
+_CODE_FENCE_RE = re.compile(
+    r"```(?P<language>[A-Za-z0-9_+.-]*)?[ \t]*\r?\n(?P<body>[\s\S]*?)```",
+    re.IGNORECASE,
+)
+
+
+def _review_sql_templates(context: dict[str, Any]) -> list[str]:
+    """取出待确认方法中的规范 SQL；只处理方法审查阶段。"""
+    context_type = context.get("type")
+    if context_type == "method_review":
+        sql = context.get("sql_template")
+        return [sql.strip() for sql in [sql] if isinstance(sql, str) and sql.strip()]
+    if context_type == "method_set_review":
+        templates: list[str] = []
+        for step in context.get("steps") or []:
+            sql = step.get("sql_template") if isinstance(step, dict) else None
+            if isinstance(sql, str) and sql.strip():
+                templates.append(sql.strip())
+        return templates
+    return []
+
+
+def _looks_like_sql(language: str, body: str) -> bool:
+    if language.strip().lower() in {"sql", "postgres", "postgresql", "pgsql"}:
+        return True
+    # 回复模型有时省略 ```sql 语言标记；只把明显的 SQL 代码块纳入同步。
+    if language.strip():
+        return False
+    return bool(re.match(r"^\s*(?:select|with)\b", body, re.IGNORECASE))
+
+
+def _synchronize_review_sql(answer: str, context: dict[str, Any]) -> str:
+    """用方法 SQL 替换回复中的 SQL 代码块，保证展示与执行完全一致。
+
+    方法审查阶段的 SQL 是参数化模板，不能让普通回复 LLM 重新生成。
+    如果模型漏掉代码块，则补到回复末尾；如果多生成了 SQL 代码块，则移除多余块。
+    非 SQL 代码（例如 Python）保持原样。
+    """
+    templates = _review_sql_templates(context)
+    if not templates or not answer:
+        return answer
+
+    sql_index = 0
+    replacements: list[tuple[int, int, str]] = []
+    for match in _CODE_FENCE_RE.finditer(answer):
+        language = match.group("language") or ""
+        body = match.group("body") or ""
+        if not _looks_like_sql(language, body):
+            continue
+        if sql_index < len(templates):
+            replacement = f"```sql\n{templates[sql_index]}\n```"
+            sql_index += 1
+        else:
+            # 多余的 SQL 是回复模型自行添加的，不能让它进入用户可见回复。
+            replacement = ""
+        replacements.append((match.start(), match.end(), replacement))
+
+    if replacements:
+        chunks: list[str] = []
+        cursor = 0
+        for start, end, replacement in replacements:
+            chunks.append(answer[cursor:start])
+            chunks.append(replacement)
+            cursor = end
+        chunks.append(answer[cursor:])
+        synchronized = "".join(chunks).strip()
+    else:
+        synchronized = answer.strip()
+
+    if sql_index < len(templates):
+        missing = templates[sql_index:]
+        if len(templates) == 1:
+            label = "系统生成的 SQL："
+            blocks = [f"{label}\n```sql\n{sql}\n```" for sql in missing]
+        else:
+            blocks = [
+                f"步骤 {sql_index + offset + 1} SQL：\n```sql\n{sql}\n```"
+                for offset, sql in enumerate(missing)
+            ]
+        synchronized = f"{synchronized}\n\n" + "\n\n".join(blocks)
+
+    return synchronized.strip()
 
 
 def _format_context(context: dict[str, Any]) -> str:

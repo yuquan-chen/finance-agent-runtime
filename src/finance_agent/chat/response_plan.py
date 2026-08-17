@@ -23,7 +23,10 @@ class MethodProposal(BaseModel):
     """统一的方法提案。有提案 = 需要计算，无提案 = 纯文本回复。"""
     entity_id: str | None = None            # 注册的 capability/skill id
     entity_type: str | None = None          # "capability" | "skill" | None（临时方法）
-    result_refs: list[str] = Field(default_factory=list)  # 引用的先前结果
+    # 兼容旧客户端字段。当前统一走 A 路径，不允许 LLM 用它路由到旧结果。
+    result_refs: list[str] = Field(default_factory=list)
+    # 当前会话安全查询卡的候选编号（1=最新）。不是 result_ref，也不直接代表结果数据。
+    base_query_candidate: int | None = None
     goal: str = ""                          # 分析目标
     preferred_runtime: str = "auto"         # sql | python | auto
     reason: str = ""
@@ -121,6 +124,7 @@ INSTRUCTIONS = """# 角色
     "entity_id": "匹配的能力/技能 id，无匹配留空",
     "entity_type": "capability 或 skill，无匹配留空",
     "result_refs": [],
+    "base_query_candidate": null,
     "goal": "不包含用户实际筛选值的分析目标",
     "preferred_runtime": "sql | python | auto",
     "reason": "简短原因",
@@ -171,6 +175,10 @@ skill > capability > operations > 新查询
 - 【强制】不要改变参数值的大小写！用户输入什么就保留什么
 - 例如用户说"查询 Company 10 的 KYC 状态"，则 params: {"customer_name": "Company 10"}。
 - result_refs 必须始终为空；内部结果句柄不属于你的输出。
+- 所有后续查询都走 A 路径：参考安全的历史 goal/参数化 SQL，重新生成完整 SQL，
+  再按当前最新数据执行。不要尝试直接读取或计算上一次结果。
+- 如果 context.prior_results 中存在多个历史查询，只有在当前消息明确是后续修改时，
+  才填写 base_query_candidate；只能填写 context 中出现的 query_candidate 编号，不能猜编号。
 """
 
 # Layer 2: Context — 纯数据索引，不加任何指导语
@@ -353,16 +361,17 @@ def validate_response_plan(
             user_goal=message.strip(),
         )
 
-    # 只接受私有结果库实际使用的 result_xxx 引用。方法名、skill 名等
-    # 不得触发 prior-result 路径，否则会把一次新查询错误地路由为旧结果计算。
-    normalized_refs, invalid_refs = _normalize_result_refs(proposal)
-    proposal.result_refs = normalized_refs
-    if invalid_refs:
-        proposal.reason = proposal.reason or "忽略了无效的先前结果引用，按新查询处理"
+    # 统一走 A 路径：即使旧客户端/模型带了 result_ref，也不能触发
+    # “直接读取上一次结果”的 B 路径。历史查询会通过安全的 goal、参数化
+    # SQL 和用户消息提供给后续规划器，后端随后重新生成并执行 SQL。
+    legacy_refs = list(proposal.result_refs or [])
+    proposal.result_refs = []
+    if legacy_refs:
+        proposal.reason = proposal.reason or "忽略旧结果引用，按当前数据重新生成并执行查询"
 
     validation = _validate_proposal(proposal, message, operation_registry, skill_registry)
-    if invalid_refs:
-        validation.warnings.append(f"忽略无效 result_ref: {', '.join(invalid_refs)}")
+    if legacy_refs:
+        validation.warnings.append("当前统一按 A 路径处理：忽略旧结果引用，按最新数据重新查询")
     return validation
 
 
@@ -437,8 +446,10 @@ def _validate_proposal(
     final_proposal = MethodProposal(
         entity_id=entity_id,
         entity_type=entity_type,
-        result_refs=proposal.result_refs,
+        # A 路径不把内部结果句柄交给后续路由。
+        result_refs=[],
         goal=user_goal,
+        base_query_candidate=proposal.base_query_candidate,
         preferred_runtime=proposal.preferred_runtime,
         reason=proposal.reason,
         sql=proposal.sql,

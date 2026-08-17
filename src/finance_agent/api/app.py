@@ -18,6 +18,10 @@ class RunRequest(BaseModel):
     session_id: str | None = None  # 用于 session 管理
 
 
+class MethodReviewRevisionRequest(BaseModel):
+    instruction: str
+
+
 class RunResponse(BaseModel):
     request_id: str
     status: str
@@ -45,6 +49,7 @@ class RunResponse(BaseModel):
     internal_method_review: dict[str, Any] | None = None
     method_review_card: dict[str, Any] | None = None
     method_review_cards: list[dict[str, Any]] | None = None
+    method_set_review_card: dict[str, Any] | None = None
     data_authorization_card: dict[str, Any] | None = None
     prior_result_authorization_card: dict[str, Any] | None = None
     execution_result_card: dict[str, Any] | None = None
@@ -677,6 +682,26 @@ async def approve_method_review(request_id: str) -> RunResponse:
     return _response_from_state(state)
 
 
+@app.post("/v1/runs/{request_id}/method-review/revise", response_model=RunResponse)
+async def revise_method_review(request_id: str, request: MethodReviewRevisionRequest) -> RunResponse:
+    """修订待确认的方法集合；修订后仍需用户再次确认执行。"""
+    state = PENDING_RUNS.get(request_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="pending method review not found")
+    try:
+        state = await runtime().revise_method_review(state, request.instruction)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _sync_pending_review(state)
+    # 修订本身也是用户消息；只保存修订说明和安全方法卡，不保存结果行。
+    session_id = state.get("session_id")
+    if session_id:
+        runtime().session_manager.add_message(session_id, "user", request.instruction)
+        if state.get("answer"):
+            runtime().session_manager.add_message(session_id, "assistant", state["answer"])
+    return _response_from_state(state)
+
+
 @app.post("/v1/runs/{request_id}/data-authorization/approve", response_model=RunResponse)
 async def approve_data_authorization(request_id: str) -> RunResponse:
     state = PENDING_RUNS.get(request_id)
@@ -710,7 +735,7 @@ async def approve_prior_result_authorization(request_id: str) -> RunResponse:
 @app.post("/api/clear-memory")
 async def clear_public_memory():
     """清空公共记忆（public_memory.jsonl）。"""
-    memory_path = Path(runtime().settings.public_memory_store_path)
+    memory_path = Path(runtime().settings.public_memory_path)
     if memory_path.exists():
         memory_path.write_text("")
     return {"status": "ok", "message": "公共记忆已清空"}
@@ -858,17 +883,31 @@ def _safe_run_detail(state: dict[str, Any]) -> dict[str, Any]:
             entries.append({"label": label, "content": value})
     if state.get("errors"):
         entries.append({"label": "错误", "content": state["errors"], "type": "error"})
-    execution = state.get("execution_result_card")
-    if execution:
+    executions = state.get("execution_result_cards") or (
+        [state.get("execution_result_card")] if state.get("execution_result_card") else []
+    )
+    if executions:
         entries.append(
             {
-                "label": "执行完成",
-                "content": {
-                    "row_count": execution.get("row_count"),
-                    "execution_mode": execution.get("execution_mode"),
-                    "real_database_used": execution.get("real_database_used", False),
-                },
-                "type": "success",
+                "label": "执行完成" if len(executions) == 1 else f"执行完成（{len(executions)} 个步骤）",
+                "content": (
+                    {
+                        "row_count": executions[0].get("row_count"),
+                        "execution_mode": executions[0].get("execution_mode"),
+                        "real_database_used": executions[0].get("real_database_used", False),
+                    }
+                    if len(executions) == 1
+                    else [
+                        {
+                            "step": index + 1,
+                            "row_count": execution.get("row_count"),
+                            "execution_mode": execution.get("execution_mode"),
+                            "real_database_used": execution.get("real_database_used", False),
+                        }
+                        for index, execution in enumerate(executions)
+                    ]
+                ),
+                "type": "success" if state.get("status") == "executed_simulated_real" else "error",
             }
         )
 
@@ -912,6 +951,7 @@ def _response_from_state(state: dict[str, Any]) -> RunResponse:
         internal_method_review=state.get("internal_method_review"),
         method_review_card=state.get("method_review_card"),
         method_review_cards=state.get("method_review_cards"),
+        method_set_review_card=state.get("method_set_review_card"),
         data_authorization_card=state.get("data_authorization_card"),
         prior_result_authorization_card=state.get("prior_result_authorization_card"),
         execution_result_card=state.get("execution_result_card"),

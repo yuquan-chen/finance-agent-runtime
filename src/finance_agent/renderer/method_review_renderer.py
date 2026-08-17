@@ -16,6 +16,7 @@ from finance_agent.harness.analysis_schema import (
     ExecutionResultCard,
     MethodDraft,
     MethodReviewCard,
+    MethodSetReviewCard,
     MockDryRunResult,
     PriorResultAuthorizationCard,
 )
@@ -35,6 +36,30 @@ def build_method_review_card(method: MethodDraft, mock_result) -> MethodReviewCa
         logic_summary=method.logic_summary,
         mock_result=mock_result,
         risk_level=method.risk_level,
+        approval_required=True,
+    )
+
+
+def build_method_set_review_card(
+    plan: AnalysisPlan,
+    cards: list[MethodReviewCard],
+) -> MethodSetReviewCard:
+    """构造一个覆盖全部步骤的确认卡，而不是为每个步骤创建确认按钮。"""
+    fields: list[str] = []
+    seen: set[str] = set()
+    for card in cards:
+        for field in card.required_fields:
+            if field not in seen:
+                seen.add(field)
+                fields.append(field)
+    risks = {card.risk_level for card in cards}
+    risk_level = "high" if "high" in risks else ("medium" if "medium" in risks else "low")
+    return MethodSetReviewCard(
+        goal=plan.goal,
+        steps=cards,
+        required_fields=fields,
+        logic_summary=[f"共 {len(cards)} 个独立分析步骤，确认后按顺序执行。"],
+        risk_level=risk_level,
         approval_required=True,
     )
 

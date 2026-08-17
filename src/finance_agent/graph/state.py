@@ -40,6 +40,7 @@ class AgentState(MessagesState):
     repair_history: list[dict[str, Any]]
     method_review_card: dict[str, Any]
     method_review_cards: list[dict[str, Any]]
+    method_set_review_card: dict[str, Any]
     data_authorization_card: dict[str, Any]
     execution_result_card: dict[str, Any]
     execution_result_cards: list[dict[str, Any]]

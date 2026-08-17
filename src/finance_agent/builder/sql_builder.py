@@ -90,10 +90,84 @@ def build_sql(plan: QueryPlan, policy: Policy) -> str:
 
 
 def assert_readonly_sql(sql: str, policy: Policy) -> None:
+    """深度安全检查：验证 SQL 只包含只读操作。
+
+    检查策略：
+    1. 第一个词必须是 SELECT 或 WITH
+    2. 禁止危险关键词和函数（包括子查询、CTE 中的调用）
+    3. 禁止访问系统表/视图
+    4. 禁止注释中的危险内容
+    """
     stripped = sql.strip()
+
+    # 1. 检查第一个词
     first = stripped.split(None, 1)[0].lower()
     if first not in {"select", "with"}:
         raise SqlBuildError("only SELECT/WITH read-only SQL is allowed")
+
+    # 2. 移除注释，避免绕过检查
+    # 移除单行注释 (-- ...)
+    no_comments = re.sub(r'--[^\n]*', '', stripped)
+    # 移除多行注释 (/* ... */)
+    no_comments = re.sub(r'/\*.*?\*/', '', no_comments, flags=re.DOTALL)
+
+    # 3. 检查危险关键词和函数
     forbidden = "|".join(re.escape(word) for word in policy.forbidden_sql_keywords)
-    if forbidden and re.search(rf"\b({forbidden})\b", stripped, re.I):
+    if forbidden and re.search(rf"\b({forbidden})\b", no_comments, re.I):
         raise SqlBuildError("forbidden SQL keyword detected")
+
+    # 4. 检查危险的函数调用模式（函数名后跟括号）
+    dangerous_functions = [
+        r'\bpg_read_file\s*\(',
+        r'\bpg_write_file\s*\(',
+        r'\bpg_read_binary_file\s*\(',
+        r'\blo_import\s*\(',
+        r'\blo_export\s*\(',
+        r'\bpg_ls_dir\s*\(',
+        r'\bpg_stat_file\s*\(',
+        r'\bpg_sleep\s*\(',
+        r'\bpg_sleep_for\s*\(',
+        r'\bpg_sleep_until\s*\(',
+        r'\bdblink\s*\(',
+        r'\bdblink_exec\s*\(',
+        r'\bdblink_connect\s*\(',
+        r'\bdblink_open\s*\(',
+        r'\bdblink_fetch\s*\(',
+        r'\bdblink_close\s*\(',
+        r'\bdblink_disconnect\s*\(',
+        r'\bcopy\s+.*\bto\b',  # COPY ... TO (文件操作)
+        r'\bcopy\s+.*\bfrom\b',  # COPY ... FROM (文件操作)
+    ]
+    for pattern in dangerous_functions:
+        if re.search(pattern, no_comments, re.I):
+            raise SqlBuildError(f"dangerous function call detected: {pattern}")
+
+    # 5. 检查系统表/视图访问
+    system_tables = [
+        r'\bpg_stat_activity\b',
+        r'\bpg_stat_replication\b',
+        r'\bpg_stat_wal_receiver\b',
+        r'\bpg_stat_ssl\b',
+        r'\bpg_stat_progress\b',
+        r'\bpg_user\b',
+        r'\bpg_shadow\b',
+        r'\bpg_group\b',
+        r'\bpg_roles\b',
+        r'\bpg_authid\b',
+        r'\bpg_auth_members\b',
+    ]
+    for pattern in system_tables:
+        if re.search(pattern, no_comments, re.I):
+            raise SqlBuildError(f"system table access detected: {pattern}")
+
+    # 6. 检查危险的字符串模式
+    dangerous_patterns = [
+        r"'\s*/etc/",  # 路径访问
+        r"'\s*/tmp/",
+        r"'\s*/var/",
+        r"'\s*\\",  # Windows 路径
+        r"'\s*[A-Za-z]:\\",
+    ]
+    for pattern in dangerous_patterns:
+        if re.search(pattern, no_comments, re.I):
+            raise SqlBuildError(f"dangerous path pattern detected")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from typing import Any
@@ -48,6 +49,7 @@ from finance_agent.renderer.method_review_renderer import (
     build_data_authorization_card_for_methods,
     build_execution_result_card,
     build_method_review_card,
+    build_method_set_review_card,
     render_analysis_plan_review_data,
     render_data_authorization_data,
     render_execution_result_data,
@@ -58,7 +60,7 @@ from finance_agent.renderer.method_review_renderer import (
     refuse_method_data,
 )
 from finance_agent.renderer.reply_generator import generate_reply
-from finance_agent.renderer.result_narrator import narrate_execution_result
+from finance_agent.renderer.result_narrator import narrate_execution_result, render_user_narration
 from finance_agent.sandbox.mock_sandbox import run_mock_dry_run, run_simulated_real_execution
 from finance_agent.session.manager import SessionManager, get_session_manager
 from finance_agent.skills.registry import SkillRegistry, load_skill_registry
@@ -230,153 +232,206 @@ class FinanceAgentRuntime:
         if not state.get("method_draft") and not state.get("method_drafts"):
             raise ValueError("run has no method draft")
 
-        # 生成授权卡片
-        methods = self._state_methods(state)
-        card = (
-            build_data_authorization_card_for_methods(methods, row_limit=self.policy.max_rows)
-            if len(methods) > 1
-            else build_data_authorization_card(methods[0], row_limit=self.policy.max_rows)
-        )
+        original_methods = self._state_methods(state)
+        final_methods: list[MethodDraft] = []
+        executions: list[Any] = []
+        failures: list[str] = []
 
-        # 尝试执行，如果失败则自动修复重试
-        max_attempts = 3
-        last_error = None
-        execution = None
+        # 一个确认卡可以包含多个 draft；确认后按生成顺序逐个执行。
+        # 某一步失败时继续执行其余步骤，最后将成功结果与失败原因一起返回。
+        for index, method in enumerate(original_methods, start=1):
+            method_state = {
+                **state,
+                "method_draft": method.model_dump(mode="json"),
+                "method_drafts": [method.model_dump(mode="json")],
+                "sql": method.sql_template,
+                "repair_attempts": 0,
+                "repair_history": [],
+                "errors": [],
+            }
+            _, final_method, execution, error = self._execute_one_method_with_repair(method_state, method)
+            if execution is None or final_method is None:
+                failures.append(f"步骤 {index}（{method.name}）执行失败：{error or '未知错误'}")
+                continue
+            final_methods.append(final_method)
+            executions.append(execution)
 
-        for attempt in range(max_attempts):
-            methods = self._state_methods(state)
-            execution = run_simulated_real_execution(methods[0])
-
-            if execution.status == "passed":
-                break  # 执行成功
-
-            # 执行失败，尝试修复
-            last_error = "; ".join(execution.errors) or f"simulated execution failed: {methods[0].name}"
-
-            if attempt < max_attempts - 1 and self._can_repair(state):
-                current_sql = state.get("sql") or (state.get("method_draft") or {}).get("sql_template", "")
-                user_goal = state.get("action_user_goal") or state["user_query"]
-                proposal = (state.get("action_validation") or {}).get("proposal") or {}
-                sql_input_slots = state.get("sql_input_slots") or self._sql_input_slots(proposal.get("params") or {})
-                sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, proposal.get("params") or {})
-                repaired_sql = self._call_llm_for_repair(
-                    sql_planning_goal,
-                    current_sql,
-                    last_error,
-                    state.get("visible_catalog"),
-                    input_slots=[{"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]} for slot in sql_input_slots],
-                )
-
-                if repaired_sql:
-                    import re
-                    table_match = re.search(r"FROM\s+(\w+)", repaired_sql, re.IGNORECASE)
-                    table_name = table_match.group(1) if table_match else "card_transaction"
-
-                    method = MethodDraft(
-                        method_type="sql",
-                        name="llm_repaired_sql",
-                        goal=user_goal,
-                        operation="custom_sql",
-                        table=table_name,
-                        data_source="table",
-                        sql_template=repaired_sql,
-                        params=self._bound_input_params(state),
-                        required_fields=self._extract_fields_from_sql(repaired_sql),
-                        output_schema={},
-                        risk_level="medium",
-                        logic_summary=[f"已完成查询校验与调整：{user_goal}"],
-                    )
-                    state = {
-                        **state,
-                        "method_draft": method.model_dump(mode="json"),
-                        "method_drafts": [method.model_dump(mode="json")],
-                        "sql": repaired_sql,
-                        "repair_attempts": state.get("repair_attempts", 0) + 1,
-                    }
-                    continue
-
-            break  # 无法修复或重试次数用完
-
-        # 如果仍然失败，返回错误信息
-        if not execution or execution.status != "passed":
+        if not executions:
             return self.audit({
                 **state,
                 "status": "method_execution_failed",
-                "answer": f"SQL 执行失败: {last_error}\n\n已尝试 {max_attempts} 次修复，但仍有问题。请检查查询条件或联系管理员。",
-                "errors": state.get("errors", []) + [last_error],
+                "answer": "所有查询步骤均执行失败：\n" + "\n".join(failures),
+                "errors": state.get("errors", []) + failures,
             })
 
-        # 执行成功，构建结果
-        methods = self._state_methods(state)
-        authorization = card
-
-        # 使用已有的执行结果，不重新执行
-        card = build_execution_result_card(methods[0], authorization, execution)
-        private_record = self.private_result_store.append(
-            request_id=state["request_id"],
-            session_id=state["session_id"],
-            method_name=methods[0].name,
-            method_hash=card.method_hash,
-            authorization_hash=stable_hash(authorization.model_dump(mode="json")),
-            result=card.result,
-            row_count=card.row_count,
-            metadata={
-                "execution_mode": card.execution_mode,
-                "real_database_used": card.real_database_used,
-                "method_set_size": 1,
-            },
+        proposal_params = ((state.get("action_validation") or {}).get("proposal") or {}).get("params") or {}
+        source_params = {**(state.get("base_query_params") or {}), **proposal_params}
+        cards = []
+        private_records = []
+        public_entries = []
+        narrations = []
+        aggregate_authorization = (
+            build_data_authorization_card_for_methods(final_methods, row_limit=self.policy.max_rows)
+            if len(final_methods) > 1
+            else build_data_authorization_card(final_methods[0], row_limit=self.policy.max_rows)
         )
-        public_memory = self.public_memory_store.append(
-            build_public_memory_entry(
+        for index, (method, execution) in enumerate(zip(final_methods, executions, strict=True), start=1):
+            # 修复后的 SQL 可能与确认时不同，因此基于所有最终方法重新生成授权信息。
+            # 多 draft 仍共享一张确认范围卡，但每个步骤保留独立结果卡。
+            authorization = aggregate_authorization
+            card = build_execution_result_card(method, authorization, execution)
+            private_record = self.private_result_store.append(
                 request_id=state["request_id"],
                 session_id=state["session_id"],
-                method=methods[0],
-                execution_card=card,
-                private_record=private_record,
-                user_query=state.get("user_query"),
+                method_name=method.name,
+                method_hash=card.method_hash,
+                authorization_hash=stable_hash(authorization.model_dump(mode="json")),
+                result=card.result,
+                row_count=card.row_count,
+                metadata={
+                    "execution_mode": card.execution_mode,
+                    "real_database_used": card.real_database_used,
+                    "method_set_size": len(original_methods),
+                    "method_index": index,
+                    # 仅供后端下一轮 A 路径恢复参数；不进入任何 LLM 上下文。
+                    "source_params": source_params,
+                },
             )
-        )
+            public_memory = self.public_memory_store.append(
+                build_public_memory_entry(
+                    request_id=state["request_id"],
+                    session_id=state["session_id"],
+                    method=method,
+                    execution_card=card,
+                    private_record=private_record,
+                    user_query=state.get("user_query"),
+                )
+            )
 
-        # 保存查询历史到文件型 memory（保存用户意图，不保存 SQL）
-        result_summary = f"返回 {card.row_count} 行"
+            # 保存查询历史到文件型 memory（保存用户意图，不保存 SQL）
+            sql_template = method.sql_template or ""
+            tables_from_sql = re.findall(r"(?:FROM|JOIN)\s+(\w+)", sql_template, re.IGNORECASE)
+            tables = list(set([f.split(".")[0] for f in method.required_fields if "." in f])) or tables_from_sql
+            self.memory_store.save_query_history(
+                user_query=state.get("user_query", ""),
+                result_summary=f"步骤 {index} 返回 {card.row_count} 行",
+                tables=tables,
+                fields=method.required_fields,
+                session_id=state["session_id"],
+            )
+            narration = narrate_execution_result(
+                card,
+                method,
+                self.settings,
+                self.llm_provider,
+                result_ref=private_record.result_ref,
+            )
+            cards.append(card)
+            private_records.append(private_record)
+            public_entries.append(public_memory)
+            narrations.append(narration)
 
-        # 从 SQL 中提取表名（如果 required_fields 为空）
-        import re
-        sql_template = methods[0].sql_template or ""
-        tables_from_sql = re.findall(r"(?:FROM|JOIN)\s+(\w+)", sql_template, re.IGNORECASE)
-        tables = list(set([f.split(".")[0] for f in methods[0].required_fields if "." in f])) or tables_from_sql
+        answer_parts = []
+        for index, narration in enumerate(narrations, start=1):
+            rendered = render_user_narration(narration)
+            answer_parts.append(f"步骤 {index}：\n{rendered}" if len(narrations) > 1 else rendered)
+        if failures:
+            answer_parts.append("\n".join(["以下步骤未完成：", *failures]))
 
-        self.memory_store.save_query_history(
-            user_query=state.get("user_query", ""),
-            result_summary=result_summary,
-            tables=tables,
-            fields=methods[0].required_fields,
-            session_id=state["session_id"],
-        )
-        narration = narrate_execution_result(
-            card,
-            methods[0],
-            self.settings,
-            self.llm_provider,
-            result_ref=private_record.result_ref,
-        )
-
-        context = render_execution_result_data(card, narration, self.handler_registry)
-        answer = await generate_reply(context, state["user_query"], self.llm_provider, state.get("conversation_history"))
+        card_data = [card.model_dump(mode="json") for card in cards]
+        narration_data = [item.model_dump(mode="json") for item in narrations]
+        public_data = [item.model_dump(mode="json") for item in public_entries]
         next_state: AgentState = {
             **state,
-            "status": "executed_simulated_real",
-            "result_ref": private_record.result_ref,
-            "public_memory_entry": public_memory.model_dump(mode="json"),
-            "execution_result_card": card.model_dump(mode="json"),
-            "execution_result_cards": [card.model_dump(mode="json")],
-            "result_narration": narration.model_dump(mode="json"),
-            "result_narrations": [narration.model_dump(mode="json")],
-            "public_memory_entries": [public_memory.model_dump(mode="json")],
-            "row_count": card.row_count,
-            "answer": answer,
+            "status": "method_execution_failed" if failures else "executed_simulated_real",
+            "result_ref": private_records[0].result_ref,
+            "public_memory_entry": public_data[0],
+            "execution_result_card": card_data[0],
+            "execution_result_cards": card_data,
+            "result_narration": narration_data[0],
+            "result_narrations": narration_data,
+            "public_memory_entries": public_data,
+            "method_draft": final_methods[0].model_dump(mode="json"),
+            "method_drafts": [method.model_dump(mode="json") for method in final_methods],
+            "sql": final_methods[0].sql_template,
+            "row_count": sum(card.row_count for card in cards),
+            "answer": "\n\n".join(answer_parts),
+            "errors": state.get("errors", []) + failures,
         }
         return self.audit(next_state)
+
+    def _execute_one_method_with_repair(
+        self,
+        state: AgentState,
+        method: MethodDraft,
+    ) -> tuple[AgentState, MethodDraft | None, Any | None, str | None]:
+        """执行单个 draft；修复后必须重新经过 review_method 才能执行。"""
+        current_state = state
+        current_method = method
+        last_error: str | None = None
+
+        for attempt in range(MAX_METHOD_REPAIR_ATTEMPTS):
+            execution = run_simulated_real_execution(current_method)
+            if execution.status == "passed":
+                return current_state, current_method, execution, None
+
+            last_error = "; ".join(execution.errors) or f"simulated execution failed: {current_method.name}"
+            if attempt >= MAX_METHOD_REPAIR_ATTEMPTS - 1:
+                break
+
+            current_sql = current_state.get("sql") or current_method.sql_template or ""
+            user_goal = current_state.get("action_user_goal") or current_state["user_query"]
+            proposal = (current_state.get("action_validation") or {}).get("proposal") or {}
+            merged_params = {
+                **(current_state.get("base_query_params") or {}),
+                **(proposal.get("params") or {}),
+            }
+            sql_input_slots = current_state.get("sql_input_slots") or self._sql_input_slots(merged_params)
+            sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, merged_params)
+            repaired_sql = self._call_llm_for_repair(
+                sql_planning_goal,
+                current_sql,
+                last_error,
+                current_state.get("visible_catalog"),
+                input_slots=[
+                    {"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]}
+                    for slot in sql_input_slots
+                ],
+            )
+            if not repaired_sql:
+                break
+
+            table_match = re.search(r"FROM\s+(\w+)", repaired_sql, re.IGNORECASE)
+            repaired_method = MethodDraft(
+                method_type="sql",
+                name="llm_repaired_sql",
+                goal=user_goal,
+                operation="custom_sql",
+                table=table_match.group(1) if table_match else current_method.table,
+                data_source="table",
+                sql_template=repaired_sql,
+                params=self._bound_input_params(current_state),
+                required_fields=self._extract_fields_from_sql(repaired_sql),
+                output_schema={},
+                risk_level="medium",
+                logic_summary=[f"已完成查询校验与调整：{user_goal}"],
+            )
+            candidate_state = {
+                **current_state,
+                "method_draft": repaired_method.model_dump(mode="json"),
+                "method_drafts": [repaired_method.model_dump(mode="json")],
+                "sql": repaired_sql,
+                "repair_attempts": attempt + 1,
+                "errors": [],
+            }
+            reviewed = self.review_method(candidate_state)
+            if reviewed.get("status") != "method_reviewed":
+                last_error = "; ".join(reviewed.get("errors", [])[-5:]) or "repaired SQL failed validation"
+                break
+            current_state = reviewed
+            current_method = self._state_methods(reviewed)[0]
+
+        return current_state, None, None, last_error
 
     async def approve_analysis_plan(self, state: AgentState) -> AgentState:
         if state.get("status") != "analysis_plan_review_ready":
@@ -386,6 +441,93 @@ class FinanceAgentRuntime:
 
         next_state: AgentState = {**state, "status": "analysis_plan_approved"}
         return await self._prepare_method_after_analysis_plan(next_state)
+
+    async def revise_method_review(self, state: AgentState, instruction: str) -> AgentState:
+        """在待确认阶段修订方法集合，修订后回到同一张确认卡，不读取数据库。"""
+        if state.get("status") != "method_review_ready":
+            raise ValueError(f"run is not pending method review: {state.get('status')}")
+        instruction = instruction.strip()
+        if not instruction:
+            raise ValueError("revision instruction is empty")
+
+        methods = self._state_methods(state)
+        proposal = (state.get("action_validation") or {}).get("proposal") or {}
+        merged_params = {
+            **(state.get("base_query_params") or {}),
+            **(proposal.get("params") or {}),
+        }
+        slots = state.get("sql_input_slots") or self._sql_input_slots(merged_params)
+        method_context = [
+            {
+                "step_index": index,
+                "operation": method.operation,
+                "goal": self._redact_sql_planning_goal(method.goal, slots, merged_params),
+                "sql_template": method.sql_template,
+                "fields": method.required_fields,
+            }
+            for index, method in enumerate(methods, start=1)
+        ]
+        original_goal = state.get("action_user_goal") or state.get("user_query") or ""
+        revision_goal = (
+            f"原始分析目标：{original_goal}\n"
+            f"当前方法集合：{json.dumps(method_context, ensure_ascii=False)}\n"
+            f"用户要求修改：{instruction}\n"
+            "请只修改用户明确指出的步骤，其他步骤保持语义不变，并重新输出完整方法集合。"
+        )
+        sql_planning_goal = self._redact_sql_planning_goal(revision_goal, slots, merged_params)
+        action_context = {
+            "route": (state.get("action_validation") or {}).get("route"),
+            "entity_id": proposal.get("entity_id"),
+            "entity_type": proposal.get("entity_type"),
+            "preferred_runtime": proposal.get("preferred_runtime"),
+            "selected_skill_detail": state.get("selected_skill_detail"),
+            "revision": True,
+            "current_method_set": method_context,
+            "revision_instruction": instruction,
+        }
+        visible = Catalog.model_validate(state["visible_catalog"])
+        try:
+            plan = plan_analysis_with_lmstudio(
+                sql_planning_goal,
+                visible,
+                self.operation_registry,
+                self.settings,
+                self.llm_provider,
+                action_context=action_context,
+                input_slots=[
+                    {"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]}
+                    for slot in slots
+                ],
+                handler_manifest=self.handler_registry.manifest_for_llm(),
+                business_term_manifest=self.business_term_registry.manifest_for_llm(),
+            )
+            planner_used = self.llm_provider.provider_name
+        except Exception as exc:
+            plan = plan_analysis_with_rules(instruction, visible)
+            planner_used = "rule"
+            state = {
+                **state,
+                "errors": state.get("errors", []) + [f"method revision planner failed: {type(exc).__name__}: {exc}"],
+            }
+        plan = self._apply_action_constraints(plan, state)
+        plan = self._apply_skill_constraints(plan, state)
+        revised = {
+            **state,
+            "analysis_plan": plan.model_dump(mode="json"),
+            "sql_input_slots": slots,
+            "planner_used": planner_used,
+            "action_user_goal": plan.goal,
+            "method_draft": None,
+            "method_drafts": [],
+            "method_review_card": None,
+            "method_review_cards": [],
+            "method_set_review_card": None,
+            "repair_attempts": 0,
+            "repair_history": [],
+            "errors": [],
+            "status": "analysis_planned",
+        }
+        return await self._prepare_method_after_analysis_plan(revised)
 
     async def approve_data_authorization(self, state: AgentState) -> AgentState:
         """保留兼容性，但实际上已合并到 approve_method_review 中。"""
@@ -464,10 +606,9 @@ class FinanceAgentRuntime:
         validation = state["action_validation"]
         if validation.get("route") != "method_flow":
             return "direct_response"
-        # 有 result_refs → 依赖执行路径
-        proposal = validation.get("proposal") or {}
-        if proposal.get("result_refs"):
-            return "dependent_flow"
+        # 统一走 A 路径：后续请求只参考安全的历史查询记录，重新生成
+        # 完整 SQL 并重新查询当前数据。旧的 result_ref/B 路径保留在图中
+        # 仅用于兼容历史 checkpoint，但新请求不可再进入该路径。
         return "method_flow"
 
     def validate_action(self, state: AgentState) -> AgentState:
@@ -536,8 +677,10 @@ class FinanceAgentRuntime:
         errors = list(state.get("errors", []))
         user_goal = state.get("action_user_goal") or state["user_query"]
         proposal = (state.get("action_validation") or {}).get("proposal") or {}
-        sql_input_slots = self._sql_input_slots(proposal.get("params") or {})
-        sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, proposal.get("params") or {})
+        base_query_reference, base_query_params = self._resolve_base_query_reference(state)
+        merged_params = {**base_query_params, **(proposal.get("params") or {})}
+        sql_input_slots = self._sql_input_slots(merged_params)
+        sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, merged_params)
         action_context = {
             # 不传完整 response_plan / action_validation：其中可能有用户真实筛选值。
             "route": (state.get("action_validation") or {}).get("route"),
@@ -546,6 +689,9 @@ class FinanceAgentRuntime:
             "preferred_runtime": proposal.get("preferred_runtime"),
             "selected_skill_detail": state.get("selected_skill_detail"),
         }
+        if base_query_reference:
+            # 只传参数化 SQL、脱敏目标和结构信息，不传 result_ref、参数值或结果行。
+            action_context["base_query_reference"] = base_query_reference
         try:
             plan = plan_analysis_with_lmstudio(
                 sql_planning_goal,
@@ -570,6 +716,7 @@ class FinanceAgentRuntime:
             **state,
             "analysis_plan": plan.model_dump(mode="json"),
             "sql_input_slots": sql_input_slots,
+            "base_query_params": base_query_params,
             "planner_used": planner_used,
             "status": "analysis_planned",
             "errors": errors,
@@ -627,20 +774,49 @@ class FinanceAgentRuntime:
         """Map opaque SQL slots back to values only after SQL planning is complete."""
         proposal = (state.get("action_validation") or {}).get("proposal") or {}
         proposal_params = proposal.get("params") or {}
-        slots = state.get("sql_input_slots") or FinanceAgentRuntime._sql_input_slots(proposal_params)
+        base_params = state.get("base_query_params") or {}
+        merged_params = {**base_params, **proposal_params}
+        slots = state.get("sql_input_slots") or FinanceAgentRuntime._sql_input_slots(merged_params)
         return {
-            slot["id"]: proposal_params[slot["source_param"]]
+            slot["id"]: merged_params[slot["source_param"]]
             for slot in slots
-            if slot.get("source_param") in proposal_params
+            if slot.get("source_param") in merged_params
         }
+
+    def _resolve_base_query_reference(self, state: AgentState) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Resolve the safe candidate number to a session-scoped query card."""
+        proposal = (state.get("action_validation") or {}).get("proposal") or {}
+        candidate = proposal.get("base_query_candidate")
+        if candidate is None:
+            return None, {}
+        if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate < 1:
+            return None, {}
+        entries = self.public_memory_store.latest(limit=5, session_id=state.get("session_id"))
+        if candidate > len(entries):
+            return None, {}
+        entry = entries[candidate - 1]
+        records = self.private_result_store.latest(limit=50, session_id=state.get("session_id"))
+        record = next((item for item in records if item.result_ref == entry.result_ref), None)
+        private_params: dict[str, Any] = {}
+        if record:
+            source_params = record.metadata.get("source_params")
+            if isinstance(source_params, dict):
+                private_params = dict(source_params)
+        return {
+            "goal": entry.goal or "",
+            "sql_template": entry.sql_template or "",
+            "fields": entry.fields,
+            "result_shape": entry.result_shape,
+            "row_count": entry.row_count,
+            "status": "executed",
+        }, private_params
 
     @staticmethod
     def after_analysis_plan(state: AgentState) -> str:
         if state.get("status") != "analysis_planned":
             return "fail"
-        validation = state.get("action_validation") or {}
-        if validation.get("status") == "skill_proposed":
-            return "plan_review"
+        # 分析计划保留为后端内部规划，不再单独阻塞用户确认。
+        # 所有请求统一继续生成最终 method_drafts，再进入一次 method review。
         return "method"
 
     @staticmethod
@@ -1144,6 +1320,7 @@ class FinanceAgentRuntime:
             for method, mock_result in zip(methods, mock_results, strict=False)
         ]
         card = cards[0]
+        method_set_card = build_method_set_review_card(plan, cards) if len(cards) > 1 else None
 
         # 获取之前的查询记录（从文件型 memory）
         prior_queries = self.memory_store.get_recent_queries(limit=3, session_id=state["session_id"])
@@ -1183,8 +1360,9 @@ class FinanceAgentRuntime:
                 **state,
                 "mock_result": mock_results[0],
                 "mock_results": mock_results,
-                "method_review_card": card.model_dump(mode="json"),
+                "method_review_card": method_set_card.model_dump(mode="json") if method_set_card else card.model_dump(mode="json"),
                 "method_review_cards": [card.model_dump(mode="json") for card in cards],
+                "method_set_review_card": method_set_card.model_dump(mode="json") if method_set_card else None,
                 "prior_result_authorization_card": prior_auth_card.model_dump(mode="json"),
                 "answer": answer,
                 "status": "prior_result_authorization_pending",
@@ -1194,8 +1372,9 @@ class FinanceAgentRuntime:
             **state,
             "mock_result": mock_results[0],
             "mock_results": mock_results,
-            "method_review_card": card.model_dump(mode="json"),
+            "method_review_card": method_set_card.model_dump(mode="json") if method_set_card else card.model_dump(mode="json"),
             "method_review_cards": [card.model_dump(mode="json") for card in cards],
+            "method_set_review_card": method_set_card.model_dump(mode="json") if method_set_card else None,
             "answer": answer,
             "status": "method_review_ready",
         }
@@ -1369,8 +1548,8 @@ class FinanceAgentRuntime:
             self.llm_provider,
             result_ref=private_record.result_ref,
         )
-        context = render_execution_result_data(card, narration, self.handler_registry)
-        answer = await generate_reply(context, state["user_query"], self.llm_provider, state.get("conversation_history"))
+        # 兼容旧 B 接口时也不把 prior result 行发送给普通回复 LLM。
+        answer = render_user_narration(narration)
         return self.audit(
             {
                 **state,
@@ -1416,6 +1595,22 @@ class FinanceAgentRuntime:
         return [MethodDraft.model_validate(state["method_draft"])]
 
     def audit(self, state: AgentState) -> AgentState:
+        execution_card = self._safe_audit_execution_card(state.get("execution_result_card"))
+        execution_cards = [
+            self._safe_audit_execution_card(card)
+            for card in (state.get("execution_result_cards") or [])
+        ]
+        mock_result = self._safe_audit_execution_card(state.get("mock_result"))
+        mock_results = [
+            self._safe_audit_execution_card(result)
+            for result in (state.get("mock_results") or [])
+        ]
+        narration = state.get("result_narration") or {}
+        safe_narration = {
+            key: narration.get(key)
+            for key in ("title", "source")
+            if isinstance(narration, dict) and narration.get(key) is not None
+        }
         event: dict[str, Any] = {
             "request_id": state.get("request_id"),
             "user_query": state.get("user_query"),
@@ -1432,19 +1627,27 @@ class FinanceAgentRuntime:
             "method_drafts": state.get("method_drafts"),
             "harness_review": state.get("harness_review"),
             "harness_reviews": state.get("harness_reviews"),
-            "mock_result": state.get("mock_result"),
-            "mock_results": state.get("mock_results"),
+            "mock_result": mock_result,
+            "mock_results": mock_results,
             "internal_method_review": state.get("internal_method_review"),
             "repair_attempts": state.get("repair_attempts"),
             "repair_history": state.get("repair_history"),
             "method_review_card": state.get("method_review_card"),
             "method_review_cards": state.get("method_review_cards"),
+            "method_set_review_card": state.get("method_set_review_card"),
             "data_authorization_card": state.get("data_authorization_card"),
             "prior_result_authorization_card": state.get("prior_result_authorization_card"),
-            "execution_result_card": state.get("execution_result_card"),
-            "execution_result_cards": state.get("execution_result_cards"),
-            "result_narration": state.get("result_narration"),
-            "result_narrations": state.get("result_narrations"),
+            "execution_result_card": execution_card,
+            "execution_result_cards": execution_cards,
+            "result_narration": safe_narration,
+            "result_narrations": [
+                {
+                    key: item.get(key)
+                    for key in ("title", "source")
+                    if isinstance(item, dict) and item.get(key) is not None
+                }
+                for item in (state.get("result_narrations") or [])
+            ],
             "result_ref": state.get("result_ref"),
             "referenced_result_ref": state.get("referenced_result_ref"),
             "public_memory_entry": state.get("public_memory_entry"),
@@ -1476,3 +1679,10 @@ class FinanceAgentRuntime:
             conversation_history.append({"role": "assistant", "content": answer})
 
         return {**state, "audit": audit, "conversation_history": conversation_history}
+
+    @staticmethod
+    def _safe_audit_execution_card(value: Any) -> dict[str, Any] | None:
+        """Keep audit metadata while excluding result rows/output values."""
+        if not isinstance(value, dict):
+            return None
+        return {key: item for key, item in value.items() if key not in {"result", "output"}}

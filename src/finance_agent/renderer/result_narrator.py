@@ -46,6 +46,21 @@ class ResultNarration(BaseModel):
     source: str = "lmstudio"
 
 
+def render_user_narration(narration: ResultNarration) -> str:
+    """Render the privileged interpretation directly for the user.
+
+    The ordinary reply planner must not receive raw result rows. The narration
+    LLM has already interpreted the private result, so the resulting text can
+    be shown directly while the UI renders the result table separately.
+    """
+    parts = [part for part in (narration.title, narration.summary) if part]
+    if narration.key_findings:
+        parts.append("\n".join(f"- {finding}" for finding in narration.key_findings))
+    if narration.caveats:
+        parts.append("注意：" + "；".join(narration.caveats))
+    return "\n\n".join(parts) or "查询已完成。"
+
+
 SYSTEM_PROMPT = """你是本地金融数据分析 Agent 的结果解读器。
 你会收到沙箱执行的真实数据结果。你的任务是写出一段简洁的业务解读。
 

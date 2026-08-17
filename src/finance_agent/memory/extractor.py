@@ -192,10 +192,9 @@ async def extract_memories_from_state(
     if user_query:
         messages.append({"role": "user", "content": user_query})
 
-    # 添加 AI 回复
-    answer = state.get("answer", "")
-    if answer:
-        messages.append({"role": "assistant", "content": answer})
+    # 不把 AI 的结果解读放入记忆提取上下文。执行结果可能包含敏感值，
+    # 即使它已经展示给用户，也不能因为记忆提取再次进入普通 LLM。
+    # 长期记忆只从用户原始请求和错误信息中提取。
 
     # 添加错误信息（如果有）
     errors = state.get("errors", [])
