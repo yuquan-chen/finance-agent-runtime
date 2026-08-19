@@ -60,7 +60,8 @@ class FirecrackerSandboxProvider:
                             "events_path": "/sandbox/events.jsonl",
                         },
                         ensure_ascii=False,
-                    )
+                    ),
+                    encoding="utf-8",
                 )
 
                 process = self._start_firecracker(socket_path)
@@ -92,7 +93,7 @@ class FirecrackerSandboxProvider:
                         process.kill()
 
                 elapsed_ms = int((time.time() - started) * 1000)
-                output = json.loads(output_path.read_text()) if output_path.exists() else {}
+                output = json.loads(output_path.read_text(encoding="utf-8")) if output_path.exists() else {}
                 return MockDryRunResult(
                     status="passed",
                     output=output.get("result", output),
@@ -169,4 +170,3 @@ class FirecrackerSandboxProvider:
                 return
             time.sleep(0.1)
         raise TimeoutError(f"Firecracker sandbox timed out after {timeout_seconds}s")
-

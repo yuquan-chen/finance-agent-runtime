@@ -31,6 +31,7 @@ from finance_agent.llm.provider import LlmProvider, build_llm_provider
 from finance_agent.memory.memory_store import MemoryStore
 from finance_agent.memory.private_result_store import PrivateResultStore
 from finance_agent.memory.public_memory import PublicMemoryStore
+from finance_agent.memory.query_candidate_selector import parse_candidate_reply, select_query_candidate
 from finance_agent.memory.safe_summary import build_public_memory_entry
 from finance_agent.memory.selector import select_relevant_memories
 from finance_agent.memory.extractor import extract_memories_from_state
@@ -178,20 +179,32 @@ class FinanceAgentRuntime:
 
         # 从 SessionManager 读取对话历史
         conversation_history = self.session_manager.get_conversation_history(session_id)
-
-        # 添加当前用户消息到历史
-        conversation_history.append({"role": "user", "content": question})
-
-        # 保存用户消息到 session
-        self.session_manager.add_message(session_id, "user", question)
+        pending_candidate = self.session_manager.get_pending_query_candidate(session_id)
+        selected_candidate = parse_candidate_reply(question) if pending_candidate else None
+        resume_query_candidate = None
+        if pending_candidate and selected_candidate is not None:
+            resume_query_candidate = {
+                "candidate": selected_candidate,
+                "pending": pending_candidate,
+            }
+        elif pending_candidate:
+            # 用户开始了新的问题，旧的澄清状态不再阻塞当前请求。
+            self.session_manager.set_pending_query_candidate(session_id, None)
 
         # 每次运行使用独立的图状态。会话历史已由 SessionManager 持久化，
         # 不能让上一次运行的 method_draft / SQL 通过 checkpointer 泄漏到本次请求。
         request_id = str(uuid.uuid4())
+
+        # 添加当前用户消息到历史和 UI 事件流。request_id 将待确认卡精确
+        # 绑定到这一次请求，而不是绑定到刷新时的最后一条机器人消息。
+        conversation_history.append({"role": "user", "content": question})
+        self.session_manager.add_message(session_id, "user", question, request_id=request_id)
+
         config = {"configurable": {"thread_id": f"run_{request_id}"}}
 
         initial: AgentState = {
             "request_id": request_id,
+            "review_id": request_id,
             "session_id": session_id,
             "user_query": question,
             "status": "started",
@@ -200,16 +213,32 @@ class FinanceAgentRuntime:
             "conversation_history": conversation_history,
             "repair_attempts": 0,
             "repair_history": [],
+            "pending_query_candidate": pending_candidate,
+            "resume_query_candidate": resume_query_candidate,
         }
 
         # 调用图
         result = await self.graph.ainvoke(initial, config=config)
 
+        candidate_selection = result.get("query_candidate_selection") or {}
+        if candidate_selection.get("status") == "ambiguous":
+            proposal = (result.get("action_validation") or {}).get("proposal") or {}
+            self.session_manager.set_pending_query_candidate(
+                session_id,
+                {
+                    "request_id": result.get("request_id", request_id),
+                    "proposal": proposal,
+                    "ranked": candidate_selection.get("ranked", [])[:5],
+                },
+            )
+        elif resume_query_candidate:
+            self.session_manager.set_pending_query_candidate(session_id, None)
+
         # 普通回复进入 conversation_history。执行结果由对应的授权执行方法
         # 写入独立的 private_analysis，供当前用户刷新后查看，但不进入普通模型上下文。
         answer = result.get("answer")
         if answer:
-            self.session_manager.add_message(session_id, "assistant", answer)
+            self.session_manager.add_message(session_id, "assistant", answer, request_id=request_id)
 
         return result
 
@@ -450,11 +479,17 @@ class FinanceAgentRuntime:
         if not state.get("analysis_plan"):
             raise ValueError("run has no analysis plan")
 
-        next_state: AgentState = {**state, "status": "analysis_plan_approved"}
+        next_state: AgentState = {
+            **state,
+            # The approved plan and its generated method card must retain
+            # independent, persistent statuses.
+            "review_id": str(uuid.uuid4()),
+            "status": "analysis_plan_approved",
+        }
         return await self._prepare_method_after_analysis_plan(next_state)
 
     async def revise_method_review(self, state: AgentState, instruction: str) -> AgentState:
-        """在待确认阶段修订方法集合，修订后回到同一张确认卡，不读取数据库。"""
+        """Create a new pending review version without reading business data."""
         if state.get("status") != "method_review_ready":
             raise ValueError(f"run is not pending method review: {state.get('status')}")
         instruction = instruction.strip()
@@ -462,12 +497,33 @@ class FinanceAgentRuntime:
             raise ValueError("revision instruction is empty")
 
         methods = self._state_methods(state)
-        proposal = (state.get("action_validation") or {}).get("proposal") or {}
-        merged_params = {
-            **(state.get("base_query_params") or {}),
-            **(proposal.get("params") or {}),
+        action_validation = state.get("action_validation") or {}
+        proposal = action_validation.get("proposal") or {}
+        proposal_params = dict(proposal.get("params") or {})
+        # Revisions bypass normal response planning.  Capture newly supplied
+        # filter values before making opaque SQL slots, otherwise SQL may use
+        # :input_1 with no value available to bind.
+        proposal_params.update(self._revision_filter_params(instruction))
+        original_goal = state.get("action_user_goal") or state.get("user_query") or ""
+        revised_goal = self._revision_goal(original_goal, proposal_params)
+        revised_proposal = {**proposal, "goal": revised_goal, "params": proposal_params}
+        revised_validation = {
+            **action_validation,
+            "proposal": revised_proposal,
+            "user_goal": revised_goal,
         }
-        slots = state.get("sql_input_slots") or self._sql_input_slots(merged_params)
+        revision_state = self.load_metadata(
+            {
+                **state,
+                "action_validation": revised_validation,
+                "action_user_goal": revised_goal,
+            }
+        )
+        merged_params = {
+            **(revision_state.get("base_query_params") or {}),
+            **proposal_params,
+        }
+        slots = self._sql_input_slots(merged_params)
         method_context = [
             {
                 "step_index": index,
@@ -478,25 +534,24 @@ class FinanceAgentRuntime:
             }
             for index, method in enumerate(methods, start=1)
         ]
-        original_goal = state.get("action_user_goal") or state.get("user_query") or ""
         revision_goal = (
-            f"原始分析目标：{original_goal}\n"
+            f"原始分析目标：{revised_goal}\n"
             f"当前方法集合：{json.dumps(method_context, ensure_ascii=False)}\n"
             f"用户要求修改：{instruction}\n"
             "请只修改用户明确指出的步骤，其他步骤保持语义不变，并重新输出完整方法集合。"
         )
         sql_planning_goal = self._redact_sql_planning_goal(revision_goal, slots, merged_params)
         action_context = {
-            "route": (state.get("action_validation") or {}).get("route"),
-            "entity_id": proposal.get("entity_id"),
-            "entity_type": proposal.get("entity_type"),
-            "preferred_runtime": proposal.get("preferred_runtime"),
-            "selected_skill_detail": state.get("selected_skill_detail"),
+            "route": revised_validation.get("route"),
+            "entity_id": revised_proposal.get("entity_id"),
+            "entity_type": revised_proposal.get("entity_type"),
+            "preferred_runtime": revised_proposal.get("preferred_runtime"),
+            "selected_skill_detail": revision_state.get("selected_skill_detail"),
             "revision": True,
             "current_method_set": method_context,
-            "revision_instruction": instruction,
+            "revision_instruction": self._redact_sql_planning_goal(instruction, slots, merged_params),
         }
-        visible = Catalog.model_validate(state["visible_catalog"])
+        visible = Catalog.model_validate(revision_state["visible_catalog"])
         try:
             plan = plan_analysis_with_lmstudio(
                 sql_planning_goal,
@@ -516,16 +571,17 @@ class FinanceAgentRuntime:
         except Exception as exc:
             plan = plan_analysis_with_rules(instruction, visible)
             planner_used = "rule"
-            state = {
-                **state,
-                "errors": state.get("errors", []) + [f"method revision planner failed: {type(exc).__name__}: {exc}"],
+            revision_state = {
+                **revision_state,
+                "errors": revision_state.get("errors", []) + [f"method revision planner failed: {type(exc).__name__}: {exc}"],
             }
-        plan = self._apply_action_constraints(plan, state)
-        plan = self._apply_skill_constraints(plan, state)
+        plan = self._apply_action_constraints(plan, revision_state)
+        plan = self._apply_skill_constraints(plan, revision_state)
         revised = {
-            **state,
+            **revision_state,
             "analysis_plan": plan.model_dump(mode="json"),
             "sql_input_slots": slots,
+            "review_id": str(uuid.uuid4()),
             "planner_used": planner_used,
             "action_user_goal": plan.goal,
             "method_draft": None,
@@ -540,6 +596,21 @@ class FinanceAgentRuntime:
         }
         return await self._prepare_method_after_analysis_plan(revised)
 
+    @staticmethod
+    def _revision_filter_params(instruction: str) -> dict[str, Any]:
+        """Extract bindable values for the revision path without another LLM call."""
+        company = re.search(r"\b(company\s*[A-Za-z0-9_-]+)\b", instruction, re.IGNORECASE)
+        if company:
+            return {"customer_name": company.group(1).strip()}
+        return {}
+
+    @staticmethod
+    def _revision_goal(original_goal: str, params: dict[str, Any]) -> str:
+        """Keep actual filter values out of the SQL-planning goal."""
+        if params.get("customer_name") and "客户" not in original_goal and "公司" not in original_goal:
+            return f"{original_goal}，并限定指定客户"
+        return original_goal
+
     async def approve_data_authorization(self, state: AgentState) -> AgentState:
         """保留兼容性，但实际上已合并到 approve_method_review 中。"""
         # 如果状态是 method_review_ready，直接调用 approve_method_review
@@ -550,6 +621,26 @@ class FinanceAgentRuntime:
         raise ValueError(f"run is not pending data authorization: {state.get('status')}")
 
     def plan_response(self, state: AgentState) -> AgentState:
+        # 用户正在回答上一轮的历史候选澄清。这里不再让普通响应 LLM
+        # 解释“第 2 个”是什么意思，而是由后端恢复原始安全 proposal。
+        resume = state.get("resume_query_candidate") or {}
+        if resume.get("pending") and resume.get("candidate") is not None:
+            pending_proposal = (resume.get("pending") or {}).get("proposal") or {}
+            proposal = MethodProposal.model_validate(pending_proposal).model_copy(
+                update={"base_query_candidate": resume["candidate"]}
+            )
+            plan = ResponsePlan(
+                message="继续处理你选中的历史查询。",
+                method_proposal=proposal,
+                confidence=1.0,
+            )
+            return {
+                **state,
+                "response_plan": plan.model_dump(mode="json"),
+                "tool_decision": response_plan_to_tool_decision(plan).model_dump(mode="json"),
+                "status": "response_planned",
+            }
+
         # 选择相关记忆（新系统）- 使用同步版本
         from finance_agent.memory.selector import select_relevant_memories_sync
         relevant_memories = select_relevant_memories_sync(
@@ -625,10 +716,42 @@ class FinanceAgentRuntime:
     def validate_action(self, state: AgentState) -> AgentState:
         plan = ResponsePlan.model_validate(state["response_plan"])
         validation = validate_response_plan(plan, state["user_query"], self.operation_registry, self.skill_registry)
+        proposal = validation.proposal
+        candidate = proposal.base_query_candidate if proposal else None
+        candidate_selection = select_query_candidate(
+            self.public_memory_store.context_for_llm(state["session_id"]),
+            candidate=candidate,
+            current_goal=validation.user_goal,
+            user_query=state["user_query"],
+            confirmed_candidate=(state.get("resume_query_candidate") or {}).get("candidate"),
+        )
+        response_plan = dict(state["response_plan"])
+        if candidate_selection["status"] == "selected" and proposal is not None:
+            validation = validation.model_copy(
+                update={
+                    "proposal": proposal.model_copy(
+                        update={"base_query_candidate": candidate_selection["selected_candidate"]}
+                    )
+                }
+            )
+        elif candidate_selection["status"] == "ambiguous":
+            response_plan["message"] = candidate_selection["message"]
+            validation = validation.model_copy(
+                update={
+                    "route": "direct_response",
+                    "status": "clarification",
+                    "warnings": [
+                        *validation.warnings,
+                        "历史查询候选无法唯一匹配，已暂停重新生成 SQL",
+                    ],
+                }
+            )
         selected_skill_detail = validation.disclosure.get("skill_detail") if validation.disclosure else None
         return {
             **state,
+            "response_plan": response_plan,
             "action_validation": validation.model_dump(mode="json"),
+            "query_candidate_selection": candidate_selection,
             "selected_skill_detail": selected_skill_detail,
             "action_user_goal": validation.user_goal,
             "status": validation.status,
@@ -637,9 +760,10 @@ class FinanceAgentRuntime:
 
     def render_direct_response(self, state: AgentState) -> AgentState:
         plan = ResponsePlan.model_validate(state["response_plan"])
+        candidate_selection = state.get("query_candidate_selection") or {}
         return {
             **state,
-            "answer": plan.message,
+            "answer": candidate_selection.get("message") or plan.message,
             "status": state.get("action_validation", {}).get("status", plan.status_hint),
         }
 

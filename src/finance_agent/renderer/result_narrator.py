@@ -53,7 +53,8 @@ def render_user_narration(narration: ResultNarration) -> str:
     LLM has already interpreted the private result, so the resulting text can
     be shown directly while the UI renders the result table separately.
     """
-    parts = [part for part in (narration.title, narration.summary) if part]
+    parts = [f"**{narration.title}**" if narration.title else "", narration.summary]
+    parts = [part for part in parts if part]
     if narration.key_findings:
         parts.append("\n".join(f"- {finding}" for finding in narration.key_findings))
     if narration.caveats:
@@ -81,6 +82,9 @@ SYSTEM_PROMPT = """你是本地金融数据分析 Agent 的结果解读器。
 # summary 写法
 - 用 2-4 句话写完，不要分点列举。
 - 包含：主要发现、异常项（如有）、是否模拟数据、建议下一步。
+- 使用 **重点** 标出最多 3 个最重要的指标、趋势或结论；不要把整句话加粗。
+- 使用 ++异常或风险++ 标出最多 1 个最需要关注的异常点；没有异常时不要使用下划线。
+- 只允许上述 **...** 和 ++...++ 两种强调标记，不能输出 HTML。
 - 用业务语言，不要说"数据已生成"或"结果如下"。
 - 分布类：说明最大/最小项、占比、异常项。
 - 趋势类：说明方向、幅度。
@@ -134,6 +138,7 @@ def _narrate_simple(
     simple_prompt = """你是结果解读器。根据下方数据写一段简洁的中文解读。
 输出 JSON：
 {"title": "标题", "summary": "2-4 句话解读，包含主要发现、异常项、是否模拟数据"}
+用 **重点** 标出最多 3 个关键指标或结论；如有异常，用 ++异常或风险++ 标出最多 1 处。不要输出 HTML。
 不要编造数据中不存在的数字。"""
     messages = [
         {"role": "system", "content": simple_prompt},

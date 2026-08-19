@@ -47,5 +47,5 @@ class Catalog(BaseModel):
 
 
 def load_catalog(path: Path) -> Catalog:
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return Catalog.model_validate(raw)

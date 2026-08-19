@@ -79,7 +79,7 @@ def _load_description_overlay(path: Path = DESCRIPTION_OVERLAY_PATH) -> dict[str
     """读取不属于 ORM 的业务说明覆盖层。"""
     if not path.exists():
         return {}
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     tables = raw.get("tables", {}) if isinstance(raw, dict) else {}
     if not isinstance(tables, dict):
         return {}

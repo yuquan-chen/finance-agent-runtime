@@ -93,7 +93,7 @@ class SkillRegistry(BaseModel):
 
 
 def load_skill_registry(path: Path) -> SkillRegistry:
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     registry = SkillRegistry.model_validate(raw)
 
     # 合并装饰器注册的技能（不覆盖 YAML 中已有的）

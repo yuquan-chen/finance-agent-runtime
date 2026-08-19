@@ -12,6 +12,8 @@ class AgentState(MessagesState):
     # 只需要添加自定义字段
 
     request_id: str
+    # A run can create several review-card versions after revisions.
+    review_id: str
     session_id: str
     user_query: str
     status: str
@@ -23,6 +25,9 @@ class AgentState(MessagesState):
     result_refs: list[str]
     response_plan: dict[str, Any]
     action_validation: dict[str, Any]
+    query_candidate_selection: dict[str, Any]
+    pending_query_candidate: dict[str, Any]
+    resume_query_candidate: dict[str, Any]
     selected_skill_detail: dict[str, Any]
     tool_decision: dict[str, Any]
     action_user_goal: str

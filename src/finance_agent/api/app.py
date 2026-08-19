@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,17 @@ class MethodReviewRevisionRequest(BaseModel):
     instruction: str
 
 
+class FrontendEventRequest(BaseModel):
+    event: str
+    session_id: str | None = None
+    request_id: str | None = None
+    status: str | None = None
+    detail: str | None = None
+
+
 class RunResponse(BaseModel):
     request_id: str
+    review_id: str | None = None
     status: str
     answer: str | None = None
     errors: list[str] = []
@@ -76,6 +86,24 @@ PENDING_REVIEW_STATUSES = {
     "data_authorization_pending",
     "prior_result_authorization_pending",
 }
+
+
+@app.post("/v1/frontend-events")
+async def record_frontend_event(event: FrontendEventRequest) -> dict[str, str]:
+    """Persist structural UI telemetry for diagnosing SSE/card rendering failures."""
+    event_path = Path(runtime().settings.audit_log_path).with_name("frontend_events.jsonl")
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event.event[:80],
+        "session_id": event.session_id,
+        "request_id": event.request_id,
+        "status": event.status,
+        "detail": (event.detail or "")[:1000],
+    }
+    with event_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return {"status": "ok"}
 
 
 CHAT_HTML = """<!doctype html>
@@ -656,10 +684,25 @@ async def approve_analysis_plan(request_id: str) -> RunResponse:
     state = _load_pending_run(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="pending analysis plan review not found")
+    prior_review_id = state.get("review_id")
     try:
         state = await runtime().approve_analysis_plan(state)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # 批准计划后会生成下一张方法确认卡；把这条安全回复写入时间线，
+    # 否则刷新后无法在原计划之后恢复该卡片。
+    session_id = state.get("session_id")
+    if session_id:
+        runtime().session_manager.set_review_status(
+            session_id, request_id, "analysis_plan_approved", review_id=prior_review_id
+        )
+    if session_id and state.get("answer"):
+        runtime().session_manager.add_message(
+            session_id,
+            "assistant",
+            state["answer"],
+            request_id=state.get("request_id") or request_id,
+        )
     _sync_pending_review(state)
     return _response_from_state(state)
 
@@ -676,10 +719,15 @@ async def approve_method_review(request_id: str) -> RunResponse:
                 break
     if state is None:
         raise HTTPException(status_code=404, detail="pending method review not found")
+    review_id = state.get("review_id")
     try:
         state = await runtime().approve_method_review(state)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if state.get("session_id"):
+        runtime().session_manager.set_review_status(
+            state["session_id"], request_id, state.get("status", "executed_simulated_real"), review_id=review_id
+        )
     _sync_pending_review(state)
     return _response_from_state(state)
 
@@ -690,17 +738,21 @@ async def revise_method_review(request_id: str, request: MethodReviewRevisionReq
     state = _load_pending_run(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="pending method review not found")
+    prior_review_id = state.get("review_id")
     try:
         state = await runtime().revise_method_review(state, request.instruction)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    _sync_pending_review(state)
     # 修订本身也是用户消息；只保存修订说明和安全方法卡，不保存结果行。
     session_id = state.get("session_id")
     if session_id:
-        runtime().session_manager.add_message(session_id, "user", request.instruction)
+        runtime().session_manager.set_review_status(
+            session_id, request_id, "method_review_revised", review_id=prior_review_id
+        )
+        runtime().session_manager.add_message(session_id, "user", request.instruction, request_id=request_id)
         if state.get("answer"):
-            runtime().session_manager.add_message(session_id, "assistant", state["answer"])
+            runtime().session_manager.add_message(session_id, "assistant", state["answer"], request_id=request_id)
+    _sync_pending_review(state)
     return _response_from_state(state)
 
 
@@ -739,7 +791,7 @@ async def clear_public_memory():
     """清空公共记忆（public_memory.jsonl）。"""
     memory_path = Path(runtime().settings.public_memory_path)
     if memory_path.exists():
-        memory_path.write_text("")
+        memory_path.write_text("", encoding="utf-8")
     return {"status": "ok", "message": "公共记忆已清空"}
 
 
@@ -835,6 +887,11 @@ async def get_session_history(session_id: str, limit: int | None = None):
     if persisted_state and persisted_state.get("request_id"):
         PENDING_RUNS[persisted_state["request_id"]] = dict(persisted_state)
         PENDING_RUNS[session_id] = dict(persisted_state)
+        # 升级前已有 pending_review 时也要补写其时间线卡片快照；否则
+        # pending_review 本身存在，但刷新后的消息没有可挂载的确认卡。
+        if persisted_state.get("status") in PENDING_REVIEW_STATUSES:
+            _sync_pending_review(persisted_state)
+            pending_review = runtime().session_manager.get_pending_review(session_id)
     # 兼容本次升级前已在内存中等待确认的会话：首次读取历史时补写安全卡片。
     if pending_review is None:
         in_memory_state = PENDING_RUNS.get(session_id)
@@ -844,10 +901,37 @@ async def get_session_history(session_id: str, limit: int | None = None):
     return {
         "session_id": session_id,
         "history": history,
+        "timeline": runtime().session_manager.get_timeline(session_id),
         "private_analysis": runtime().session_manager.get_private_analysis(session_id),
         "pending_review": pending_review,
         "run_detail": runtime().session_manager.get_run_detail(session_id),
     }
+
+
+def _review_snapshot(state: dict[str, Any]) -> dict[str, Any] | None:
+    """提取确认卡所需的安全 UI 状态，不包含任何执行结果行。"""
+    if not (
+        state.get("analysis_plan_review_card")
+        or state.get("method_review_card")
+        or state.get("method_set_review_card")
+        or state.get("method_draft")
+        or state.get("method_drafts")
+    ):
+        return None
+    keys = (
+        "request_id",
+        "review_id",
+        "status",
+        "analysis_plan",
+        "analysis_plan_review_card",
+        "method_draft",
+        "method_drafts",
+        "method_review_card",
+        "method_review_cards",
+        "method_set_review_card",
+        "sql",
+    )
+    return {key: state.get(key) for key in keys if state.get(key) is not None}
 
 
 def _sync_pending_review(state: dict[str, Any]) -> None:
@@ -858,6 +942,9 @@ def _sync_pending_review(state: dict[str, Any]) -> None:
 
     if session_id:
         runtime().session_manager.set_run_detail(session_id, _safe_run_detail(state))
+        review = _review_snapshot(state)
+        if request_id and review:
+            runtime().session_manager.set_review_snapshot(session_id, request_id, review)
 
     if is_pending:
         PENDING_RUNS[request_id] = dict(state)
@@ -968,6 +1055,7 @@ def _safe_run_detail(state: dict[str, Any]) -> dict[str, Any]:
 def _response_from_state(state: dict[str, Any]) -> RunResponse:
     return RunResponse(
         request_id=state.get("request_id", ""),
+        review_id=state.get("review_id"),
         status=state.get("status", "unknown"),
         answer=state.get("answer"),
         errors=state.get("errors", []),

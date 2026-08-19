@@ -28,5 +28,5 @@ class Policy(BaseModel):
 
 
 def load_policy(path: Path) -> Policy:
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return Policy.model_validate(raw)
