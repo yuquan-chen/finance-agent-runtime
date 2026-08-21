@@ -46,6 +46,7 @@ SYSTEM_PROMPT = """# 角色
 1.2 如果 action_context.base_query_reference 存在，它是同一会话中已执行查询的安全参考：保留其中仍然有效的表、JOIN、过滤条件和参数占位符，再把当前 user_query 的新要求合并进去；必须重新生成 SQL 并重新查询，不能读取 prior result。
 1.3 用户要求查看某个主体的交易/付款等明细记录（没有明确指定返回字段）时，使用主表别名的 ``SELECT p.*``，不要自行枚举列名；JOIN 的表只用于过滤时不选取其列。这样读取范围明确且不会猜测字段。
 1.4 如果 action_context.revision=true，current_method_set 是当前待确认的方法集合：保持步骤编号和未被用户明确修改的步骤不变，只修改用户指明的步骤，并输出完整的方法集合。
+1.5 如果 action_context.selected_capability_detail 存在，它是第一层已经由用户问题选中的受控能力。优先使用该 capability 作为主步骤 operation；不要把它替换成不相关的 operation。
 2. 表名和字段名只能来自 context.visible_metadata；不要猜测或使用未展示的表/字段
 3. 只写 SELECT，绝不写 INSERT/UPDATE/DELETE
 4. 多表用 JOIN，关系参考 visible_metadata 中的 relationships

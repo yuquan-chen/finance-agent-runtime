@@ -182,6 +182,17 @@ def _extract_fields_from_sql(sql: str, table: str) -> list[str]:
     """从 SELECT 表达式中提取字段引用，避免把函数片段误认为字段。"""
     patterns = re.findall(r"(?:FROM|JOIN)\s+(\w+)", sql, re.IGNORECASE)
     detected_table = patterns[0] if patterns else table
+    # 确认卡和字段校验使用真实表名，而不是 SQL 中临时的表别名。
+    # 例如 ``card_transaction ct`` 中的 ``ct.status`` 必须归一化成
+    # ``card_transaction.status``，否则会被误判成一张名为 ct 的表。
+    alias_map: dict[str, str] = {}
+    for source_table, alias in re.findall(
+        r"(?:FROM|JOIN)\s+(\w+)\s+(?:AS\s+)?(\w+)",
+        sql,
+        re.IGNORECASE,
+    ):
+        if alias.lower() not in {"where", "join", "on", "order", "group", "limit"}:
+            alias_map[alias.lower()] = source_table
     select_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql, re.IGNORECASE | re.DOTALL)
     if not select_match:
         return []
@@ -195,13 +206,18 @@ def _extract_fields_from_sql(sql: str, table: str) -> list[str]:
         if reference == "*":
             fields.append(f"{detected_table}.*")
             return
-        fields.append(reference if "." in reference else f"{detected_table}.{reference}")
+        if "." in reference:
+            prefix, field = reference.split(".", 1)
+            fields.append(f"{alias_map.get(prefix.lower(), prefix)}.{field}")
+        else:
+            fields.append(f"{detected_table}.{reference}")
 
     # SELECT * 明确表示读取主表的全部字段，不能在确认卡中显示为“未指定”。
     if re.search(r"(?:^|,)\s*\*\s*(?:,|$)", select_sql):
         fields.append(f"{detected_table}.*")
     for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.\*", select_sql):
-        fields.append(f"{match.group(1)}.*")
+        prefix = match.group(1)
+        fields.append(f"{alias_map.get(prefix.lower(), prefix)}.*")
 
     # 直接选择的字段，例如 SELECT status, card_channel ...
     direct_pattern = r"(?:^|,)\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*(?:AS\s+\w+)?\s*(?=,|$)"
@@ -221,6 +237,11 @@ def _extract_fields_from_sql(sql: str, table: str) -> list[str]:
         re.IGNORECASE,
     ):
         add(match.group(1))
+
+    # WHERE / JOIN 条件同样属于实际读取范围，必须出现在确认卡并接受字段校验。
+    # 这里仅追加带表前缀的引用；未限定的字段仍由上面的 SELECT 解析处理。
+    for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b", sql):
+        add(f"{match.group(1)}.{match.group(2)}")
 
     return list(dict.fromkeys(fields))
 

@@ -28,7 +28,13 @@ class AgentState(MessagesState):
     query_candidate_selection: dict[str, Any]
     pending_query_candidate: dict[str, Any]
     resume_query_candidate: dict[str, Any]
+    selected_capability_detail: dict[str, Any]
     selected_skill_detail: dict[str, Any]
+    schema_search_terms: list[str]
+    schema_candidates: list[dict[str, Any]]
+    selected_schema_tables: list[str]
+    schema_selection: dict[str, Any]
+    schema_repair_errors: list[str]
     tool_decision: dict[str, Any]
     action_user_goal: str
     visible_catalog: dict[str, Any]

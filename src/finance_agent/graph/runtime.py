@@ -39,6 +39,7 @@ from finance_agent.metadata.business_registry import BusinessTermRegistry, load_
 from finance_agent.metadata.catalog import Catalog, load_catalog
 from finance_agent.metadata.policy import Policy, load_policy
 from finance_agent.metadata.pruner import prune_catalog
+from finance_agent.metadata.schema_selector import select_schema_with_llm
 from finance_agent.metadata.table_registry import TableRegistry, get_default_table_registry
 from finance_agent.methods.generator import generate_dependent_method, generate_method_drafts
 from finance_agent.operations.handler_registry import OperationHandlerRegistry, get_default_registry
@@ -114,6 +115,8 @@ class FinanceAgentRuntime:
         graph.add_node("plan_response", self.plan_response)
         graph.add_node("validate_action", self.validate_action)
         graph.add_node("render_direct_response", self.render_direct_response)
+        graph.add_node("search_schema", self.search_schema)
+        graph.add_node("select_schema", self.select_schema)
         graph.add_node("load_metadata", self.load_metadata)
         graph.add_node("plan_analysis", self.plan_analysis)
         graph.add_node("render_analysis_plan_card", self.render_analysis_plan_card)
@@ -121,6 +124,7 @@ class FinanceAgentRuntime:
         graph.add_node("review_method", self.review_method)
         graph.add_node("synthetic_check", self.synthetic_check)
         graph.add_node("repair_method", self.repair_method)
+        graph.add_node("prepare_schema_repair", self.prepare_schema_repair)
         graph.add_node("render_method_card", self.render_method_card)
         graph.add_node("refuse_method", self.refuse_method)
         graph.add_node("load_prior_result", self.load_prior_result)
@@ -133,12 +137,14 @@ class FinanceAgentRuntime:
             "validate_action",
             self.after_action_validation,
             {
-                "method_flow": "load_metadata",
+                "method_flow": "search_schema",
                 "direct_response": "render_direct_response",
                 "dependent_flow": "load_prior_result",
             },
         )
         graph.add_edge("render_direct_response", "audit")
+        graph.add_edge("search_schema", "select_schema")
+        graph.add_edge("select_schema", "load_metadata")
         graph.add_edge("load_metadata", "plan_analysis")
         graph.add_conditional_edges(
             "plan_analysis",
@@ -150,13 +156,14 @@ class FinanceAgentRuntime:
         graph.add_conditional_edges(
             "review_method",
             self.after_method_review,
-            {"ok": "synthetic_check", "repair": "repair_method", "refuse": "refuse_method"},
+            {"ok": "synthetic_check", "repair": "prepare_schema_repair", "refuse": "refuse_method"},
         )
         graph.add_conditional_edges(
             "synthetic_check",
             self.after_synthetic_check,
-            {"ok": "render_method_card", "repair": "repair_method", "refuse": "refuse_method"},
+            {"ok": "render_method_card", "repair": "prepare_schema_repair", "refuse": "refuse_method"},
         )
+        graph.add_edge("prepare_schema_repair", "search_schema")
         graph.add_edge("repair_method", "review_method")
         graph.add_edge("render_method_card", "audit")
         graph.add_edge("refuse_method", "audit")
@@ -686,10 +693,8 @@ class FinanceAgentRuntime:
             sent_memory_count=state.get("sent_memory_count", 0),
             handler_registry=self.handler_registry,
             business_term_registry=self.business_term_registry,
-            table_manifest=self.table_registry.manifest_for_llm(),
             relevant_memories=memory_context,
             conversation_messages=conversation_history,
-            table_detail_level="summary",  # 第一层：只发送表名和描述
         )
         legacy_decision = response_plan_to_tool_decision(plan)
         # 更新 sent_memory_count，下次只发增量
@@ -746,13 +751,17 @@ class FinanceAgentRuntime:
                     ],
                 }
             )
+        selected_capability_detail = validation.disclosure.get("capability_detail") if validation.disclosure else None
         selected_skill_detail = validation.disclosure.get("skill_detail") if validation.disclosure else None
+        schema_search_terms = list((validation.proposal.schema_search_terms if validation.proposal else []) or [])
         return {
             **state,
             "response_plan": response_plan,
             "action_validation": validation.model_dump(mode="json"),
             "query_candidate_selection": candidate_selection,
+            "selected_capability_detail": selected_capability_detail,
             "selected_skill_detail": selected_skill_detail,
+            "schema_search_terms": schema_search_terms,
             "action_user_goal": validation.user_goal,
             "status": validation.status,
             "errors": state.get("errors", []) + validation.errors,
@@ -767,8 +776,8 @@ class FinanceAgentRuntime:
             "status": state.get("action_validation", {}).get("status", plan.status_hint),
         }
 
-    def load_metadata(self, state: AgentState) -> AgentState:
-        # 从 table_registry 构建完整的 catalog（包含所有表）
+    def _full_catalog(self) -> Catalog:
+        """从注册的真实 Schema 构建仅供后端检索的完整目录。"""
         from finance_agent.metadata.catalog import Catalog, ColumnMeta, TableMeta, RelationshipMeta
 
         tables = []
@@ -793,19 +802,99 @@ class FinanceAgentRuntime:
                 relationships=relationships,
             ))
 
-        full_catalog = Catalog(
+        return Catalog(
             version="dynamic",
             description="Auto-generated from table_registry",
             tables=tables,
             business_terms=self.catalog.business_terms if hasattr(self, 'catalog') else {},
         )
 
-        visible = prune_catalog(state.get("action_user_goal") or state["user_query"], full_catalog, self.policy)
+    def search_schema(self, state: AgentState) -> AgentState:
+        """后端检索真实目录，只把少量表名和说明交给模型选择。"""
+        full_catalog = self._full_catalog()
+        goal = state.get("action_user_goal") or state["user_query"]
+        terms = [term for term in state.get("schema_search_terms", []) if isinstance(term, str)]
+        # goal 已在第一阶段脱值；search terms 也已在 response validator 中剔除真实参数值。
+        search_query = " ".join([goal, *terms])
+        max_candidates = 8 if state.get("repair_attempts", 0) == 0 else 16
+        matched = prune_catalog(search_query, full_catalog, self.policy, max_tables=max_candidates)
+        candidates = [
+            {"name": table.name, "description": table.description}
+            for table in matched.tables
+        ]
+        return {
+            **state,
+            "schema_candidates": candidates,
+            "status": "schema_candidates_ready",
+        }
+
+    def select_schema(self, state: AgentState) -> AgentState:
+        """模型从候选表摘要中选择要展开的 Schema，不能直接猜表或字段。"""
+        candidates = list(state.get("schema_candidates") or [])
+        candidate_names = {candidate.get("name") for candidate in candidates}
+        try:
+            selection = select_schema_with_llm(
+                user_goal=state.get("action_user_goal") or state["user_query"],
+                capability_detail=state.get("selected_capability_detail"),
+                candidates=candidates,
+                repair_errors=state.get("schema_repair_errors") or [],
+                llm_provider=self.llm_provider,
+            )
+            selected = [name for name in selection.selected_tables if name in candidate_names]
+            selection_data = selection.model_dump(mode="json")
+            source = "llm"
+        except Exception as exc:
+            # Schema 选择器不可用时不让模型猜表：只退回后端已经检索出的候选。
+            selected = [candidate["name"] for candidate in candidates]
+            selection_data = {"selected_tables": selected, "reason": f"schema selector fallback: {type(exc).__name__}"}
+            source = "fallback"
+
+        if not selected:
+            selected = [candidate["name"] for candidate in candidates]
+            selection_data["selected_tables"] = selected
+            selection_data["reason"] = selection_data.get("reason") or "选择为空，使用后端候选目录"
+            source = "fallback"
+        return {
+            **state,
+            "selected_schema_tables": selected,
+            "schema_selection": {**selection_data, "source": source},
+            "status": "schema_selected",
+        }
+
+    def load_metadata(self, state: AgentState) -> AgentState:
+        """只展开 schema selector 选中的表的真实字段和关系。"""
+        full_catalog = self._full_catalog()
+        selected_names = list(state.get("selected_schema_tables") or [])
+        if selected_names:
+            selected_set = set(selected_names)
+            selected_tables = [table for table in full_catalog.tables if table.name in selected_set]
+            visible = Catalog(
+                version=full_catalog.version,
+                description=full_catalog.description,
+                tables=selected_tables,
+                business_terms=full_catalog.business_terms,
+            )
+            visible = self._sanitize_catalog(visible)
+        else:
+            # 兼容直接调用 load_metadata 的旧接口和历史 checkpoint。
+            visible = prune_catalog(state.get("action_user_goal") or state["user_query"], full_catalog, self.policy)
         return {
             **state,
             "visible_catalog": visible.model_dump(),
             "status": "metadata_loaded",
         }
+
+    def _sanitize_catalog(self, catalog: Catalog) -> Catalog:
+        """展开后仍剔除敏感字段，防止 Schema 选择绕过字段策略。"""
+        sanitized_tables = []
+        for table in catalog.tables:
+            columns = [
+                column
+                for column in table.columns
+                if not column.sensitive and not self.policy.is_sensitive_column_name(column.name)
+            ]
+            sanitized_tables.append(table.model_copy(update={"columns": columns}))
+        return catalog.model_copy(update={"tables": sanitized_tables})
 
     def plan_analysis(self, state: AgentState) -> AgentState:
         visible = Catalog.model_validate(state["visible_catalog"])
@@ -822,6 +911,10 @@ class FinanceAgentRuntime:
             "entity_id": proposal.get("entity_id"),
             "entity_type": proposal.get("entity_type"),
             "preferred_runtime": proposal.get("preferred_runtime"),
+            # 第二层：只把首轮已选中的 capability 规格交给 SQL 规划器。
+            # 首轮路由不再携带 173 张表的摘要，避免模型在还没决定能力时
+            # 就被完整 schema 索引干扰。
+            "selected_capability_detail": state.get("selected_capability_detail"),
             "selected_skill_detail": state.get("selected_skill_detail"),
         }
         if base_query_reference:
@@ -1199,7 +1292,7 @@ class FinanceAgentRuntime:
     def after_method_review(self, state: AgentState) -> str:
         if state.get("status") == "method_reviewed":
             return "ok"
-        return "repair" if self._can_repair(state) else "refuse"
+        return "repair" if self._should_research_schema(state) else "refuse"
 
     def synthetic_check(self, state: AgentState) -> AgentState:
         methods = self._state_methods(state)
@@ -1231,7 +1324,53 @@ class FinanceAgentRuntime:
     def after_synthetic_check(self, state: AgentState) -> str:
         if state.get("status") == "synthetic_check_passed":
             return "ok"
-        return "repair" if self._can_repair(state) else "refuse"
+        return "repair" if self._should_research_schema(state) else "refuse"
+
+    @staticmethod
+    def _can_schema_repair(state: AgentState) -> bool:
+        # 包含首轮在内最多三次 Schema → SQL → 校验循环。
+        return state.get("repair_attempts", 0) < MAX_METHOD_REPAIR_ATTEMPTS - 1
+
+    def _should_research_schema(self, state: AgentState) -> bool:
+        """仅把可由 Schema/SQL 重规划解决的问题送回循环。
+
+        沙箱连接失败、超时等基础设施错误不是“表没找对”，重跑只会浪费
+        两次 LLM 调用并掩盖部署问题，因此直接停止在未通过状态。
+        """
+        if not self._can_schema_repair(state):
+            return False
+        error_text = " ".join(str(error).lower() for error in state.get("errors", [])[-5:])
+        infrastructure_markers = (
+            "failed to connect",
+            "connection refused",
+            "connection timed out",
+            "could not connect",
+            "timeout expired",
+        )
+        return not any(marker in error_text for marker in infrastructure_markers)
+
+    def prepare_schema_repair(self, state: AgentState) -> AgentState:
+        """把系统校验错误反馈到下一轮受控 Schema 搜索，而非让模型盲改 SQL。"""
+        attempts = state.get("repair_attempts", 0) + 1
+        errors = list(state.get("errors", []))
+        history = list(state.get("repair_history", []))
+        history.append(
+            {
+                "attempt": attempts + 1,
+                "from_status": state.get("status"),
+                "errors": errors[-5:] or ["unknown validation failure"],
+                "repair_mode": "schema_research",
+            }
+        )
+        return {
+            **state,
+            "repair_attempts": attempts,
+            "repair_history": history,
+            "schema_repair_errors": errors[-5:] or ["unknown validation failure"],
+            # 上一轮的错误必须被消费，而不能令下一轮无条件失败。
+            "errors": [],
+            "status": "schema_repair_prepared",
+        }
 
     def repair_method(self, state: AgentState) -> AgentState:
         attempts = state.get("repair_attempts", 0) + 1

@@ -30,6 +30,8 @@ class MethodProposal(BaseModel):
     goal: str = ""                          # 分析目标
     preferred_runtime: str = "auto"         # sql | python | auto
     reason: str = ""
+    # 只保存业务概念，用于后端受控 Schema 搜索；不得包含客户名、金额等筛选值。
+    schema_search_terms: list[str] = Field(default_factory=list)
     sql: str | None = None                  # LLM 自写的 SQL（当通用操作不覆盖时）
     params: dict[str, Any] = Field(default_factory=dict)  # SQL 参数值，如 {"customer_name": "Company 10"}
     code: str | None = None                 # LLM 自写的 Python 代码
@@ -128,6 +130,7 @@ INSTRUCTIONS = """# 角色
     "goal": "不包含用户实际筛选值的分析目标",
     "preferred_runtime": "sql | python | auto",
     "reason": "简短原因",
+    "schema_search_terms": ["用于查找表的业务概念，不含用户实际筛选值"],
     "sql": null,
     "params": {}
   },
@@ -163,6 +166,8 @@ skill > capability > operations > 新查询
 # SQL 生成边界
 - 你绝不生成 SQL：sql 必须始终为 null。
 - 只有后续拿到完整 schema 的查询生成器可以生成 SQL；这样确认卡和执行器只有一个 SQL 来源。
+- schema_search_terms 只写 1–5 个业务概念（例如“交易”“状态”“客户”），用于后端搜索受控表目录；
+  绝不能填客户名称、账户号、金额、日期等用户实际筛选值，也不能填猜测的表名或字段名。
 - 用户补充筛选、字段、时间或排序要求时，结合最近聊天消息，把原需求和新要求合并到 goal。
 - 【连续查询强制规则】如果最近一条消息只是补充、修改或指代上一条数据请求（例如“按金额排序”“改成近三个月”“只看失败的”“再加上渠道”），必须继承上一条请求的查询对象、时间范围和筛选条件，生成一条完整的新 goal；不得把它当成新的、信息不足的问题，也不得要求用户重复主体。
 - 补充排序/字段/时间时，保留上一条请求中仍然有效的 params；只有用户明确替换筛选值时才替换对应 params。
@@ -452,6 +457,7 @@ def _validate_proposal(
         base_query_candidate=proposal.base_query_candidate,
         preferred_runtime=proposal.preferred_runtime,
         reason=proposal.reason,
+        schema_search_terms=_safe_schema_search_terms(proposal.schema_search_terms, proposal.params),
         sql=proposal.sql,
         params=proposal.params,
     )
@@ -485,6 +491,25 @@ def _repair_to_proposal(message: str) -> MethodProposal | None:
             reason="系统修复：模型未提出分析请求",
         )
     return None
+
+
+def _safe_schema_search_terms(terms: list[str], params: dict[str, Any]) -> list[str]:
+    """Schema 搜索词是业务元数据，不得把用户的真实筛选值带到后续模型调用。"""
+    private_values = {
+        str(value).strip().casefold()
+        for value in params.values()
+        if isinstance(value, (str, int, float)) and str(value).strip()
+    }
+    safe: list[str] = []
+    for term in terms:
+        if not isinstance(term, str):
+            continue
+        normalized = " ".join(term.split()).strip()
+        if not normalized or len(normalized) > 40 or normalized.casefold() in private_values:
+            continue
+        if normalized not in safe:
+            safe.append(normalized)
+    return safe[:5]
 
 
 def _normalize_result_refs(proposal: MethodProposal) -> tuple[list[str], list[str]]:
