@@ -100,23 +100,42 @@ def _prepare_sql(sql: str, params: dict[str, Any] | None = None) -> tuple[str, d
         flags=re.I
     )
 
+    # Customer labels are a user-facing lookup key. Normalize generated
+    # equality predicates to the same case/space-tolerant contract as mock
+    # execution, without broadening UUID, numeric, or date comparisons.
+    prepared = re.sub(
+        r"\b(legal_name(?:_en)?)\s*=\s*:([a-zA-Z_][a-zA-Z0-9_]*)",
+        r"\1 ILIKE :\2",
+        prepared,
+        flags=re.IGNORECASE,
+    )
+    # Keep the readable ILIKE predicate for audit/debug output while adding a
+    # normalized fallback that matches ``Company1`` with ``Company 1``. The
+    # parameter itself stays unchanged so authorization and audit hashes keep
+    # the user's original value.
+    prepared = re.sub(
+        r"\b(legal_name(?:_en)?)\s+ILIKE\s+:([a-zA-Z_][a-zA-Z0-9_]*)",
+        r"(\1 ILIKE :\2 OR regexp_replace(\1, '\\s+', '', 'g') ILIKE regexp_replace(:\2, '\\s+', '', 'g'))",
+        prepared,
+        flags=re.IGNORECASE,
+    )
+
     # 只为 SQL 明确写了 ILIKE 的文本参数启用模糊匹配。不能把所有
     # ``= :param`` 改写为 ILIKE，否则 UUID、数字和日期条件会被破坏。
     fuzzy_parameter_names = set(
         re.findall(r"\bILIKE\s+:([a-zA-Z_][a-zA-Z0-9_]*)", prepared, re.IGNORECASE)
     )
 
-    # ILIKE 参数：在字母和数字之间、以及任意连续空白处插入 %，并用 % 包裹。
-    # 例如：'Company5' / 'Company  5' 都会转换为 '%Company%5%'。
-    if params:
-        for key in params:
-            if key in fuzzy_parameter_names and isinstance(params[key], str):
-                val = re.sub(r"\s+", "%", params[key].strip())
-                # 在字母→数字、数字→字母之间插入 %
-                val = re.sub(r"([a-zA-Z])(\d)", r"\1%\2", val)
-                val = re.sub(r"(\d)([a-zA-Z])", r"\1%\2", val)
-                # 用 % 包裹，实现模糊匹配
-                params[key] = f"%{val}%"
+    # ILIKE 参数只补全首尾通配符，保留用户输入中的空格；复制参数，避免
+    # 执行过程污染 method.params 和持久化的原始值。
+    prepared_params = dict(params or {})
+    for key in fuzzy_parameter_names:
+        value = prepared_params.get(key)
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if "%" not in value and "_" not in value:
+            prepared_params[key] = f"%{value}%"
 
     # 提取命名参数并转换为 psycopg2 格式
     # :param_name → %(param_name)s，并收集参数值
@@ -124,8 +143,8 @@ def _prepare_sql(sql: str, params: dict[str, Any] | None = None) -> tuple[str, d
 
     def _replace_param(match):
         param_name = match.group(1)
-        if params and param_name in params:
-            param_values[param_name] = params[param_name]
+        if param_name in prepared_params:
+            param_values[param_name] = prepared_params[param_name]
             return f"%({param_name})s"
         else:
             # 没有提供参数值，使用 NULL

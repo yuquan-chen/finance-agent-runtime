@@ -15,7 +15,10 @@ class AgentState(MessagesState):
     # A run can create several review-card versions after revisions.
     review_id: str
     session_id: str
+    user_id: str
+    workspace_id: str
     user_query: str
+    requested_skill_id: str | None
     status: str
     errors: list[str]
     public_memory_context: list[dict[str, Any]]
@@ -30,10 +33,12 @@ class AgentState(MessagesState):
     resume_query_candidate: dict[str, Any]
     selected_capability_detail: dict[str, Any]
     selected_skill_detail: dict[str, Any]
+    skill_card: dict[str, Any]
     schema_search_terms: list[str]
     schema_candidates: list[dict[str, Any]]
     selected_schema_tables: list[str]
     schema_selection: dict[str, Any]
+    metadata_disclosure: dict[str, Any]
     schema_repair_errors: list[str]
     tool_decision: dict[str, Any]
     action_user_goal: str

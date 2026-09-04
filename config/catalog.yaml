@@ -72,18 +72,37 @@ tables:
         sensitive: false
     relationships: []
 business_terms:
+  kyc_status:
+    description: "客户 KYC/KYB 状态查询，第一版以账户表中的状态字段为主。"
+    aliases: ["KYC", "KYB", "kyc", "kyb", "身份认证", "身份验证", "合规状态"]
+    candidate_tables: ["account"]
+  payment:
+    description: "支付或收款交易，优先使用支付交易表。"
+    aliases: ["支付", "收款", "payment"]
+    candidate_tables: ["pay_transaction"]
+  payout:
+    description: "付款、打款或汇款交易，优先使用付款交易表。"
+    aliases: ["付款", "打款", "汇款", "payout"]
+    candidate_tables: ["payout_transaction"]
+  transaction_status:
+    description: "卡交易状态分布，使用卡交易表的状态字段。"
+    aliases: ["交易状态", "状态分布", "status distribution"]
+    candidate_tables: ["card_transaction"]
   customer:
-    description: "In card transaction analysis, customer maps to account_id unless a more specific customer dimension is configured."
-    candidate_fields: ["account_id", "customer_id", "user_id", "client_id"]
+    description: "Customer identity is resolved through the account name fields; transaction account identifiers remain available as join fields."
+    aliases: ["客户", "公司", "企业", "company"]
+    candidate_tables: ["account", "card_transaction", "payout_transaction", "pay_transaction"]
   card_channel:
     description: "Card channel dimension."
-    candidate_fields: ["card_channel", "channel", "card_channel_code", "channel_code"]
+    aliases: ["卡渠道", "渠道", "channel"]
+    candidate_tables: ["card_transaction", "card_channel"]
   consumption:
     description: "Consumption transaction. Prefer type = consumption and completed/success-like statuses."
+    aliases: ["消费", "购买", "purchase"]
     filters:
-      - field: type
+      - field: card_transaction.type
         op: in
         value: ["consumption", "consume", "purchase"]
-      - field: status
+      - field: card_transaction.status
         op: in
         value: ["completed", "success", "succeeded", "settled"]

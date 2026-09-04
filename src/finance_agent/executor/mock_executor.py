@@ -90,7 +90,13 @@ class MockExecutor:
             value = row.get(filter_.field)
             if filter_.op == "in" and value not in filter_.value:
                 return False
-            if filter_.op == "=" and value != filter_.value:
+            if filter_.op == "=" and isinstance(value, str) and isinstance(filter_.value, str):
+                # Match the production customer-name lookup contract: labels
+                # are case-insensitive and tolerant of omitted spaces.
+                normalize = lambda item: "".join(str(item).casefold().split())
+                if normalize(value) != normalize(filter_.value):
+                    return False
+            elif filter_.op == "=" and value != filter_.value:
                 return False
             if filter_.op == "!=" and value == filter_.value:
                 return False

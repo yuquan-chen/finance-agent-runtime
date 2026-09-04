@@ -21,6 +21,10 @@ Note/
 .pytest_cache/
 tests/
 docs/
+# 产品方向是团队共享的版本化决策；其余 docs 仍作为本地工作资料忽略。
+!docs/
+docs/*
+!docs/product_prd_summary.md
 STARTUP.md
 
 # Python build

@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from finance_agent.session.thread_store import SideThreadStore, ThreadStoreError
 
 
 class SessionManager:
@@ -18,21 +21,49 @@ class SessionManager:
 
     def __init__(self, sessions_dir: Path | str | None = None):
         if sessions_dir is None:
-            sessions_dir = Path(__file__).parent.parent.parent.parent / "data" / "sessions"
+            default_path = Path(__file__).parent.parent.parent.parent / "data" / "sessions"
+            sessions_dir = Path(os.environ.get("SESSION_STORE_PATH", str(default_path)))
         self.sessions_dir = Path(sessions_dir)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.side_thread_store = SideThreadStore(self.sessions_dir.parent / "side_threads.sqlite3")
+        self._migrate_legacy_side_data()
 
     def _session_path(self, session_id: str) -> Path:
         """获取 session 文件路径。"""
         return self.sessions_dir / f"{session_id}.json"
 
-    def create_session(self, title: str | None = None) -> dict[str, Any]:
+    def _migrate_legacy_side_data(self) -> None:
+        """Copy old embedded side sessions into SQLite without deleting source data."""
+        for path in self.sessions_dir.glob("*.json"):
+            try:
+                session_data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            session_id = str(session_data.get("session_id") or "")
+            if not session_id:
+                continue
+            for key, state in (session_data.get("skill_state") or {}).items():
+                if isinstance(state, dict):
+                    self.side_thread_store.import_workflow_state(session_id, str(key), state)
+            for thread in (session_data.get("skill_sessions") or {}).values():
+                if isinstance(thread, dict):
+                    self.side_thread_store.import_legacy_thread(thread)
+
+    def create_session(
+        self,
+        title: str | None = None,
+        *,
+        user_id: str = "local",
+        workspace_id: str = "local",
+    ) -> dict[str, Any]:
         """创建新的 session。"""
         session_id = str(uuid.uuid4())
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         session_data = {
             "session_id": session_id,
+            "user_id": user_id,
+            "workspace_id": workspace_id,
             "title": title or f"对话 {now[:10]}",
             "created_at": now,
             "updated_at": now,
@@ -50,6 +81,10 @@ class SessionManager:
             "pending_query_candidate": None,
             # 右侧运行详情仅保存最近一次运行的安全追踪，不保存结果行。
             "run_detail": None,
+            # Skill 表单/草稿按会话隔离；具体 Skill 自己定义 state 结构。
+            "skill_state": {},
+            # 侧边 Skill Agent 的独立子会话；消息与主聊天隔离，但仍归属当前父会话。
+            "skill_sessions": {},
             "metadata": {},
         }
 
@@ -68,14 +103,24 @@ class SessionManager:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def list_sessions(self) -> list[dict[str, Any]]:
+    def list_sessions(self, *, user_id: str | None = None, workspace_id: str | None = None) -> list[dict[str, Any]]:
         """列出所有 session。"""
         sessions = []
         for path in self.sessions_dir.glob("*.json"):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                stored_user_id = str(data.get("user_id") or data.get("metadata", {}).get("user_id") or "local")
+                stored_workspace_id = str(
+                    data.get("workspace_id") or data.get("metadata", {}).get("workspace_id") or "local"
+                )
+                if user_id is not None and stored_user_id != user_id:
+                    continue
+                if workspace_id is not None and stored_workspace_id != workspace_id:
+                    continue
                 sessions.append({
                     "session_id": data["session_id"],
+                    "user_id": stored_user_id,
+                    "workspace_id": stored_workspace_id,
                     "title": data.get("title", ""),
                     "created_at": data.get("created_at", ""),
                     "updated_at": data.get("updated_at", ""),
@@ -86,6 +131,16 @@ class SessionManager:
                 continue
         # 文件名是随机 UUID，不能代表对话的新旧；按最近更新时间展示。
         return sorted(sessions, key=lambda session: (session["pinned"], session["updated_at"]), reverse=True)
+
+    def owns_session(self, session_id: str, *, user_id: str, workspace_id: str) -> bool:
+        session = self.get_session(session_id)
+        if session is None:
+            return False
+        stored_user_id = str(session.get("user_id") or session.get("metadata", {}).get("user_id") or "local")
+        stored_workspace_id = str(
+            session.get("workspace_id") or session.get("metadata", {}).get("workspace_id") or "local"
+        )
+        return stored_user_id == user_id and stored_workspace_id == workspace_id
 
     def set_session_pinned(self, session_id: str, pinned: bool) -> dict[str, Any] | None:
         """设置会话是否置顶，不改变对话内容。"""
@@ -164,6 +219,26 @@ class SessionManager:
         )
 
         return session_data
+
+    def add_attachment(self, session_id: str, attachment: dict[str, Any]) -> dict[str, Any] | None:
+        """Persist session-scoped attachment metadata without adding OCR text to chat history."""
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return None
+        metadata = dict(session_data.get("metadata") or {})
+        attachments = list(metadata.get("attachments") or [])
+        attachments.append(attachment)
+        metadata["attachments"] = attachments
+        return self.update_session(session_id, {"metadata": metadata})
+
+    def get_attachments(self, session_id: str) -> list[dict[str, Any]]:
+        """Return attachment metadata for one session."""
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return []
+        metadata = session_data.get("metadata") or {}
+        attachments = metadata.get("attachments")
+        return list(attachments) if isinstance(attachments, list) else []
 
     def add_private_analysis(self, session_id: str, analysis: dict[str, Any]) -> dict[str, Any] | None:
         """保存当前用户可见的真实结果与解读，不写入普通 conversation_history。"""
@@ -423,10 +498,144 @@ class SessionManager:
         detail = session_data.get("run_detail")
         return detail if isinstance(detail, dict) else None
 
+    def set_skill_state(
+        self,
+        session_id: str,
+        skill_key: str,
+        state: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Save a versioned workflow artifact outside the session JSON document."""
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return None
+        self.side_thread_store.set_workflow_state(session_id, skill_key, state)
+        return session_data
+
+    def get_skill_state(self, session_id: str, skill_key: str) -> dict[str, Any] | None:
+        """Read a workflow artifact without exposing its storage implementation."""
+        if self.get_session(session_id) is None:
+            return None
+        state, _ = self.side_thread_store.get_workflow_state(session_id, skill_key)
+        return state
+
+    def get_skill_state_with_revision(self, session_id: str, skill_key: str) -> tuple[dict[str, Any], int]:
+        """Read the artifact together with the revision needed for an explicit handoff."""
+        if self.get_session(session_id) is None:
+            return {}, 0
+        state, revision = self.side_thread_store.get_workflow_state(session_id, skill_key)
+        return state or {}, revision
+
+    def create_skill_session(
+        self,
+        session_id: str,
+        skill_id: str,
+        *,
+        state_key: str | None = None,
+        handler_id: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Create a first-class side thread owned by a parent session."""
+        if self.get_session(session_id) is None:
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        return self.side_thread_store.create_thread(
+            thread_id=str(uuid.uuid4()),
+            parent_session_id=session_id,
+            skill_id=skill_id,
+            state_key=state_key or skill_id,
+            handler_id=handler_id or "general",
+            context_snapshot=dict(context or {}),
+            created_at=now,
+        )
+
+    def list_skill_sessions(self, session_id: str) -> list[dict[str, Any]]:
+        """List side-thread metadata without loading their event histories."""
+        if self.get_session(session_id) is None:
+            return []
+        return self.side_thread_store.list_threads(session_id)
+
+    def get_skill_session(
+        self,
+        skill_session_id: str,
+        *,
+        parent_session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read one side thread and reconstruct its messages from events."""
+        return self.side_thread_store.get_thread(skill_session_id, parent_session_id=parent_session_id)
+
+    def add_skill_session_message(
+        self,
+        skill_session_id: str,
+        role: str,
+        content: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Append a side-thread message as an immutable event."""
+        return self.side_thread_store.append_message(skill_session_id, role, content, attachments)
+
+    def begin_skill_session_turn(self, skill_session_id: str) -> dict[str, Any]:
+        """Mark a resumable side thread as actively handling one user turn."""
+        return self.side_thread_store.begin_turn(skill_session_id)
+
+    def complete_skill_session_turn(
+        self,
+        *,
+        skill_session_id: str,
+        user_content: str,
+        attachments: list[dict[str, Any]],
+        answer: str,
+        state_key: str,
+        state: dict[str, Any],
+        expected_state_revision: int,
+        next_status: str = "waiting_user",
+    ) -> dict[str, Any]:
+        """Commit messages, a workflow handoff, checkpoint, and status atomically."""
+        return self.side_thread_store.complete_turn(
+            thread_id=skill_session_id,
+            user_content=user_content,
+            attachments=attachments,
+            answer=answer,
+            artifact_key=state_key,
+            artifact_state=state,
+            expected_artifact_revision=expected_state_revision,
+            next_status=next_status,
+        )
+
+    def fail_skill_session_turn(self, skill_session_id: str, reason: str) -> dict[str, Any] | None:
+        """Record a side-handler failure without persisting raw exception details."""
+        return self.side_thread_store.fail_turn(skill_session_id, reason)
+
+    def replace_skill_session_message(
+        self,
+        skill_session_id: str,
+        message_index: int,
+        content: str,
+    ) -> dict[str, Any] | None:
+        """Legacy compatibility hook; event logs intentionally do not rewrite history."""
+        del message_index, content
+        return self.get_skill_session(skill_session_id)
+
+    def update_skill_session(
+        self,
+        skill_session_id: str,
+        updates: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Transition side-thread status through the durable state machine."""
+        unsupported = set(updates) - {"status"}
+        if unsupported:
+            raise ThreadStoreError(f"side-thread metadata is immutable: {', '.join(sorted(unsupported))}")
+        if "status" not in updates:
+            return self.get_skill_session(skill_session_id)
+        status = str(updates["status"])
+        if status == "closed":
+            status = "cancelled"
+        return self.side_thread_store.transition(skill_session_id, status)
+
     def delete_session(self, session_id: str) -> bool:
         """删除 session。"""
         path = self._session_path(session_id)
         if path.exists():
+            self.side_thread_store.delete_parent(session_id)
             path.unlink()
             return True
         return False

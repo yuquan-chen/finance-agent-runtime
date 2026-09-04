@@ -44,13 +44,25 @@ def response_plan_to_tool_decision(plan: ResponsePlan) -> ToolDecision:
         )
     proposal = plan.method_proposal
     if proposal and proposal.goal:
+        # Native Skill calls expose their registered business entrypoint. Keep
+        # the legacy analysis name only for proposals from the old contract.
+        tool_name = (
+            proposal.entity_id
+            if proposal.entity_type == "skill" and proposal.entity_id
+            else "analysis.prepare_method"
+        )
         return ToolDecision(
             response_mode="tool_call",
-            tool_name="analysis.prepare_method",
+            tool_name=tool_name,
             assistant_message=plan.message,
             reason=proposal.reason,
             confidence=plan.confidence,
-            tool_arguments={"user_goal": proposal.goal, "entity_id": proposal.entity_id, "result_refs": proposal.result_refs},
+            tool_arguments={
+                "user_goal": proposal.goal,
+                "entity_id": proposal.entity_id,
+                "result_refs": proposal.result_refs,
+                "params": proposal.params,
+            },
         )
     return ToolDecision(
         response_mode="chat_response",

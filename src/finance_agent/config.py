@@ -38,6 +38,11 @@ class Settings:
     audit_log_path: Path
     private_result_store_path: Path
     public_memory_path: Path
+    run_store_path: Path
+    kyc_draft_path: Path
+    session_store_path: Path
+    auth_mode: str
+    auth_secret: str
     # PostgreSQL 配置
     pg_host: str
     pg_port: str
@@ -67,6 +72,11 @@ def get_settings() -> Settings:
             os.environ.get("PRIVATE_RESULT_STORE_PATH", str(PROJECT_ROOT / "data" / "private_results.jsonl"))
         ),
         public_memory_path=Path(os.environ.get("PUBLIC_MEMORY_PATH", str(PROJECT_ROOT / "data" / "public_memory.jsonl"))),
+        run_store_path=Path(os.environ.get("RUN_STORE_PATH", str(PROJECT_ROOT / "data" / "runs.sqlite3"))),
+        kyc_draft_path=Path(os.environ.get("KYC_DRAFT_PATH", str(PROJECT_ROOT / "data" / "kyc_drafts"))),
+        session_store_path=Path(os.environ.get("SESSION_STORE_PATH", str(PROJECT_ROOT / "data" / "sessions"))),
+        auth_mode=os.environ.get("AUTH_MODE", "local").strip().lower(),
+        auth_secret=os.environ.get("AUTH_SECRET", ""),
         # PostgreSQL 配置
         pg_host=os.environ.get("PG_HOST", "localhost"),
         pg_port=os.environ.get("PG_PORT", "5432"),

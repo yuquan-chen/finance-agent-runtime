@@ -239,7 +239,9 @@ def build_execution_result_card(
     execution_result: MockDryRunResult,
 ) -> ExecutionResultCard:
     output = execution_result.output if execution_result.output is not None else {}
-    row_count = int(execution_result.input_summary.get("row_count") or 0)
+    # The result card describes returned rows, not fixture rows loaded into the
+    # sandbox. Aggregate queries can read 100 rows and return one row.
+    row_count = len(output) if isinstance(output, list) else (1 if isinstance(output, dict) else 0)
     return ExecutionResultCard(
         status="executed",
         execution_mode="simulated_real",

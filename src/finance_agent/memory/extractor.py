@@ -6,6 +6,7 @@ Turn 结束后，使用 LLM 从对话中提取记忆。
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from finance_agent.llm.provider import LlmProvider
@@ -21,6 +22,7 @@ EXTRACTOR_SYSTEM_PROMPT = """你是一个记忆提取器。分析用户对话，
 3. 不要提取代码模式、架构、文件路径
 4. 对于 feedback 类型，必须包含 **Why:** 和 **How to apply:**
 5. 每条记忆必须有明确的类型（user/feedback/project/reference）
+6. 不要保存账户号、客户名称、金额、日期、证件号、密码、token 或其他原始敏感值
 
 {type_prompt}
 
@@ -46,6 +48,7 @@ async def extract_memories(
     store: MemoryStore,
     llm: LlmProvider,
     session_id: str,
+    redact_values: list[Any] | None = None,
 ) -> list[MemoryFile]:
     """从对话中提取记忆。
 
@@ -95,7 +98,7 @@ async def extract_memories(
         # 应用更新
         saved_memories = []
         for update in memory_updates:
-            memory = _apply_memory_update(update, store, session_id)
+            memory = _apply_memory_update(update, store, session_id, redact_values=redact_values)
             if memory:
                 saved_memories.append(memory)
 
@@ -126,12 +129,13 @@ def _apply_memory_update(
     update: dict[str, Any],
     store: MemoryStore,
     session_id: str,
+    redact_values: list[Any] | None = None,
 ) -> MemoryFile | None:
     """应用记忆更新。"""
-    name = update.get("name", "")
-    description = update.get("description", "")
+    name = _normalize_memory_name(update.get("name", ""))
+    description = _redact_memory_text(update.get("description", ""), redact_values)
     type_str = update.get("type", "project")
-    content = update.get("content", "")
+    content = _redact_memory_text(update.get("content", ""), redact_values)
     action = update.get("action", "create")
 
     if not name or not content:
@@ -169,6 +173,25 @@ def _apply_memory_update(
         return store.save_memory(memory)
 
 
+def _normalize_memory_name(value: Any) -> str:
+    """Restrict model-generated names to safe single-file identifiers."""
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "")).strip("_")
+    return name[:80]
+
+
+def _redact_memory_text(value: Any, redact_values: list[Any] | None) -> str:
+    """Remove known request parameter values before storing semantic memory."""
+    text = str(value or "")
+    for raw_value in sorted(
+        (str(item) for item in (redact_values or []) if item is not None),
+        key=len,
+        reverse=True,
+    ):
+        if raw_value.strip():
+            text = re.sub(re.escape(raw_value), "[参数]", text, flags=re.IGNORECASE)
+    return text
+
+
 async def extract_memories_from_state(
     state: dict[str, Any],
     store: MemoryStore,
@@ -204,7 +227,18 @@ async def extract_memories_from_state(
     if not messages:
         return []
 
-    return await extract_memories(messages, store, llm, state.get("session_id", ""))
+    proposal = (state.get("action_validation") or {}).get("proposal") or {}
+    redact_values = [
+        *(state.get("base_query_params") or {}).values(),
+        *(proposal.get("params") or {}).values(),
+    ]
+    return await extract_memories(
+        messages,
+        store,
+        llm,
+        state.get("session_id", ""),
+        redact_values=redact_values,
+    )
 
 
 def extract_memories_from_state_sync(

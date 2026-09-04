@@ -28,14 +28,16 @@ from finance_agent.harness.analysis_schema import (
 )
 from finance_agent.harness.method_validator import validate_method_draft
 from finance_agent.llm.provider import LlmProvider, build_llm_provider
-from finance_agent.memory.memory_store import MemoryStore
 from finance_agent.memory.private_result_store import PrivateResultStore
-from finance_agent.memory.public_memory import PublicMemoryStore
 from finance_agent.memory.query_candidate_selector import parse_candidate_reply, select_query_candidate
-from finance_agent.memory.safe_summary import build_public_memory_entry
+from finance_agent.memory.contracts import MemoryKind
+from finance_agent.memory.memory_store import MemoryStore
+from finance_agent.memory.public_memory import PublicMemoryEntry
+from finance_agent.memory.safe_summary import build_query_history_memory
 from finance_agent.memory.selector import select_relevant_memories
 from finance_agent.memory.extractor import extract_memories_from_state
 from finance_agent.metadata.business_registry import BusinessTermRegistry, load_business_registry_from_catalog
+from finance_agent.metadata.business_knowledge import BusinessKnowledge
 from finance_agent.metadata.catalog import Catalog, load_catalog
 from finance_agent.metadata.policy import Policy, load_policy
 from finance_agent.metadata.pruner import prune_catalog
@@ -64,8 +66,12 @@ from finance_agent.renderer.method_review_renderer import (
 from finance_agent.renderer.reply_generator import generate_reply
 from finance_agent.renderer.result_narrator import narrate_execution_result, render_user_narration
 from finance_agent.sandbox.mock_sandbox import run_mock_dry_run, run_simulated_real_execution
-from finance_agent.session.manager import SessionManager, get_session_manager
+from finance_agent.session.manager import SessionManager
+from finance_agent.session.run_store import RunStore
 from finance_agent.skills.registry import SkillRegistry, load_skill_registry
+from finance_agent.skills.agent import SkillAgentExecutor
+from finance_agent.kyc.local_drafts import KycLocalDraftStore
+from finance_agent.kyc.conversation import update_from_conversation
 
 
 MAX_METHOD_REPAIR_ATTEMPTS = 3
@@ -97,13 +103,27 @@ class FinanceAgentRuntime:
             self.catalog.business_terms if hasattr(self.catalog, "business_terms") else {}
         )
         self.table_registry = table_registry or get_default_table_registry()
+        self.business_knowledge = BusinessKnowledge(self.table_registry, self.business_term_registry)
         self.llm_provider = llm_provider or build_llm_provider(self.settings)
         self.audit_logger = AuditLogger(self.settings.audit_log_path)
         self.private_result_store = PrivateResultStore(self.settings.private_result_store_path)
-        self.public_memory_store = PublicMemoryStore(self.settings.public_memory_path)
-        self.memory_store = MemoryStore(self.settings.public_memory_path.parent / "public_memory")
-        self.session_manager = session_manager or get_session_manager()
+        # One canonical store contains both safe query history and semantic
+        # memory. Private results, run checkpoints, and audit logs are separate.
+        self.memory_store = MemoryStore(self.settings.public_memory_path)
+        # Session storage follows the rest of the runtime's configured data
+        # paths. This keeps test/runtime instances isolated from user sessions.
+        self.session_manager = session_manager or SessionManager(self.settings.session_store_path)
+        self.run_store = RunStore(self.settings.run_store_path)
+        self.kyc_drafts = KycLocalDraftStore(self.settings.kyc_draft_path)
+        self.skill_agent = SkillAgentExecutor(
+            session_manager=self.session_manager,
+            skill_registry=self.skill_registry,
+            llm_provider=self.llm_provider,
+        )
         self.checkpointer = MemorySaver()
+        # Each request intentionally gets its own graph thread. Keep the mapping
+        # so session deletion can remove all in-process checkpoints for a session.
+        self._checkpoint_threads_by_session: dict[str, set[str]] = {}
         self.executor = self._build_executor()
         self.graph = self._build_graph()
 
@@ -172,17 +192,31 @@ class FinanceAgentRuntime:
         graph.add_edge("audit", END)
         return graph.compile(checkpointer=self.checkpointer)
 
-    async def invoke(self, question: str, session_id: str | None = None) -> AgentState:
+    def _prepare_invocation(
+        self,
+        question: str,
+        session_id: str | None = None,
+        requested_skill_id: str | None = None,
+        user_id: str = "local",
+        workspace_id: str = "local",
+    ) -> tuple[AgentState, dict[str, Any], Any]:
         # 如果没有 session_id，创建新的 session
         if not session_id:
-            session = self.session_manager.create_session()
+            session = self.session_manager.create_session(user_id=user_id, workspace_id=workspace_id)
             session_id = session["session_id"]
         else:
-            # 确保 session 存在
+            # Session IDs are capabilities scoped to the authenticated owner;
+            # never silently replace a missing or foreign session.
             session = self.session_manager.get_session(session_id)
             if session is None:
-                session = self.session_manager.create_session()
-                session_id = session["session_id"]
+                raise ValueError("session not found")
+            metadata = session.get("metadata") or {}
+            stored_user_id = str(session.get("user_id") or metadata.get("user_id") or "local")
+            stored_workspace_id = str(
+                session.get("workspace_id") or metadata.get("workspace_id") or "local"
+            )
+            if stored_user_id != user_id or stored_workspace_id != workspace_id:
+                raise PermissionError("session does not belong to the current principal")
 
         # 从 SessionManager 读取对话历史
         conversation_history = self.session_manager.get_conversation_history(session_id)
@@ -208,25 +242,43 @@ class FinanceAgentRuntime:
         self.session_manager.add_message(session_id, "user", question, request_id=request_id)
 
         config = {"configurable": {"thread_id": f"run_{request_id}"}}
+        self._checkpoint_threads_by_session.setdefault(session_id, set()).add(
+            config["configurable"]["thread_id"]
+        )
 
         initial: AgentState = {
             "request_id": request_id,
             "review_id": request_id,
             "session_id": session_id,
+            "user_id": user_id,
+            "workspace_id": workspace_id,
             "user_query": question,
+            "requested_skill_id": requested_skill_id,
             "status": "started",
             "errors": [],
-            "public_memory_context": self.public_memory_store.context_for_llm(session_id),
+            "public_memory_context": self.memory_store.context_for_llm(session_id),
             "conversation_history": conversation_history,
             "repair_attempts": 0,
             "repair_history": [],
             "pending_query_candidate": pending_candidate,
             "resume_query_candidate": resume_query_candidate,
         }
+        # Persist the run before invoking the graph so a crash during planning
+        # still leaves a durable lifecycle record to inspect or reconcile.
+        self.run_store.save(initial, initial)
 
-        # 调用图
-        result = await self.graph.ainvoke(initial, config=config)
+        conversational_skill = self.skill_registry.get(requested_skill_id) if requested_skill_id else None
+        return initial, config, conversational_skill
 
+    def _finish_graph_result(
+        self,
+        initial: AgentState,
+        result: AgentState,
+    ) -> AgentState:
+        """完成图运行后的会话、候选查询和持久化收尾。"""
+        session_id = initial["session_id"]
+        request_id = initial["request_id"]
+        resume_query_candidate = initial.get("resume_query_candidate")
         candidate_selection = result.get("query_candidate_selection") or {}
         if candidate_selection.get("status") == "ambiguous":
             proposal = (result.get("action_validation") or {}).get("proposal") or {}
@@ -242,24 +294,146 @@ class FinanceAgentRuntime:
             self.session_manager.set_pending_query_candidate(session_id, None)
 
         # 普通回复进入 conversation_history。执行结果由对应的授权执行方法
-        # 写入独立的 private_analysis，供当前用户刷新后查看，但不进入普通模型上下文。
+        # 写入独立的 private_analysis，不进入普通模型上下文。
         answer = result.get("answer")
         if answer:
             self.session_manager.add_message(session_id, "assistant", answer, request_id=request_id)
 
+        self.run_store.save(result, result)
         return result
+
+    async def invoke(
+        self,
+        question: str,
+        session_id: str | None = None,
+        requested_skill_id: str | None = None,
+        user_id: str = "local",
+        workspace_id: str = "local",
+    ) -> AgentState:
+        initial, config, conversational_skill = self._prepare_invocation(
+            question, session_id, requested_skill_id, user_id, workspace_id
+        )
+        session_id = initial["session_id"]
+        if conversational_skill and conversational_skill.card.get("type") in {"intake", "identity"} and question.strip():
+            result = self._invoke_kyc_conversation(initial, conversational_skill)
+            answer = result.get("answer")
+            if answer:
+                self.session_manager.add_message(
+                    session_id, "assistant", answer, request_id=initial["request_id"]
+                )
+            self.run_store.save(result, result)
+            return result
+
+        # 调用图
+        result = await self.graph.ainvoke(initial, config=config)
+        return self._finish_graph_result(initial, result)
+
+    async def astream(
+        self,
+        question: str,
+        session_id: str | None = None,
+        requested_skill_id: str | None = None,
+        user_id: str = "local",
+        workspace_id: str = "local",
+    ):
+        """按 LangGraph 节点产出阶段事件，并在最后产出完整状态。
+
+        这是运行阶段流式：每个节点结束就能通知前端。LLM 当前仍使用
+        chat_json 一次性得到结构化结果，因此暂不承诺 token 级流式。
+        """
+        initial, config, conversational_skill = self._prepare_invocation(
+            question, session_id, requested_skill_id, user_id, workspace_id
+        )
+        if conversational_skill and conversational_skill.card.get("type") in {"intake", "identity"} and question.strip():
+            result = self._invoke_kyc_conversation(initial, conversational_skill)
+            answer = result.get("answer")
+            if answer:
+                self.session_manager.add_message(initial["session_id"], "assistant", answer, request_id=initial["request_id"])
+            self.run_store.save(result, result)
+            yield "skill_agent", result
+            yield "complete", result
+            return
+
+        current: AgentState = dict(initial)
+        async for update in self.graph.astream(initial, config=config, stream_mode="updates"):
+            if not isinstance(update, dict):
+                continue
+            for node, node_update in update.items():
+                if isinstance(node_update, dict):
+                    current = {**current, **node_update}
+                yield str(node), current
+
+        result = self._finish_graph_result(initial, current)
+        yield "complete", result
+
+    def _invoke_kyc_conversation(self, state: AgentState, skill) -> AgentState:
+        skill_key = skill.card.get("state_key") or skill.name
+        current = self.session_manager.get_skill_state(state["session_id"], skill_key) or {}
+        try:
+            result = update_from_conversation(
+                message=state["user_query"],
+                card=skill.card,
+                state=current,
+                provider=self.llm_provider,
+            )
+            updated_state = {**current, "fields": {**(current.get("fields") or {}), **result["updates"]}}
+            self.session_manager.set_skill_state(state["session_id"], skill_key, updated_state)
+            answer = result["message"]
+            errors: list[str] = []
+        except Exception as error:
+            updated_state = current
+            answer = "这句话暂时无法可靠映射到表单字段，请直接填写卡片，或换一种方式描述。"
+            errors = [f"KYC 对话解析失败：{error}"]
+        detail = skill.detail_spec()
+        return {
+            **state,
+            "answer": answer,
+            "errors": errors,
+            "status": "skill_card_ready",
+            "response_plan": {"message": answer, "status_hint": "skill_card_ready"},
+            "action_validation": {"allowed": True, "route": "direct_response", "status": "skill_card_ready"},
+            "selected_skill_detail": detail,
+            "skill_card": skill.card,
+            "kyc_state": updated_state,
+        }
+
+    def open_skill_agent(self, session_id: str, skill_id: str) -> dict[str, Any]:
+        """打开或恢复通用侧边 Skill Agent。"""
+        return self.skill_agent.open(session_id, skill_id)
+
+    def get_skill_agent(self, skill_session_id: str) -> dict[str, Any]:
+        """读取侧边 Skill Agent 的独立消息和共享状态。"""
+        return self.skill_agent.messages(skill_session_id)
+
+    def send_skill_agent_message(
+        self,
+        skill_session_id: str,
+        message: str,
+        attachment_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """向侧边 Skill Agent 发送消息，不进入主聊天查询链路。"""
+        return self.skill_agent.respond(skill_session_id, message, attachment_ids)
+
+    def register_side_agent_handler(self, handler_id: str, handler, *, attachment_access: str = "metadata") -> None:
+        """Register an extension handler without modifying the main graph."""
+        self.skill_agent.register_handler(handler_id, handler, attachment_access=attachment_access)
 
     async def delete_session(self, session_id: str) -> dict[str, int] | None:
         """删除会话及其所有会话级记忆与内存检查点。"""
         if self.session_manager.get_session(session_id) is None:
             return None
         deleted = {
-            "public_memory": self.public_memory_store.delete_session(session_id),
+            "query_history": self.memory_store.delete_session(session_id, MemoryKind.QUERY_HISTORY),
             "private_results": self.private_result_store.delete_session(session_id),
-            "file_memories": self.memory_store.delete_session_memories(session_id),
+            "semantic_memory": self.memory_store.delete_session_memories(session_id),
+            "kyc_documents": self.kyc_drafts.delete_session(session_id),
         }
-        await self.checkpointer.adelete_thread(session_id)
+        checkpoint_threads = self._checkpoint_threads_by_session.pop(session_id, set())
+        checkpoint_threads.add(session_id)  # Compatibility with older session-scoped threads.
+        for thread_id in checkpoint_threads:
+            await self.checkpointer.adelete_thread(thread_id)
         self.session_manager.delete_session(session_id)
+        self.run_store.delete_session(session_id)
         return deleted
 
     async def approve_method_review(self, state: AgentState) -> AgentState:
@@ -339,8 +513,8 @@ class FinanceAgentRuntime:
                     "source_params": source_params,
                 },
             )
-            public_memory = self.public_memory_store.append(
-                build_public_memory_entry(
+            public_memory = self.memory_store.upsert(
+                build_query_history_memory(
                     request_id=state["request_id"],
                     session_id=state["session_id"],
                     method=method,
@@ -351,17 +525,6 @@ class FinanceAgentRuntime:
                 )
             )
 
-            # 保存查询历史到文件型 memory（保存用户意图，不保存 SQL）
-            sql_template = method.sql_template or ""
-            tables_from_sql = re.findall(r"(?:FROM|JOIN)\s+(\w+)", sql_template, re.IGNORECASE)
-            tables = list(set([f.split(".")[0] for f in method.required_fields if "." in f])) or tables_from_sql
-            self.memory_store.save_query_history(
-                user_query=state.get("user_query", ""),
-                result_summary=f"步骤 {index} 返回 {card.row_count} 行",
-                tables=tables,
-                fields=method.required_fields,
-                session_id=state["session_id"],
-            )
             narration = narrate_execution_result(
                 card,
                 method,
@@ -383,7 +546,9 @@ class FinanceAgentRuntime:
 
         card_data = [card.model_dump(mode="json") for card in cards]
         narration_data = [item.model_dump(mode="json") for item in narrations]
-        public_data = [item.model_dump(mode="json") for item in public_entries]
+        # Keep the response/audit payload stable while persistence itself uses
+        # the canonical MemoryRecord schema.
+        public_data = [PublicMemoryEntry.from_record(item).model_dump(mode="json") for item in public_entries]
         next_state: AgentState = {
             **state,
             "status": "method_execution_failed" if failures else "executed_simulated_real",
@@ -648,6 +813,18 @@ class FinanceAgentRuntime:
                 "status": "response_planned",
             }
 
+        # 显式点击/调用一个没有附加任务的 Skill 时，直接打开它的配置卡片。
+        # 这条路径不需要模型判断，保证 @Skill 的 UI 入口稳定且不会产生无意义的 LLM 调用。
+        requested_skill = self.skill_registry.get(state.get("requested_skill_id")) if state.get("requested_skill_id") else None
+        if requested_skill and requested_skill.card and not state.get("user_query", "").strip():
+            plan = ResponsePlan(message=requested_skill.title, status_hint="skill_card_ready")
+            return {
+                **state,
+                "response_plan": plan.model_dump(mode="json"),
+                "tool_decision": response_plan_to_tool_decision(plan).model_dump(mode="json"),
+                "status": "response_planned",
+            }
+
         # 选择相关记忆（新系统）- 使用同步版本
         from finance_agent.memory.selector import select_relevant_memories_sync
         relevant_memories = select_relevant_memories_sync(
@@ -696,6 +873,36 @@ class FinanceAgentRuntime:
             relevant_memories=memory_context,
             conversation_messages=conversation_history,
         )
+        requested_skill_id = state.get("requested_skill_id")
+        if requested_skill_id:
+            skill = self.skill_registry.get(requested_skill_id)
+            if skill:
+                if skill.kind == "query":
+                    proposal = plan.method_proposal or MethodProposal()
+                    plan = plan.model_copy(
+                        update={
+                            "method_proposal": proposal.model_copy(
+                                update={
+                                    "entity_id": skill.name,
+                                    "entity_type": "skill",
+                                    "goal": proposal.goal or state["user_query"],
+                                    "schema_search_terms": list(
+                                        dict.fromkeys(
+                                            [*proposal.schema_search_terms, *skill.required_metadata_terms]
+                                        )
+                                    ),
+                                }
+                            )
+                        }
+                    )
+                else:
+                    plan = plan.model_copy(
+                        update={
+                            "method_proposal": None,
+                            "message": plan.message or skill.title,
+                            "status_hint": "skill_card_ready",
+                        }
+                    )
         legacy_decision = response_plan_to_tool_decision(plan)
         # 更新 sent_memory_count，下次只发增量
         memory_count = len(state.get("public_memory_context", []))
@@ -724,7 +931,7 @@ class FinanceAgentRuntime:
         proposal = validation.proposal
         candidate = proposal.base_query_candidate if proposal else None
         candidate_selection = select_query_candidate(
-            self.public_memory_store.context_for_llm(state["session_id"]),
+            self.memory_store.context_for_llm(state["session_id"]),
             candidate=candidate,
             current_goal=validation.user_goal,
             user_query=state["user_query"],
@@ -751,8 +958,26 @@ class FinanceAgentRuntime:
                     ],
                 }
             )
+        requested_skill = self.skill_registry.get(state.get("requested_skill_id")) if state.get("requested_skill_id") else None
+        proposed_skill = None
+        if validation.proposal and validation.proposal.entity_type == "skill":
+            proposed_skill = self.skill_registry.get(validation.proposal.entity_id or "")
+        special_skill = requested_skill or proposed_skill
+        # An explicit Skill with no task opens its configured card first. Once
+        # the card submits a natural-language goal, the normal query graph is
+        # preserved, including table matching, disclosure, SQL checks, and
+        # authorization.
+        if (
+            special_skill
+            and special_skill.card
+            and validation.allowed
+            and (special_skill.kind != "query" or not state.get("user_query", "").strip())
+        ):
+            validation = validation.model_copy(update={"route": "direct_response", "status": "skill_card_ready"})
         selected_capability_detail = validation.disclosure.get("capability_detail") if validation.disclosure else None
         selected_skill_detail = validation.disclosure.get("skill_detail") if validation.disclosure else None
+        if special_skill and special_skill.kind != "query":
+            selected_skill_detail = special_skill.detail_spec()
         schema_search_terms = list((validation.proposal.schema_search_terms if validation.proposal else []) or [])
         return {
             **state,
@@ -770,9 +995,12 @@ class FinanceAgentRuntime:
     def render_direct_response(self, state: AgentState) -> AgentState:
         plan = ResponsePlan.model_validate(state["response_plan"])
         candidate_selection = state.get("query_candidate_selection") or {}
+        skill_detail = state.get("selected_skill_detail") or {}
+        skill_card = skill_detail.get("card") if state.get("status") == "skill_card_ready" else None
         return {
             **state,
             "answer": candidate_selection.get("message") or plan.message,
+            "skill_card": skill_card,
             "status": state.get("action_validation", {}).get("status", plan.status_hint),
         }
 
@@ -806,18 +1034,30 @@ class FinanceAgentRuntime:
             version="dynamic",
             description="Auto-generated from table_registry",
             tables=tables,
-            business_terms=self.catalog.business_terms if hasattr(self, 'catalog') else {},
+            business_terms=self.business_term_registry.to_catalog_dict(),
         )
 
     def search_schema(self, state: AgentState) -> AgentState:
-        """后端检索真实目录，只把少量表名和说明交给模型选择。"""
+        """先按业务词典匹配表，再用通用元数据检索作为兜底。"""
         full_catalog = self._full_catalog()
         goal = state.get("action_user_goal") or state["user_query"]
         terms = [term for term in state.get("schema_search_terms", []) if isinstance(term, str)]
         # goal 已在第一阶段脱值；search terms 也已在 response validator 中剔除真实参数值。
         search_query = " ".join([goal, *terms])
         max_candidates = 8 if state.get("repair_attempts", 0) == 0 else 16
-        matched = prune_catalog(search_query, full_catalog, self.policy, max_tables=max_candidates)
+        mapped_tables = self.business_knowledge.match_tables(search_query)
+        if mapped_tables:
+            mapped_names = {table.table for table in mapped_tables}
+            matched = Catalog(
+                version=full_catalog.version,
+                description=full_catalog.description,
+                tables=[
+                    table for table in full_catalog.tables if table.name in mapped_names
+                ][:max_candidates],
+                business_terms=full_catalog.business_terms,
+            )
+        else:
+            matched = prune_catalog(search_query, full_catalog, self.policy, max_tables=max_candidates)
         candidates = [
             {"name": table.name, "description": table.description}
             for table in matched.tables
@@ -878,10 +1118,57 @@ class FinanceAgentRuntime:
         else:
             # 兼容直接调用 load_metadata 的旧接口和历史 checkpoint。
             visible = prune_catalog(state.get("action_user_goal") or state["user_query"], full_catalog, self.policy)
+        disclosed_tables = list(state.get("selected_schema_tables") or [table.name for table in visible.tables])
+        metadata_disclosure = self._metadata_disclosure(
+            candidates=list(state.get("schema_candidates") or []),
+            visible=visible,
+            selected_tables=disclosed_tables,
+        )
         return {
             **state,
             "visible_catalog": visible.model_dump(),
+            "metadata_disclosure": metadata_disclosure,
             "status": "metadata_loaded",
+        }
+
+    @staticmethod
+    def _metadata_disclosure(
+        *,
+        candidates: list[dict[str, Any]],
+        visible: Catalog,
+        selected_tables: list[str],
+    ) -> dict[str, Any]:
+        """Expose table summaries first and selected table fields second.
+
+        The visible catalog is already sanitized, so this payload contains
+        metadata only and cannot expose query rows or private filter values.
+        """
+        selected = set(selected_tables)
+        details = []
+        for table in visible.tables:
+            if table.name not in selected:
+                continue
+            details.append(
+                {
+                    "name": table.name,
+                    "description": table.description,
+                    "fields": [
+                        {
+                            "name": column.name,
+                            "qualified_name": f"{table.name}.{column.name}",
+                            "type": column.type,
+                            "description": column.semantic,
+                        }
+                        for column in table.columns
+                    ],
+                    "relationships": [relationship.model_dump(by_alias=True) for relationship in table.relationships],
+                }
+            )
+        return {
+            "mode": "table_then_fields",
+            "candidate_tables": candidates,
+            "selected_tables": [table for table in selected_tables if table in selected],
+            "selected_table_details": details,
         }
 
     def _sanitize_catalog(self, catalog: Catalog) -> Catalog:
@@ -916,6 +1203,7 @@ class FinanceAgentRuntime:
             # 就被完整 schema 索引干扰。
             "selected_capability_detail": state.get("selected_capability_detail"),
             "selected_skill_detail": state.get("selected_skill_detail"),
+            "skill_card": state.get("skill_card"),
         }
         if base_query_reference:
             # 只传参数化 SQL、脱敏目标和结构信息，不传 result_ref、参数值或结果行。
@@ -1019,23 +1307,24 @@ class FinanceAgentRuntime:
             return None, {}
         if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate < 1:
             return None, {}
-        entries = self.public_memory_store.latest(limit=5, session_id=state.get("session_id"))
+        entries = self.memory_store.query_history(state.get("session_id") or "", limit=5)
         if candidate > len(entries):
             return None, {}
         entry = entries[candidate - 1]
         records = self.private_result_store.latest(limit=50, session_id=state.get("session_id"))
-        record = next((item for item in records if item.result_ref == entry.result_ref), None)
+        result_ref = str(entry.metadata.get("result_ref") or "")
+        record = next((item for item in records if item.result_ref == result_ref), None)
         private_params: dict[str, Any] = {}
         if record:
             source_params = record.metadata.get("source_params")
             if isinstance(source_params, dict):
                 private_params = dict(source_params)
         return {
-            "goal": entry.goal or "",
-            "sql_template": entry.sql_template or "",
-            "fields": entry.fields,
-            "result_shape": entry.result_shape,
-            "row_count": entry.row_count,
+            "goal": entry.metadata.get("goal") or "",
+            "sql_template": entry.metadata.get("sql_template") or "",
+            "fields": entry.metadata.get("fields") or [],
+            "result_shape": entry.metadata.get("result_shape") or {},
+            "row_count": entry.metadata.get("row_count") or 0,
             "status": "executed",
         }, private_params
 
@@ -1072,86 +1361,6 @@ class FinanceAgentRuntime:
 
     @staticmethod
     def _apply_skill_constraints(plan: AnalysisPlan, state: AgentState) -> AnalysisPlan:
-        skill_id = (state.get("selected_skill_detail") or {}).get("skill_id")
-        if not skill_id:
-            return plan
-        if skill_id == "transaction_quality_review":
-            existing = list(plan.steps)
-            status_index = next(
-                (index for index, step in enumerate(existing) if step.operation == "status_distribution"),
-                None,
-            )
-            status_step = existing[status_index] if status_index is not None else None
-            if status_step is None:
-                base_step = existing[0] if existing else None
-                if base_step is None:
-                    return plan
-                status_step = base_step.model_copy(
-                    update={
-                        "operation": "status_distribution",
-                        "metric": None,
-                        "dimension": "status",
-                        "group_by": None,
-                        "time_field": None,
-                        "grain": None,
-                        "rationale": "交易质量分析先查看状态分布，用于判断完成、失败、处理中和冲正等占比。",
-                    }
-                )
-            else:
-                status_step = status_step.model_copy(
-                    update={
-                        "metric": None,
-                        "dimension": status_step.dimension or status_step.group_by or "status",
-                        "group_by": None,
-                        "rationale": status_step.rationale or "交易质量分析先查看状态分布。",
-                    }
-                )
-            excluded_index = status_index if status_index is not None else 0
-            rest = [step for index, step in enumerate(existing) if index != excluded_index and step.operation != "status_distribution"]
-            required = sorted(
-                {
-                    *plan.required_metadata,
-                    "card_transaction.status",
-                    "card_transaction.card_channel",
-                    "card_transaction.total_amount",
-                    "card_transaction.transaction_at",
-                }
-            )
-            has_trend = any(step.operation == "trend" for step in rest)
-            has_channel = any(
-                (step.group_by == "card_channel" or step.dimension == "card_channel")
-                for step in rest
-            )
-            if not has_trend:
-                rest.append(
-                    status_step.model_copy(
-                        update={
-                            "operation": "trend",
-                            "metric": "total_amount",
-                            "dimension": None,
-                            "group_by": None,
-                            "time_field": "transaction_at",
-                            "grain": "month",
-                            "rationale": "交易质量分析需要观察金额随时间变化，识别异常波动。",
-                        }
-                    )
-                )
-            if not has_channel:
-                rest.append(
-                    status_step.model_copy(
-                        update={
-                            "operation": "group_by",
-                            "metric": "total_amount",
-                            "dimension": None,
-                            "group_by": "card_channel",
-                            "time_field": None,
-                            "grain": None,
-                            "limit": 10,
-                            "rationale": "交易质量分析需要按卡渠道拆分，观察不同渠道的交易结构。",
-                        }
-                    )
-                )
-            return plan.model_copy(update={"steps": [status_step, *rest], "required_metadata": required})
         return plan
 
     def generate_method(self, state: AgentState) -> AgentState:
@@ -1329,7 +1538,7 @@ class FinanceAgentRuntime:
     @staticmethod
     def _can_schema_repair(state: AgentState) -> bool:
         # 包含首轮在内最多三次 Schema → SQL → 校验循环。
-        return state.get("repair_attempts", 0) < MAX_METHOD_REPAIR_ATTEMPTS - 1
+        return state.get("repair_attempts", 0) < MAX_METHOD_REPAIR_ATTEMPTS
 
     def _should_research_schema(self, state: AgentState) -> bool:
         """仅把可由 Schema/SQL 重规划解决的问题送回循环。
@@ -1356,7 +1565,7 @@ class FinanceAgentRuntime:
         history = list(state.get("repair_history", []))
         history.append(
             {
-                "attempt": attempts + 1,
+                "attempt": attempts,
                 "from_status": state.get("status"),
                 "errors": errors[-5:] or ["unknown validation failure"],
                 "repair_mode": "schema_research",
@@ -1806,8 +2015,8 @@ class FinanceAgentRuntime:
                 "real_database_used": False,
             },
         )
-        public_memory = self.public_memory_store.append(
-            build_public_memory_entry(
+        public_memory = self.memory_store.upsert(
+            build_query_history_memory(
                 request_id=state["request_id"],
                 session_id=state["session_id"],
                 method=method,
@@ -1829,12 +2038,12 @@ class FinanceAgentRuntime:
                 **state,
                 "status": "executed_simulated_real",
                 "result_ref": private_record.result_ref,
-                "public_memory_entry": public_memory.model_dump(mode="json"),
+                "public_memory_entry": PublicMemoryEntry.from_record(public_memory).model_dump(mode="json"),
                 "execution_result_card": card.model_dump(mode="json"),
                 "execution_result_cards": [card.model_dump(mode="json")],
                 "result_narration": narration.model_dump(mode="json"),
                 "result_narrations": [narration.model_dump(mode="json")],
-                "public_memory_entries": [public_memory.model_dump(mode="json")],
+                "public_memory_entries": [PublicMemoryEntry.from_record(public_memory).model_dump(mode="json")],
                 "row_count": card.row_count,
                 "answer": answer,
             }

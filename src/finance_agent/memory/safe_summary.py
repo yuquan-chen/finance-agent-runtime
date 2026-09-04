@@ -4,6 +4,8 @@ import re
 from typing import Any
 
 from finance_agent.harness.analysis_schema import ExecutionResultCard, MethodDraft
+from finance_agent.memory.contracts import MemoryKind, make_namespace
+from finance_agent.memory.memory_store import MemoryRecord
 from finance_agent.memory.private_result_store import PrivateResultRecord
 from finance_agent.memory.public_memory import PublicMemoryEntry
 
@@ -36,8 +38,40 @@ def build_public_memory_entry(
         values_visible_to_llm=False,
         sql_template=method.sql_template,
         goal=_redact_goal(method.goal, method.params),
-        user_query=user_query,
+        user_query=_redact_goal(user_query or "", method.params),
         result_summary=result_summary,
+    )
+
+
+def build_query_history_memory(
+    *,
+    request_id: str,
+    session_id: str,
+    method: MethodDraft,
+    execution_card: ExecutionResultCard,
+    private_record: PrivateResultRecord,
+    user_query: str | None = None,
+    plan_result_ref: str | None = None,
+) -> MemoryRecord:
+    """Build the canonical safe query-history record for the unified store."""
+    entry = build_public_memory_entry(
+        request_id=request_id,
+        session_id=session_id,
+        method=method,
+        execution_card=execution_card,
+        private_record=private_record,
+        user_query=user_query,
+        plan_result_ref=plan_result_ref,
+    )
+    content, metadata = entry.to_memory_parts()
+    return MemoryRecord(
+        id=entry.memory_id,
+        namespace=make_namespace("session", session_id),
+        kind=MemoryKind.QUERY_HISTORY,
+        content=content,
+        metadata=metadata,
+        created_at=entry.created_at,
+        updated_at=entry.created_at,
     )
 
 

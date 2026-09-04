@@ -1,280 +1,195 @@
 # Finance Agent Runtime
 
-一个面向财务/数据分析场景的本地 Agent Runtime。
+Finance Agent Runtime 是一个以自然语言驱动的财务查询与业务流程编排运行时。
 
-核心设计：**LLM 只提方案，系统才执行。**
+当前仓库的可验证能力集中在两条线上：
 
-用户和 LLM 对话；当问题需要查数、计算、分析时，LLM 输出一个 `MethodProposal`，系统校验、生成方法、请求用户授权，最后在沙箱里执行。LLM 永远不碰真实数据。
+- 受控的财务数据查询：模型提出查询计划和方法，系统校验后再执行只读 SQL。
+- KYC 辅助工作流：收集字段、管理材料、执行本地 OCR、保存和检查会话级草稿。
 
----
+业务 API、支付网关和 Admin 页面能力目前还没有接入。后续接入必须通过独立的领域 API 适配层，不应把写操作混入 SQL 查询执行器。
+
+## 当前边界
+
+项目遵循以下责任划分：
+
+```text
+LLM
+  理解意图，提出结构化计划或方法
+
+Runtime
+  校验计划、权限、字段、SQL 和流程状态
+
+Executor / Workflow Handler
+  在受控边界内执行只读查询或本地工作流
+
+Renderer / Audit
+  展示计算结果，保存安全摘要和审计事件
+```
+
+查询链路中的真实数据不会进入普通 LLM 上下文。查询结果、授权证据和参数保存在私有结果区；模型可见记忆只保存经过裁剪的查询历史和安全语义信息。
+
+当前不支持：
+
+- 直接调用 WavePaid、DogPay 或其他业务 API；
+- 付款、开户、审核、配置、导入等外部写操作；
+- 生产级 RBAC、组织权限和业务数据租户隔离；
+- 将 Firecracker 作为 macOS 本地执行环境；
+- 把自然语言当作真实业务状态或支付成功结论。
 
 ## 技术栈
 
-| 组件 | 技术 |
-|------|------|
-| API / UI | FastAPI + 单页 HTML + SSE 流式输出 |
-| 状态编排 | LangGraph（15 个节点，2 条主路径） |
-| LLM | DeepSeek API / LM Studio（OpenAI-compatible） |
-| 数据库 | PostgreSQL（只读账号） |
-| 结构化输出 | Pydantic |
-| 配置 | Python `TableRegistry`（schema）+ YAML（业务词典 / operations / skills / policy） |
-| 记忆 | 文件型 Markdown（用户意图 + 结果摘要） |
-| 审计 | JSONL 日志 |
+| 层 | 当前实现 |
+| --- | --- |
+| HTTP / UI | FastAPI + 单页 HTML + SSE 阶段事件 |
+| 状态编排 | LangGraph，每次请求使用独立 run checkpoint |
+| 模型 | `LlmProvider`，兼容 LM Studio / OpenAI-compatible API |
+| 查询计划 | Pydantic schema、业务词典、Operation Registry、Schema 选择器 |
+| 查询执行 | `mock` 默认模式；`direct_db` 只读 PostgreSQL/SQLAlchemy 模式 |
+| 方法校验 | SQL 只读校验、参数校验、字段校验、合成数据检查、修复循环 |
+| 会话 | `SessionManager` 文件存储；Side Skill 使用 SQLite |
+| 运行控制面 | `RunStore` SQLite WAL，保存安全快照、动作幂等回执和生命周期事件 |
+| 记忆 | `MemoryStore` JSONL；私有结果单独保存 |
+| 审计 | JSONL append-only 日志 |
 
----
+## 快速开始
 
-## 安全红线
-
-1. **LLM 不看真实数据** — 只能看到元数据（表名、字段名、描述）和结果的结构信息（列名、行数）
-2. **LLM 只提方案** — 输出 `MethodProposal`，不等于授权，不等于执行
-3. **系统校验一切** — SQL 只读检查、字段可见性、安全规则
-4. **数据读取必须授权** — 用户确认后，沙箱才执行
-5. **数字必须算出来** — 结果来自沙箱，不是 LLM 猜的
-6. **禁止编造结果** — 如果查询为空，必须如实告知
-
----
-
-## Context Engineering
-
-参考 Codex / Claude Code 的分层注入模式，context 分三层：
-
-```
-Layer 1: INSTRUCTIONS（稳定，可缓存）
-  角色定义、输出格式、安全规则
-
-Layer 2: CONTEXT（动态，纯数据）
-  - 能力/技能索引（name + description）
-  - 通用操作索引（name + title + description）
-  - 业务词典（name + aliases）
-  - 之前的查询记录（用户意图 + 结果摘要）
-
-Layer 3: USER_QUERY（每轮不同）
-  纯用户消息
-```
-
----
-
-## 核心流程
-
-```
-用户消息
-  ↓
-LLM 理解业务意图 → ResponsePlan
-  ├─ 闲聊 → 直接回复
-  └─ 需要查数 → MethodProposal（能力 + 脱敏 Schema 检索词）
-       ↓
-  后端在完整注册表中搜索少量候选表（不把 173 张表发给 LLM）
-       ↓
-  LLM 仅从候选表摘要中选择需要展开的表
-       ↓
-  系统展开所选表的真实字段、关系，并剔除敏感字段
-       ↓
-  LLM 生成 SQL / MethodDraft
-       ↓
-  系统校验：表、字段、关系、参数、只读策略、语义和沙箱
-       ├─ 不通过 → 带结构化错误重新检索 Schema 并规划（包含首轮最多 3 次）
-       └─ 通过
-       ↓
-  展示给用户确认（SQL + 实际读取范围）
-       ↓
-  用户确认 → 沙箱执行
-       ↓
-  私有结果解读 → 生成自然语言回复
-       ↓
-  保存脱敏意图与结果摘要；真实结果不进入普通 LLM 对话上下文
-```
-
----
-
-## 记忆系统
-
-### 对话历史持久化
-
-使用 LangGraph 内置的 checkpoint 功能，自动保存对话状态：
-- **MemorySaver**：内存存储（开发环境）
-- **Thread**：按 thread_id 组织对话，支持多用户并发
-- **自动持久化**：每个节点执行后自动保存状态
-- **LLM 总结**：用 LLM 提取关键信息，注入摘要而不是全量（参考 Claude Code）
-
-技术实现：
-```python
-from langgraph.checkpoint.memory import MemorySaver
-
-checkpointer = MemorySaver()
-graph = builder.compile(checkpointer=checkpointer)
-
-config = {"configurable": {"thread_id": "user-123"}}
-result = graph.invoke(input_data, config=config)
-```
-
-### 查询记录存储
-
-每次查询后保存：
-- 用户意图（不是 SQL）
-- 涉及的表和字段
-- 结果摘要（行数、列名）
-
-保存到 `data/public_memory/` 目录，每条记忆一个 `.md` 文件。
-
-### 上下文注入
-
-下次对话时，系统自动注入：
-- 最近 10 轮对话历史
-- 最近 3 条查询记录
-- 帮助 LLM 理解"排序一下"、"筛选一下"等操作性指令
-
----
-
-## 技术细节
-
-### SQL 参数绑定
-
-```python
-# LLM 生成带参数的 SQL
-SELECT * FROM account WHERE legal_name = :customer_name
-
-# 参数值单独传递
-params = {"customer_name": "Company 5"}
-
-# 系统自动转换为 psycopg2 格式
-SELECT * FROM account WHERE legal_name ILIKE %(customer_name)s
-
-# 模糊匹配：Company5 → %Company%5%（可匹配 "Company 5"）
-```
-
-### 不区分大小写
-
-所有字符串比较自动使用 `ILIKE`，支持中英文混合查询。
-
-### 自动修复
-
-SQL 执行失败时，系统会自动分析错误并重试（最多 3 次）。
-
----
-
-## 本地运行
+环境要求：Python 3.11+。默认查询模式使用本地 mock 数据，不要求 PostgreSQL。
 
 ```bash
-# 1. 准备环境
-cd /Users/joybot/Desktop/finance-agent-runtime
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[dev]"
 cp .env.example .env
-./scripts/setup.sh
-
-# 2. 配置 LLM（编辑 .env）
-# DeepSeek API（推荐）
-LMSTUDIO_BASE_URL=https://api.deepseek.com
-LMSTUDIO_MODEL=deepseek-chat
-LMSTUDIO_API_KEY=sk-your-api-key
-
-# 或本地 LM Studio
-LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
-LMSTUDIO_MODEL=qwen2.5-coder-7b-instruct-mlx
-
-# 3. 启动 PostgreSQL（如果使用真实数据库）
-# PG_HOST=localhost
-# PG_PORT=5432
-# PG_DATABASE=finance_sandbox
-# PG_USER=readonly_user
-# PG_PASSWORD=xxx
-
-# 4. 启动服务
-./scripts/start.sh
-# 打开 http://127.0.0.1:8810/
+.venv/bin/python -m uvicorn finance_agent.api.app:app --host 127.0.0.1 --port 8810 --reload
 ```
 
----
+打开 <http://127.0.0.1:8810/>。
 
-## 测试查询
+也可以使用：
 
-| 类型 | 示例 |
-|------|------|
-| 简单查询 | 查一下 Company 5 的 KYC 状态 |
-| 多表关联 | 查询 Person 3 的卡交易记录 |
-| 统计分析 | 统计每个交易状态有多少笔 |
-| 连续查询 | （基于上一个结果）按渠道拆分一下 |
+```bash
+./scripts/setup.sh
+./scripts/start.sh
+./scripts/health.sh
+```
 
----
+`.env` 中至少需要配置一个可用的 LM Studio 或 OpenAI-compatible 模型服务。默认值为本机 LM Studio：
+
+```dotenv
+LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
+LMSTUDIO_MODEL=qwen2.5-coder-7b-instruct-mlx
+LMSTUDIO_API_KEY=lm-studio
+EXECUTOR_MODE=mock
+```
+
+切换到只读数据库执行时，需要同时设置 `EXECUTOR_MODE=direct_db` 和 `DATABASE_URL`。PostgreSQL 连接信息不能交给 LLM，也不能通过用户输入动态指定。
+
+Docker 启动：
+
+```bash
+docker compose up --build
+```
+
+容器只通过 `./data:/app/data` 持久化运行数据。若模型或数据库运行在宿主机上，Docker Desktop 中应使用 `host.docker.internal`，而不是容器内的 `127.0.0.1`。
+
+## 当前运行流程
+
+```text
+用户问题
+  -> ResponsePlan
+  -> Action Validation
+  -> 直接回复 / 澄清 / 受控拒绝
+  -> Schema 候选检索与选择
+  -> 字段和关系披露
+  -> Analysis Plan
+  -> Method Draft
+  -> Harness Review + Synthetic Check
+  -> Method Review
+  -> Data Authorization
+  -> 受控执行
+  -> Private Result Store
+  -> 结果渲染和安全记忆
+```
+
+每个请求使用 `run_<request_id>` 作为 LangGraph checkpoint thread。跨请求恢复依赖 `SessionManager` 和 `RunStore`，不是依赖 `MemorySaver` 的跨进程持久化。
+
+## HTTP API
+
+当前 HTTP API 是 Runtime API，不是业务 API：
+
+- `GET /health`：健康检查。
+- `GET /v1/skills`：读取已注册 Skill manifest。
+- `POST/GET /v1/sessions`：创建和读取会话。
+- `POST /v1/runs`：执行一次非流式 Agent run。
+- `GET /v1/runs/stream`：通过 SSE 获取阶段事件。
+- `GET /v1/runs/{request_id}`：读取安全的 run 状态。
+- `/v1/runs/{request_id}/...`：分析计划、方法和数据授权动作。
+- `/v1/sessions/.../attachments`：会话材料和 KYC 辅助流程。
+
+完整的当前接口清单见 [docs/api.md](docs/api.md)。
+
+## 配置与数据
+
+| 路径 | 作用 | 是否进入普通 LLM 上下文 |
+| --- | --- | --- |
+| `config/catalog.yaml` | 业务词典和兼容性 catalog | 经过裁剪后可见 |
+| `config/operations.yaml` | 分析操作注册表 | 可见操作摘要 |
+| `config/skills.yaml` | Skill 和卡片定义 | 可见 Skill manifest |
+| `config/policy.yaml` | 行数、超时、敏感字段和 SQL 策略 | 作为系统策略使用 |
+| `schema_catalog/tables/` | 版本化表结构快照 | 只披露选中表的安全字段 |
+| `data/sessions/` | 会话、时间线和 Skill 状态 | 按策略裁剪 |
+| `data/private_results.jsonl` | 真实结果、参数和授权证据 | 不可见 |
+| `data/public_memory.jsonl` | 查询历史和安全语义记忆 | 仅安全投影可见 |
+| `data/runs.sqlite3` | run 控制面和幂等动作 | 不可见 |
+| `data/audit.jsonl` | 审计事件 | 不可见 |
+
+不要将 `data/`、`.env`、真实数据库数据或真实客户材料提交到 Git。
+
+## 测试与质量门槛
+
+运行全部测试：
+
+```bash
+.venv/bin/pytest -q
+```
+
+测试覆盖当前查询和 KYC 边界，包括：
+
+- ResponsePlan、Schema 选择、SQL 构建和参数绑定；
+- 方法校验、合成执行、结果渲染和连续追问；
+- session、run、side Skill、KYC 材料和私有结果隔离；
+- 身份边界、动作幂等和重复确认；
+- 沙箱 provider 和只读执行器。
+
+接入任何外部业务 API 前，还需要新增 contract test、权限测试、超时/重试测试、错误映射测试和状态恢复测试。
 
 ## 代码结构
 
-```
+```text
 src/finance_agent/
-  api/app.py                   FastAPI + 单页 UI
-  graph/
-    runtime.py                 LangGraph 状态机（核心）
-    state.py                   图状态定义
-  chat/
-    response_plan.py           ResponsePlan + 分层 Prompt
-  llm/provider.py              LLM Provider
-  operations/
-    registry.py                能力注册表
-    handler_registry.py        操作 Handler 注册表
-    handlers/                  内置操作（top_n, distribution, trend...）
-  skills/registry.py           技能注册表
-  metadata/
-    catalog.py                 Catalog 数据模型与兼容性 YAML 读取
-    table_registry.py          运行时表结构注册表
-    schema_selector.py         受控候选表选择器
-    tables/                    上游项目 schema 提取的 173 张表元数据
-    business_registry.py       业务词典
-  methods/generator.py         Method Draft 生成
-  sandbox/
-    runners/sql.py             SQL 执行器（PostgreSQL）
-    mock_data.py               Mock 数据
-  memory/
-    memory_store.py            文件型 Memory 存储
-    selector.py                相关记忆选择
-  renderer/
-    reply_generator.py         LLM 回复生成（注入结果数据）
-    method_review_renderer.py  方法审查渲染
-  audit/audit_logger.py        审计日志
+  api/                 FastAPI 装配、路由和响应模型
+  chat/                ResponsePlan 和工具决策
+  graph/               LangGraph 状态机
+  metadata/            Schema、业务词典、策略和候选选择
+  methods/             Method Draft 生成
+  harness/             方法和计划的确定性校验
+  executor/            mock 与只读数据库执行器
+  sandbox/             SQL/Code sandbox provider
+  renderer/            方法卡、结果和回复渲染
+  memory/              安全记忆和私有结果
+  session/             会话、run 和 side thread 存储
+  kyc/                 本地 KYC 草稿、OCR 和材料意图
+  skills/              Skill 注册表和侧边 Agent
+  audit/               审计日志
 ```
 
----
+## 文档入口
 
-## 配置文件
+- [docs/README.md](docs/README.md)：文档分类和现行基线。
+- [docs/current-architecture.md](docs/current-architecture.md)：以当前代码为准的架构说明。
+- [docs/development.md](docs/development.md)：开发、配置和故障排查。
+- [docs/api.md](docs/api.md)：当前 Runtime API。
+- [docs/admin-api-integration.md](docs/admin-api-integration.md)：未来业务 API 接入边界和契约模板。
+- [schema_catalog/README.md](schema_catalog/README.md)：Schema 快照同步规则。
 
-| 文件 | 用途 |
-|------|------|
-| `config/catalog.yaml` | 业务词典与兼容性/测试 catalog；不是运行时完整 schema 的事实源 |
-| `config/operations.yaml` | 通用操作定义 |
-| `config/skills.yaml` | 技能定义 |
-| `config/policy.yaml` | 安全策略 |
-| `.env` | 环境变量（LLM、数据库连接） |
-
-### Schema 元数据来源
-
-运行时的完整 schema 来自 `schema_catalog/tables/` 中的 Python 表元数据：这些文件由上游业务项目的数据库 schema / ORM 定义提取并版本化，目前覆盖约 173 张表。表级业务 description 单独存放在 `schema_catalog/table_descriptions.yaml`，由人工或本地 LLM 维护，避免 ORM 同步覆盖业务语义。`TableRegistry` 自动合并两层元数据，构建只供后端检索的全局 Catalog。
-
-因此，173 张表是系统拥有的元数据全集，而不是每次都应发送给 LLM 的上下文。查询路径分为三层：首轮只识别业务能力与检索词；后端返回少量候选表名和说明；模型从候选中选择后，系统才展开这些表的真实字段、关系和经过权限过滤的 `VisibleCatalog` 给 SQL 规划器。模型不能直接看到全量目录，也不能引用未展开的表或字段。`config/catalog.yaml` 保留业务词典及早期测试/兼容内容，不与 Python 表定义共同充当 schema 事实源。
-
-上游 ORM 更新后，先重新生成快照，再校验二者字段完全一致：
-
-```bash
-.venv/bin/python scripts/extract_schema.py \
-  --from-entity /path/to/wavepool-core/src/repository \
-  --output schema_catalog/tables
-.venv/bin/python scripts/verify_schema_sync.py \
-  --from-entity /path/to/wavepool-core/src/repository
-```
-
-提取器会递归保留 TypeORM 继承链，以及 `CreateDateColumn`、`UpdateDateColumn`、`DeleteDateColumn`、`VersionColumn` 等专用字段。校验失败时不得发布新的 schema 快照。
-
-缺失的表级业务说明可用本地 LLM 补齐；该脚本只更新覆盖层，不会修改 schema 文件：
-
-```bash
-.venv/bin/python scripts/generate_table_descriptions.py
-```
-
----
-
-## 下一阶段
-
-已完成：受控 Schema 检索闭环。模型不再在首轮接收全量表目录，而是经过“候选表搜索 → 选择表 → 展开字段 → SQL 校验”的受控路径生成 SQL。
-
-1. **真实数据库与沙箱可用性** — 配置 PostgreSQL 只读账号，并在部署环境保证预检沙箱可连接；连接失败属于环境问题，不应触发 LLM 重试。
-2. **Schema 语义增强** — 持续同步并校验 173+ 表的快照，并补全关系、时间字段含义、业务别名和统计口径。
-3. **查询正确性评估** — 建立覆盖客户、付款、交易、KYC、时间范围和连续追问的真实 Schema 回归集，持续检查 SQL 是否选对表、字段和关联关系。
-4. **复杂查询** — 在评估覆盖后支持子查询、CTE、窗口函数和更复杂的多步骤分析。
-5. **权限控制** — 基于用户角色、组织和字段级权限生成候选目录与 `VisibleCatalog`。
-6. **图表生成** — 自动可视化已授权查询结果。
+`docs/` 中未列为当前基线的文件均属于历史设计、实验记录或待实现方案，不能单独覆盖当前代码行为。

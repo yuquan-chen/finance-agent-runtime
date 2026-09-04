@@ -1,0 +1,21 @@
+services:
+  finance-agent:
+    build: .
+    ports:
+      - "${APP_PORT:-8810}:8810"
+    env_file:
+      - .env
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8810
+      CATALOG_PATH: /app/config/catalog.yaml
+      POLICY_PATH: /app/config/policy.yaml
+      OPERATIONS_PATH: /app/config/operations.yaml
+      SKILLS_PATH: /app/config/skills.yaml
+      AUDIT_LOG_PATH: /app/data/audit.jsonl
+      PRIVATE_RESULT_STORE_PATH: /app/data/private_results.jsonl
+      PUBLIC_MEMORY_PATH: /app/data/public_memory.jsonl
+      RUN_STORE_PATH: /app/data/runs.sqlite3
+      KYC_DRAFT_PATH: /app/data/kyc_drafts
+    volumes:
+      - ./data:/app/data

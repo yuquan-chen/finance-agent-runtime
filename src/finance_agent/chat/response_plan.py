@@ -8,10 +8,12 @@ from pydantic import BaseModel, Field
 
 from finance_agent.config import Settings
 from finance_agent.llm.provider import LlmProvider
+from finance_agent.llm.provider import LlmToolCall
 from finance_agent.metadata.business_registry import BusinessTermRegistry
 from finance_agent.operations.handler_registry import OperationHandlerRegistry
 from finance_agent.operations.registry import OperationRegistry
 from finance_agent.skills.registry import SkillRegistry
+from finance_agent.chat.tool_registry import build_skill_tools
 
 
 # ---------------------------------------------------------------------------
@@ -37,9 +39,20 @@ class MethodProposal(BaseModel):
     code: str | None = None                 # LLM 自写的 Python 代码
 
 
+class RouteIntent(BaseModel):
+    """LLM 对用户当前意图的结构化判断。"""
+
+    intent: Literal["query", "intake", "checklist", "draft_review", "clarification", "general"] = "general"
+    skill_id: str | None = None
+    confidence: float = 0.0
+    needs_clarification: bool = False
+    reason: str = ""
+
+
 class ResponsePlan(BaseModel):
     """LLM 输出的响应计划。"""
     message: str = ""                       # 给用户看的文本
+    intent: RouteIntent | None = None       # 当前消息的 Skill 路由意图
     method_proposal: MethodProposal | None = None  # 有 = 需要计算
     confidence: float = 1.0
 
@@ -122,6 +135,13 @@ INSTRUCTIONS = """# 角色
 # 输出格式
 {
   "message": "给用户看的中文消息",
+  "intent": {
+    "intent": "query | intake | checklist | draft_review | clarification | general",
+    "skill_id": "来自 context.skills 的 id；无法确定时留空",
+    "confidence": 0.0,
+    "needs_clarification": false,
+    "reason": "简短说明"
+  },
   "method_proposal": {
     "entity_id": "匹配的能力/技能 id，无匹配留空",
     "entity_type": "capability 或 skill，无匹配留空",
@@ -139,6 +159,12 @@ INSTRUCTIONS = """# 角色
 
 # 路由规则（按优先级）
 
+## 0. 模型路由协议
+- 如果请求只是说明、能力咨询、帮助或闲聊，直接返回自然语言 message，不调用 Skill。
+- 如果请求需要业务能力，优先调用 context.skills 中唯一匹配的 Skill function；tool 参数只包含 goal 和用户明确提供的 params。
+- Skill function 只表示业务入口；身份校验、权限、Schema 校验、审计、审批、状态保存和执行均由系统 Runtime 完成，不作为模型工具。
+- 不要生成 SQL，也不要调用未出现在 context.skills 中的名称。
+
 ## 1. 安全拦截（最高优先级）
 以下请求直接拒绝，method_proposal 设为 null，message 说明原因：
 - 修改/删除/写入数据库
@@ -150,7 +176,17 @@ INSTRUCTIONS = """# 角色
 - 帮助：怎么用、帮助、help
 - 闲聊：天气、谢谢
 
-## 3. 数据分析类 → 提出 method_proposal
+## 3. Skill 意图判定
+- intent 必须从 query、intake、checklist、draft_review、clarification、general 中选择。
+- query：查询或分析已经存在的业务/客户/KYC 数据，通常选择 kind 为 query 的 Skill。
+- intake：填写新的 KYC/身份进件、上传材料、OCR、确认字段，选择对应的 workflow Skill。
+- checklist：只查看材料、步骤或要求，选择对应的 knowledge Skill。
+- draft_review：检查本地草稿完整性、缺失项或待确认项，选择对应的 workflow Skill。
+- 只要用户意图不明确，使用 clarification=true，intent=clarification，method_proposal 设为 null，message 必须提出一个简短澄清问题。
+- 上传文件本身不等于 query 或 intake；结合用户文字、当前对话和 Skill 状态判断。没有足够信息时必须澄清。
+- skill_id 必须是 context.skills 中已有的 name；不得自行创造 Skill id。
+
+## 4. 数据分析类 → 提出 method_proposal
 - 明确请求："统计交易状态"、"Top 10 客户"
 - 宽泛分析："业务好不好"、"业务健康度" → 匹配 skill
 - 涉及交易/金额/状态/渠道/客户的问题
@@ -158,7 +194,7 @@ INSTRUCTIONS = """# 角色
 # 匹配优先级
 skill > capability > operations > 新查询
 
-1. 先看 context.skills，description 匹配就填 entity_type="skill"
+1. 先看 context.skills，description、when_to_use 和 kind 匹配就填 entity_type="skill"
 2. 再看 context.capabilities，匹配就填 entity_type="capability"
 3. 再看 context.operations，匹配就 entity_id 留空，reason 说明操作名
 4. 都不匹配 → entity_id 留空，并把合并后的完整分析目标写入 goal。
@@ -320,9 +356,84 @@ def plan_response_with_llm_and_registry(
     # 添加当前用户消息
     llm_messages.append({"role": "user", "content": message})
 
+    tool_response = _try_model_tool_call(llm_provider, llm_messages, skill_registry)
+    if tool_response is not None:
+        if tool_response.tool_calls:
+            return _plan_from_tool_calls(tool_response.tool_calls, message, skill_registry)
+        if tool_response.content.strip():
+            return ResponsePlan(message=tool_response.content.strip(), method_proposal=None)
+
     payload, _ = llm_provider.chat_json(llm_messages, temperature=0)
     plan = _parse_payload(payload, message)
     return _normalize(plan, message)
+
+
+def _try_model_tool_call(
+    llm_provider: LlmProvider,
+    messages: list[dict[str, str]],
+    skill_registry: SkillRegistry | None,
+):
+    """Ask a tool-capable provider for a model-selected business capability.
+
+    Providers without ``chat_with_tools`` keep using the legacy structured JSON
+    planner.  This keeps the routing contract portable across local models.
+    """
+    chat_with_tools = getattr(llm_provider, "chat_with_tools", None)
+    tools = build_skill_tools(skill_registry)
+    if not callable(chat_with_tools) or not tools:
+        return None
+    try:
+        tool_messages = [
+            messages[0],
+            {
+                "role": "system",
+                "content": (
+                    "本轮使用 function calling 路由协议。不要输出规划 JSON。"
+                    "只有用户明确要求查询、统计、计算或分析已有业务数据时，"
+                    "才调用一个最匹配的已注册 Skill function。"
+                    "如果用户只是在询问系统能做什么、有哪些数据或如何使用，"
+                    "直接用普通中文回答，不调用任何 function。"
+                    "这类回答只能依据 context 中的已注册能力，保持简洁，不要虚构表名、字段名或未注册的业务类型。"
+                    "除非用户要求，否则不要堆叠示例。"
+                    "不要因为上下文里出现某个 Skill 就调用它；不要调用与用户目标无关的 Skill。"
+                ),
+            },
+            *messages[1:],
+        ]
+        return chat_with_tools(tool_messages, tools, temperature=0)
+    except Exception:
+        # A compatible endpoint may advertise no tool support.  The existing
+        # JSON contract is a deliberate compatibility fallback in that case.
+        return None
+
+
+def _plan_from_tool_calls(
+    tool_calls: tuple[LlmToolCall, ...],
+    message: str,
+    skill_registry: SkillRegistry | None,
+) -> ResponsePlan:
+    """Convert a validated model tool call into the existing query contract."""
+    call = tool_calls[0]
+    skill = skill_registry.resolve(call.name) if skill_registry else None
+    if skill is None:
+        return ResponsePlan(
+            message="我暂时无法匹配这个业务能力，请换一种方式描述你的需求。",
+            method_proposal=None,
+            confidence=0.0,
+        )
+    arguments = call.arguments if isinstance(call.arguments, dict) else {}
+    params = arguments.get("params")
+    return ResponsePlan(
+        message="",
+        method_proposal=MethodProposal(
+            entity_id=skill.name,
+            entity_type="skill",
+            goal=str(arguments.get("goal") or message.strip()),
+            params=params if isinstance(params, dict) else {},
+            reason=f"LLM selected registered skill: {skill.name}",
+        ),
+        confidence=1.0,
+    )
 
 
 def validate_response_plan(
@@ -343,22 +454,9 @@ def validate_response_plan(
 
     proposal = plan.method_proposal
 
-    # 无提案 → 直接回复（不走分析流程）
+    # 无提案 → 直接回复（不走分析流程）。是否需要分析由模型通过
+    # tool_call 或兼容的结构化提案表达，Runtime 不根据业务关键词猜测。
     if not proposal:
-        # 检测 LLM 漏掉了数据分析请求
-        if looks_like_safe_data_analysis_request(message):
-            proposal = _repair_to_proposal(message)
-            if proposal:
-                return _validate_proposal(proposal, message, operation_registry, skill_registry, warnings=["模型未提出分析请求，系统已自动修复"])
-
-        # 普通对话 → direct_response，不调用任何工具
-        return ResponseValidationResult(
-            allowed=True,
-            route="direct_response",
-            status="chat",
-            user_goal=message.strip(),
-        )
-
         return ResponseValidationResult(
             allowed=True,
             route="direct_response",
@@ -482,17 +580,6 @@ def _validate_proposal(
     )
 
 
-def _repair_to_proposal(message: str) -> MethodProposal | None:
-    """当 LLM 漏掉分析请求时，尝试修复。"""
-    if looks_like_safe_data_analysis_request(message):
-        return MethodProposal(
-            goal=message.strip(),
-            preferred_runtime="auto",
-            reason="系统修复：模型未提出分析请求",
-        )
-    return None
-
-
 def _safe_schema_search_terms(terms: list[str], params: dict[str, Any]) -> list[str]:
     """Schema 搜索词是业务元数据，不得把用户的真实筛选值带到后续模型调用。"""
     private_values = {
@@ -534,6 +621,17 @@ def _looks_like_skill(entity_id: str) -> bool:
 
 def _parse_payload(payload: dict[str, Any], message: str) -> ResponsePlan:
     """解析 LLM 输出，兼容新旧格式。"""
+    # 兼容模型将 intent 简写为字符串的情况；正常输出仍使用结构化对象。
+    if isinstance(payload.get("intent"), str):
+        payload = {
+            **payload,
+            "intent": {
+                "intent": payload["intent"],
+                "skill_id": payload.get("skill_id"),
+                "confidence": payload.get("confidence", 0.0),
+                "needs_clarification": payload.get("needs_clarification", False),
+            },
+        }
     # 新格式：有 message 和 method_proposal
     if "message" in payload:
         return ResponsePlan.model_validate(payload)
@@ -621,6 +719,18 @@ def _normalize(plan: ResponsePlan, message: str) -> ResponsePlan:
     """确保计划完整。"""
     if not plan.message:
         plan.message = message or ""
+    if plan.intent:
+        if plan.intent.intent == "clarification" or plan.intent.needs_clarification:
+            plan.method_proposal = None
+            plan.status_hint = "clarification"
+        elif plan.intent.skill_id and plan.method_proposal is None:
+            # 让模型只负责选择 Skill，后端仍会通过注册表校验并决定最终执行路径。
+            plan.method_proposal = MethodProposal(
+                entity_id=plan.intent.skill_id,
+                entity_type="skill",
+                goal=message.strip(),
+                reason=plan.intent.reason or "按结构化意图选择 Skill",
+            )
     return plan
 
 
@@ -635,31 +745,4 @@ def hard_safety_plan(message: str) -> ResponsePlan | None:
             refused=True,
             safety_flags=["unsafe_data_operation"],
         )
-    return None
-
-
-
-
-# ---------------------------------------------------------------------------
-# 工具函数
-# ---------------------------------------------------------------------------
-
-
-def looks_like_safe_data_analysis_request(message: str) -> bool:
-    text = message.strip().lower()
-    if not text:
-        return False
-    analysis_terms = ["统计", "查询", "计算", "分析", "对比", "排名", "top", "最多", "最少", "方差", "标准差", "趋势", "分布", "多少笔", "count", "sum", "avg"]
-    domain_terms = ["交易", "卡", "渠道", "消费", "金额", "客户", "状态", "transaction", "card", "amount", "status", "account"]
-    return any(term in text for term in analysis_terms) and any(term in text for term in domain_terms)
-
-
-def infer_skill_id_for_message(message: str) -> str | None:
-    text = message.strip().lower()
-    if any(term in message for term in ["交易质量", "失败交易", "异常状态", "成功率"]) or any(term in text for term in ["transaction quality", "failed transaction", "success rate"]):
-        return "transaction_quality_review"
-    if any(term in message for term in ["业务好不好", "业务健康", "分析业务", "业务表现"]):
-        return "business_health_analysis"
-    if any(term in message for term in ["卡渠道", "渠道表现", "渠道分析"]):
-        return "channel_performance_analysis"
     return None

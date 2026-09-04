@@ -8,7 +8,7 @@
         name="消费",
         description="消费类交易，包含购买、刷卡等。",
         aliases=["购买", "刷卡", "purchase"],
-        candidate_fields=["type"],
+        candidate_tables=["card_transaction"],
         filters=[{"field": "type", "op": "in", "value": ["consumption", "purchase"]}],
     )
     def _register():
@@ -19,11 +19,9 @@ from __future__ import annotations
 import importlib
 import pkgutil
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
-
 
 # ---------------------------------------------------------------------------
 # 业务术语模型
@@ -34,7 +32,7 @@ class BusinessTerm(BaseModel):
     name: str
     description: str = ""
     aliases: list[str] = Field(default_factory=list)
-    candidate_fields: list[str] = Field(default_factory=list)
+    candidate_tables: list[str] = Field(default_factory=list)
     filters: list[dict[str, Any]] = Field(default_factory=list)
     source: str = "decorator"  # "decorator" | "yaml"
 
@@ -51,7 +49,7 @@ def register_business_term(
     name: str,
     description: str = "",
     aliases: list[str] | None = None,
-    candidate_fields: list[str] | None = None,
+    candidate_tables: list[str] | None = None,
     filters: list[dict[str, Any]] | None = None,
 ) -> callable:
     """装饰器：注册一个业务术语。
@@ -61,7 +59,7 @@ def register_business_term(
             name="消费",
             description="消费类交易。",
             aliases=["购买", "purchase"],
-            candidate_fields=["type"],
+            candidate_tables=["card_transaction"],
             filters=[{"field": "type", "op": "in", "value": ["consumption"]}],
         )
         def _register():
@@ -72,7 +70,7 @@ def register_business_term(
             "name": name,
             "description": description,
             "aliases": aliases or [],
-            "candidate_fields": candidate_fields or [],
+            "candidate_tables": candidate_tables or [],
             "filters": filters or [],
         })
         return fn
@@ -125,8 +123,10 @@ class BusinessTermRegistry:
         result = {}
         for term in self._terms.values():
             entry: dict[str, Any] = {"description": term.description}
-            if term.candidate_fields:
-                entry["candidate_fields"] = term.candidate_fields
+            if term.aliases:
+                entry["aliases"] = term.aliases
+            if term.candidate_tables:
+                entry["candidate_tables"] = term.candidate_tables
             if term.filters:
                 entry["filters"] = term.filters
             result[term.name] = entry
@@ -163,7 +163,7 @@ def get_default_business_registry() -> BusinessTermRegistry:
             name=term_data["name"],
             description=term_data["description"],
             aliases=term_data["aliases"],
-            candidate_fields=term_data["candidate_fields"],
+            candidate_tables=term_data["candidate_tables"],
             filters=term_data["filters"],
             source="decorator",
         ))
@@ -184,7 +184,7 @@ def load_business_registry_from_catalog(catalog_business_terms: dict[str, Any]) 
                 name=name,
                 description=data.get("description", ""),
                 aliases=data.get("aliases", []),
-                candidate_fields=data.get("candidate_fields", []),
+                candidate_tables=data.get("candidate_tables", []),
                 filters=data.get("filters", []),
                 source="yaml",
             ))
@@ -197,7 +197,7 @@ def load_business_registry_from_catalog(catalog_business_terms: dict[str, Any]) 
                 name=term_data["name"],
                 description=term_data["description"],
                 aliases=term_data["aliases"],
-                candidate_fields=term_data["candidate_fields"],
+                candidate_tables=term_data["candidate_tables"],
                 filters=term_data["filters"],
                 source="decorator",
             ))

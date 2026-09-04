@@ -52,7 +52,9 @@ SYSTEM_PROMPT = """# 角色
 4. 多表用 JOIN，关系参考 visible_metadata 中的 relationships
 5. 业务术语参考 context.business_terms（如"消费"= type='consumption'）
 6. 参数只能使用 context.input_slots 中提供的 :input_N 占位符。绝不猜测、复述或写入任何真实筛选值；需要按值筛选时必须引用一个 input_slot。必须根据 slot 的 type 和 semantic 选择兼容字段：公司名称等 text slot 应匹配名称字段，不能匹配 UUID/金额/日期字段；UUID slot 才能匹配 UUID 字段。
-7. 文本字段的模糊、不区分大小写匹配必须显式写 ILIKE :input_N；其他字段保持正确的类型比较，不能把 UUID/数值字段写成 ILIKE。
+7. 文本字段的匹配必须根据用户意图选择：用户提供完整的主体名称或明确要求精确匹配时使用
+   ``= :input_N``；用户只提供名称片段，或明确要求包含/模糊匹配时才使用
+   ``ILIKE :input_N``。其他字段保持正确的类型比较，不能把 UUID/数值字段写成 ILIKE。
 
 # 步骤设计原则
 - 从宏观到微观：先看整体趋势，再拆维度

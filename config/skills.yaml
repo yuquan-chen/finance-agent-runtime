@@ -1,61 +1,540 @@
-version: "2026-07-28"
+version: "2026-08-27"
 skills:
-  - name: business_health_analysis
-    title: "业务健康度分析"
-    description: "面向宽泛的业务好不好、增长是否健康、交易表现如何等问题，组织一组安全的分析步骤。"
+  - name: finance_query
+    title: "财务查询"
+    description: "通过受控的业务表匹配、字段逐层披露、查询计划校验和用户确认，完成只读财务数据查询与分析。"
+    aliases: ["查找", "查询", "finance query", "query"]
+    entrypoint: "finance_query"
+    workflow:
+      - "business_language_to_candidate_tables"
+      - "select_tables"
+      - "disclose_selected_table_fields"
+      - "plan_and_validate_readonly_query"
+      - "confirm_and_execute"
     when_to_use:
-      - "用户提出宽泛业务分析请求，但没有指定单一指标。"
-      - "用户希望系统主动选择趋势、结构、质量、波动等分析角度。"
-    suggested_capabilities:
-      - trend
-      - status_distribution
-      - top_n
-      - variance
-    required_metadata_terms:
-      - "交易金额"
-      - "交易时间"
-      - "交易状态"
-      - "客户"
-      - "卡渠道"
-    clarification_policy: "缺少时间范围时可以先使用安全默认范围或在 Method Review 中列出假设；只有对象完全不清楚时才澄清。"
+      - "用户需要查询、统计、对比或分析财务业务数据。"
+      - "用户通过 @finance_query 显式调用查询能力。"
+    suggested_capabilities: []
+    required_metadata_terms: []
+    clarification_policy: "先匹配业务表，再根据已选表展开字段；信息不足时询问用户，不猜测表或字段。"
     risk_notes:
-      - "不能在用户授权前读取真实数据。"
-      - "不能由 LLM 直接给出业务好坏结论，结论必须基于执行结果。"
-
-  - name: transaction_quality_review
-    title: "交易质量分析"
-    description: "分析交易状态分布、失败/异常交易占比、时间趋势和可能的质量问题。"
+      - "LLM 只处理 metadata 和查询方案，用户确认后才允许执行。"
+      - "只允许只读查询，真实数据不会进入普通对话上下文。"
+    card:
+      type: "query"
+      state_key: "finance_query"
+      title: "财务查询"
+      subtitle: "填写查询目标后，继续走业务表匹配与 SQL 审查"
+      fields:
+        - id: "goal"
+          label: "想查询什么"
+          type: "textarea"
+          required: true
+          placeholder: "例如：统计本月各支付渠道的成功交易金额"
+        - id: "time_range"
+          label: "时间范围"
+          type: "text"
+          required: false
+          placeholder: "例如：本月、2026 年上半年"
+        - id: "business_object"
+          label: "业务对象"
+          type: "text"
+          required: false
+          placeholder: "例如：支付交易、客户、结算"
+        - id: "metric"
+          label: "指标或维度"
+          type: "text"
+          required: false
+          placeholder: "例如：金额、笔数、状态、渠道"
+      workflow:
+        - id: "goal"
+          title: "描述查询目标"
+          summary: "先用自然语言说明问题，不需要填写表名或字段名。"
+        - id: "tables"
+          title: "匹配业务表"
+          summary: "根据业务语言匹配候选表，再逐层披露所选表的字段。"
+        - id: "review"
+          title: "审查并执行"
+          summary: "保留原有 SQL 自检、只读校验和用户确认流程。"
+      actions: ["prepare_query"]
+  - name: kyc_checklist
+    title: "KYC 材料清单"
+    description: "查看香港企业 KYC/KYB 的进件步骤、必备材料和当前流程边界；只读知识能力。"
+    aliases: ["KYC清单", "KYC checklist", "KYC材料"]
+    entrypoint: "kyc_checklist"
+    kind: "knowledge"
+    workflow: ["load_kyc_checklist", "present_steps_and_requirements"]
     when_to_use:
-      - "用户询问交易质量、异常状态、失败交易、成功率、状态分布。"
-      - "用户希望查看某类交易是否异常。"
-    suggested_capabilities:
-      - status_distribution
-      - trend
-      - group_by
-    required_metadata_terms:
-      - "交易状态"
-      - "交易时间"
-      - "交易金额"
-      - "卡渠道"
-    clarification_policy: "如果用户指定状态名或渠道名，优先作为过滤条件；否则先做状态分布。"
+      - "用户需要查看 KYC/KYB 材料、步骤或流程要求。"
+      - "用户通过 @kyc_checklist 显式调用清单能力。"
+    clarification_policy: "按企业 KYC 清单展示要求；不把清单解释成审批结果。"
     risk_notes:
-      - "状态分布只能展示聚合结果，不导出交易明细。"
-
-  - name: channel_performance_analysis
-    title: "卡渠道表现分析"
-    description: "分析不同卡渠道的交易规模、状态质量、最后一笔交易和波动情况。"
+      - "不读取客户数据、不上传材料、不提交 sandbox。"
+    card:
+      type: "checklist"
+      state_key: "kyc"
+      title: "香港企业 KYC/KYB 进件清单"
+      subtitle: "只读业务清单，不代表审批结果"
+      steps:
+        - id: "basic"
+          title: "Basic Information"
+          summary: "公司名称、类型、注册地、CI/BR、注册地址和地址证明。"
+        - id: "documents"
+          title: "Company Documents"
+          summary: "CI、AOA、BR、NNC1、NAR1，以及必要的其他附件。"
+        - id: "business"
+          title: "Business Information"
+          summary: "行业、主营业务、贸易国家、资金来源、月交易量和 KYB 问卷。"
+        - id: "personnel"
+          title: "Personnel Information"
+          summary: "董事、UBO、证件、联系方式和股权结构。"
+      actions:
+        - id: "open_intake"
+          title: "开始填写进件"
+      boundary: "Identity Verification / Face ID 需要用户在 DogPay 页面完成。"
+  - name: kyc_intake
+    title: "KYC 进件"
+    description: "收集企业 KYC 基本信息和材料，预留 OCR、字段确认与草稿流程；不负责审批或 sandbox 提交。"
+    aliases: ["KYC进件", "KYC intake", "上传KYC材料"]
+    entrypoint: "kyc_intake"
+    kind: "workflow"
+    attachment_behavior: "auto_open_side_agent"
+    side_agent_handler: "structured_form"
+    workflow: ["collect_basic_information", "collect_enterprise_documents", "collect_business_information", "collect_personnel_information", "identity_verification"]
     when_to_use:
-      - "用户询问卡渠道表现、渠道排名、渠道最近交易、渠道质量。"
-    suggested_capabilities:
-      - top_n
-      - latest_by_group
-      - status_distribution
-      - variance
-    required_metadata_terms:
-      - "卡渠道"
-      - "交易金额"
-      - "交易时间"
-      - "交易状态"
-    clarification_policy: "如果用户没有指定指标，优先使用交易金额和交易笔数作为默认观察指标。"
+      - "用户需要填写企业 KYC 信息或准备进件材料。"
+      - "用户通过 @kyc_intake 显式调用进件能力。"
+    clarification_policy: "先展示基本信息和材料结构；字段识别结果必须由用户确认后才能进入草稿。"
     risk_notes:
-      - "渠道分析默认使用聚合结果，不暴露单笔交易明细。"
+      - "当前版本只展示进件卡片结构，不自动提交外部系统。"
+      - "不支持 Face ID/活体，不替用户完成敏感身份验证。"
+    card:
+      type: "intake"
+      state_key: "kyc_intake"
+      title: "KYC 企业进件"
+      subtitle: "填写信息并准备材料，识别结果需要确认"
+      sections:
+        - id: "basic"
+          step_id: "basic_information"
+          title: "企业基本信息"
+          summary: "填写公司身份、注册编号、成立信息和注册资本。"
+          note: "带 * 的字段需要完成；CI、BR 和地址证明可在企业证件步骤上传，再用 OCR 结果辅助补充。"
+          open: true
+          fields: ["company_name", "company_name_en", "br_number", "registration_number", "company_type", "incorporation_date", "br_effective_date", "br_expiry_date", "employee_count", "registered_capital", "registered_capital_currency"]
+        - id: "registered_address"
+          step_id: "basic_information"
+          title: "企业注册地址"
+          summary: "填写注册国家/地区、城市、详细地址和邮政编码。"
+          open: true
+          fields: ["registration_country", "registration_region", "registration_city", "registered_address", "registration_postal_code"]
+        - id: "operating_address"
+          step_id: "basic_information"
+          title: "实际经营地址"
+          summary: "如果与注册地址不同，再补充实际经营地址。"
+          open: false
+          fields: ["operating_address_mode", "operating_country", "operating_region", "operating_city", "operating_address", "operating_postal_code"]
+        - id: "other_information"
+          step_id: "basic_information"
+          title: "其他企业信息"
+          summary: "税务结构、股票信息和网站信息。"
+          open: false
+          fields: ["tax_structure", "tax_country", "bearer_shares", "website_type", "website_url"]
+        - id: "business"
+          step_id: "business_information"
+          title: "业务信息"
+          summary: "描述业务范围、资金来源和预计交易情况。"
+          open: true
+          fields: ["industry", "main_business", "source_of_funds", "countries_of_trade", "monthly_volume"]
+        - id: "personnel"
+          step_id: "personnel_information"
+          title: "人员信息"
+          summary: "填写主要控制人和联系信息。"
+          open: true
+          fields: ["full_name", "id_number", "date_of_birth", "roles", "email", "phone", "residence_address"]
+        - id: "documents"
+          step_id: "enterprise_documents"
+          title: "企业证件"
+          summary: "上传企业注册和地址证明材料。"
+          open: true
+          uploads: ["certificate_of_incorporation", "business_registration", "articles", "nnc1", "nar1", "address_proof"]
+      steps: ["basic_information", "enterprise_documents", "business_information", "personnel_information", "identity_verification"]
+      fields:
+        - id: "company_name"
+          label: "企业中文名称"
+          type: "text"
+          required: true
+          help: "若无中文名称，可填写英文名称；后续可由 CI/BR 识别结果补充。"
+        - id: "company_name_en"
+          label: "企业英文名称"
+          type: "text"
+          required: true
+          help: "以 CI 或 BR 上的法定英文名称为准。"
+        - id: "registration_number"
+          label: "CI 编号"
+          type: "text"
+          required: true
+          help: "可从注册证书（CI）识别。"
+        - id: "br_number"
+          label: "BR 编号"
+          type: "text"
+          required: true
+          help: "可从商业登记证（BR）识别。"
+        - id: "company_type"
+          label: "企业类型"
+          type: "text"
+          required: true
+          help: "可从注册文件识别；请按 DogPay 选项确认。"
+        - id: "incorporation_date"
+          label: "企业成立日期"
+          type: "text"
+          required: true
+          help: "可从 CI/BR 识别。"
+        - id: "br_effective_date"
+          label: "BR 生效日期"
+          type: "text"
+          required: true
+          help: "可从 BR 识别。"
+        - id: "br_expiry_date"
+          label: "BR 届满日期"
+          type: "text"
+          required: true
+          help: "可从 BR 识别。"
+        - id: "employee_count"
+          label: "企业人数"
+          type: "text"
+          required: true
+          help: "通常需要用户选择或确认。"
+        - id: "registered_capital"
+          label: "注册资本"
+          type: "text"
+          required: true
+          help: "可从注册文件识别。"
+        - id: "registered_capital_currency"
+          label: "注册资本币种"
+          type: "text"
+          required: false
+          help: "例如：USD；请以页面显示币种为准。"
+        - id: "registration_country"
+          label: "企业注册国家/地区"
+          type: "text"
+          required: true
+          help: "可根据注册文件或用户选择确认。"
+        - id: "registration_region"
+          label: "注册地址：州/省份/地区"
+          type: "text"
+          required: true
+          help: "可根据 CI/BR 地址识别后确认。"
+        - id: "registration_city"
+          label: "注册地址：城市"
+          type: "text"
+          required: true
+          help: "可根据 CI/BR 地址识别后确认。"
+        - id: "registered_address"
+          label: "注册地址：详细地址"
+          type: "textarea"
+          required: true
+          help: "可从 CI/BR 或地址证明识别后确认。"
+        - id: "registration_postal_code"
+          label: "注册地址：邮政编码"
+          type: "text"
+          required: true
+          help: "可从注册文件或地址证明识别后确认。"
+        - id: "operating_address_mode"
+          label: "实际经营地址"
+          type: "select"
+          options: ["与企业注册地址相同", "与企业注册地址不同"]
+          required: false
+        - id: "operating_country"
+          label: "经营地址：国家/地区"
+          type: "text"
+          required: false
+        - id: "operating_region"
+          label: "经营地址：州/省份/地区"
+          type: "text"
+          required: false
+        - id: "operating_city"
+          label: "经营地址：城市"
+          type: "text"
+          required: false
+        - id: "operating_address"
+          label: "经营地址：详细地址"
+          type: "textarea"
+          required: false
+        - id: "operating_postal_code"
+          label: "经营地址：邮政编码"
+          type: "text"
+          required: false
+        - id: "tax_structure"
+          label: "税务结构"
+          type: "text"
+          required: false
+          help: "需要用户根据实际情况选择。"
+        - id: "tax_country"
+          label: "税务国家/地区"
+          type: "text"
+          required: false
+        - id: "bearer_shares"
+          label: "是否发行不记名股票"
+          type: "text"
+          required: false
+        - id: "website_type"
+          label: "网站类型"
+          type: "text"
+          required: false
+        - id: "website_url"
+          label: "企业网址"
+          type: "url"
+          required: false
+        - id: "industry"
+          label: "行业"
+          type: "text"
+          required: true
+        - id: "main_business"
+          label: "主营业务"
+          type: "textarea"
+          required: true
+        - id: "source_of_funds"
+          label: "资金来源与用途"
+          type: "textarea"
+          required: true
+        - id: "countries_of_trade"
+          label: "贸易国家/地区"
+          type: "text"
+          required: true
+        - id: "monthly_volume"
+          label: "月交易量"
+          type: "text"
+          required: false
+        - id: "full_name"
+          label: "董事/UBO 姓名"
+          type: "text"
+          required: true
+        - id: "id_number"
+          label: "董事/UBO 证件号"
+          type: "text"
+          required: true
+        - id: "date_of_birth"
+          label: "出生日期"
+          type: "text"
+          required: true
+        - id: "roles"
+          label: "角色"
+          type: "text"
+          required: true
+        - id: "email"
+          label: "联系邮箱"
+          type: "text"
+          required: true
+        - id: "phone"
+          label: "联系电话"
+          type: "text"
+          required: true
+        - id: "residence_address"
+          label: "居住地址"
+          type: "textarea"
+          required: false
+      uploads:
+        - id: "certificate_of_incorporation"
+          label: "Certificate of Incorporation"
+          required: true
+        - id: "business_registration"
+          label: "Business Registration"
+          required: true
+        - id: "articles"
+          label: "Articles of Association"
+          required: true
+        - id: "nnc1"
+          label: "NNC1"
+          required: false
+        - id: "nar1"
+          label: "NAR1"
+          required: false
+        - id: "address_proof"
+          label: "Address Proof"
+          required: true
+      workflow:
+        - id: "basic_information"
+          view: "sections"
+          title: "基本信息"
+          summary: "填写企业身份、注册信息和地址。"
+        - id: "enterprise_documents"
+          view: "uploads"
+          title: "企业证件"
+          summary: "上传 CI、BR、章程和地址证明，执行 OCR。"
+        - id: "business_information"
+          view: "sections"
+          title: "业务信息"
+          summary: "填写业务范围、资金来源和交易情况。"
+        - id: "personnel_information"
+          view: "sections"
+          title: "人员信息"
+          summary: "填写董事、UBO 和联系人信息。"
+        - id: "identity_verification"
+          view: "identity"
+          title: "身份验证"
+          summary: "身份核验和人脸验证将在统一接口接入后执行。"
+          note: "当前 Finance Agent 不执行身份验证，也不会将资料提交至 DogPay。"
+      actions:
+        - id: "confirm_fields"
+          title: "确认字段"
+        - id: "save_draft"
+          title: "保存草稿"
+        - id: "review_draft"
+          title: "检查草稿"
+  - name: individual_kyc
+    title: "个人 KYC"
+    description: "按照个人身份认证流程收集申请人信息、证件和人脸认证材料；具体识别与认证由 DogPay Unified API 执行。"
+    aliases: ["个人KYC", "个人认证", "identity verification"]
+    entrypoint: "individual_kyc"
+    kind: "workflow"
+    side_agent_handler: "structured_form"
+    workflow: ["select_region", "collect_applicant_information", "select_document", "upload_document", "face_verification"]
+    when_to_use:
+      - "用户需要办理个人身份认证。"
+      - "用户通过 @individual_kyc 显式调用个人 KYC 能力。"
+    clarification_policy: "先按地区和申请人信息逐层收集，再选择证件类型；证件识别和人脸认证必须由用户确认并通过外部统一接口完成。"
+    risk_notes:
+      - "不在 finance-agent 内实现身份识别、活体判断或审批。"
+      - "文件仅记录在当前会话状态，正式上传待接入 DogPay Unified API。"
+    card:
+      type: "identity"
+      state_key: "individual_kyc"
+      title: "个人身份认证"
+      subtitle: "填写申请信息、上传证件并完成后续认证"
+      sections:
+        - id: "region"
+          title: "选择地区"
+          summary: "认证流程会根据申请地区使用对应规则。"
+          fields: ["country_region", "state_province", "city", "postal_code"]
+        - id: "applicant"
+          title: "申请人信息"
+          summary: "填写联系电话和居住地址。"
+          fields: ["phone", "address_line_1", "address_line_2"]
+        - id: "document"
+          title: "选择并上传证件"
+          summary: "选择签发国家和证件类型，然后上传要求的证件图片或 PDF。"
+          fields: ["document_issuing_country", "document_type"]
+          uploads: ["document_front", "document_back"]
+        - id: "verification"
+          title: "人脸认证"
+          summary: "在 DogPay 页面打开摄像头完成身份核验。"
+          fields: ["face_capture"]
+      fields:
+        - id: "country_region"
+          label: "国家/地区"
+          type: "text"
+          required: true
+        - id: "state_province"
+          label: "省/州"
+          type: "text"
+          required: true
+        - id: "city"
+          label: "城市"
+          type: "text"
+          required: true
+        - id: "postal_code"
+          label: "邮编"
+          type: "text"
+          required: true
+        - id: "phone"
+          label: "联系电话"
+          type: "tel"
+          required: true
+        - id: "address_line_1"
+          label: "地址行 1"
+          type: "textarea"
+          required: true
+        - id: "address_line_2"
+          label: "地址行 2"
+          type: "textarea"
+          required: false
+        - id: "document_issuing_country"
+          label: "证件签发国家/地区"
+          type: "text"
+          required: true
+        - id: "document_type"
+          label: "证件类型"
+          type: "select"
+          required: true
+          options:
+            - value: "id_card"
+              label: "身份证"
+            - value: "residence_permit"
+              label: "居留证"
+            - value: "passport"
+              label: "护照"
+            - value: "driver_license"
+              label: "驾照"
+        - id: "face_capture"
+          label: "人脸采集"
+          type: "checkbox"
+          required: true
+          help: "我已在 DogPay 页面完成摄像头人脸认证"
+      uploads:
+        - id: "document_front"
+          label: "证件正面"
+          required: true
+          accept: ".jpg,.jpeg,.png,.heic,.webp,.pdf"
+          max_size_mb: 10
+        - id: "document_back"
+          label: "证件反面"
+          required: false
+          accept: ".jpg,.jpeg,.png,.heic,.webp,.pdf"
+          max_size_mb: 10
+      actions:
+        - id: "save_applicant"
+          title: "保存申请信息"
+        - id: "upload_identity_document"
+          title: "准备证件上传"
+        - id: "start_identity_verification"
+          title: "开始人脸认证"
+          primary: true
+  - name: kyc_draft_review
+    title: "KYC 草稿检查"
+    description: "按照 KYC/KYB 清单检查草稿中的已填字段、已收材料和缺失项；不代表合规审批结论。"
+    aliases: ["KYC草稿", "KYC draft review", "检查KYC材料"]
+    entrypoint: "kyc_draft_review"
+    kind: "workflow"
+    workflow: ["load_draft", "compare_with_checklist", "present_missing_items", "request_user_confirmation"]
+    when_to_use:
+      - "用户需要检查 KYC 草稿是否完整。"
+      - "用户通过 @kyc_draft_review 显式调用草稿检查。"
+    clarification_policy: "先展示检查维度；没有草稿时提示用户从 KYC 进件开始。"
+    risk_notes:
+      - "检查结果是材料完整性提示，不是审批决定。"
+      - "不提交 DogPay，不修改外部 KYC 状态。"
+    card:
+      type: "draft_review"
+      state_key: "kyc_intake"
+      title: "KYC 草稿完整性检查"
+      subtitle: "对照业务清单检查，不代表审批结果"
+      checks:
+        - id: "basic"
+          title: "基本信息"
+          items: ["公司名称", "注册地", "CI/BR 编号", "注册地址", "地址证明"]
+        - id: "documents"
+          title: "企业材料"
+          items: ["CI", "AOA", "BR", "NNC1", "NAR1"]
+        - id: "business"
+          title: "业务信息"
+          items: ["行业", "主营业务", "资金来源", "贸易国家", "月交易量", "KYB 问卷"]
+        - id: "personnel"
+          title: "董事和 UBO"
+          items: ["姓名", "证件号", "出生日期", "角色", "联系方式", "股权结构"]
+      workflow:
+        - id: "load"
+          title: "读取当前草稿"
+          summary: "查看已经填写的字段和已收材料。"
+        - id: "compare"
+          title: "对照 KYC 清单"
+          summary: "按基本信息、企业材料、业务信息和董事/UBO 逐项检查。"
+        - id: "missing"
+          title: "补齐缺失项"
+          summary: "列出缺失或待确认内容，不输出审批结论。"
+      actions:
+        - id: "load_draft"
+          title: "刷新草稿检查"
+        - id: "export_draft"
+          title: "导出草稿"
+        - id: "start_intake"
+          title: "返回进件填写"

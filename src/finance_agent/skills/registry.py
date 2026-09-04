@@ -6,7 +6,6 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-
 # ---------------------------------------------------------------------------
 # 装饰器注册（与 YAML 双轨）
 # ---------------------------------------------------------------------------
@@ -24,6 +23,13 @@ def register_skill(
     required_metadata_terms: list[str] | None = None,
     clarification_policy: str = "",
     risk_notes: list[str] | None = None,
+    aliases: list[str] | None = None,
+    entrypoint: str = "",
+    workflow: list[str] | None = None,
+    kind: str = "query",
+    attachment_behavior: str = "",
+    side_agent_handler: str = "",
+    card: dict[str, Any] | None = None,
 ) -> callable:
     """装饰器：注册一个 skill。与 YAML 配置合并。"""
     def decorator(fn):
@@ -36,6 +42,13 @@ def register_skill(
             "required_metadata_terms": required_metadata_terms or [],
             "clarification_policy": clarification_policy,
             "risk_notes": risk_notes or [],
+            "aliases": aliases or [],
+            "entrypoint": entrypoint,
+            "workflow": workflow or [],
+            "kind": kind,
+            "attachment_behavior": attachment_behavior,
+            "side_agent_handler": side_agent_handler,
+            "card": card or {},
         })
         return fn
     return decorator
@@ -50,16 +63,30 @@ class SkillSpec(BaseModel):
     required_metadata_terms: list[str] = Field(default_factory=list)
     clarification_policy: str = ""
     risk_notes: list[str] = Field(default_factory=list)
+    aliases: list[str] = Field(default_factory=list)
+    entrypoint: str = ""
+    workflow: list[str] = Field(default_factory=list)
+    kind: str = "query"
+    attachment_behavior: str = ""
+    side_agent_handler: str = ""
+    card: dict[str, Any] = Field(default_factory=dict)
 
-    def manifest_entry(self) -> dict[str, str]:
-        """精简索引：只暴露 name + title + description，供 LLM 匹配意图。"""
+    def manifest_entry(self) -> dict[str, Any]:
+        """精简索引：暴露路由所需元数据，不展开工作流卡片。"""
         return {
             "name": self.name,
             "title": self.title,
             "description": self.description,
+            "aliases": self.aliases,
+            "entrypoint": self.entrypoint or self.name,
+            "kind": self.kind,
+            "card_type": self.card.get("type") if isinstance(self.card, dict) else None,
+            "when_to_use": self.when_to_use,
+            "attachment_behavior": self.attachment_behavior,
+            "side_agent_handler": self.side_agent_handler or "general",
         }
 
-    def detail_spec(self) -> dict[str, str | list[str]]:
+    def detail_spec(self) -> dict[str, Any]:
         return {
             "skill_id": self.name,
             "title": self.title,
@@ -69,6 +96,13 @@ class SkillSpec(BaseModel):
             "required_metadata_terms": self.required_metadata_terms,
             "clarification_policy": self.clarification_policy,
             "risk_notes": self.risk_notes,
+            "aliases": self.aliases,
+            "entrypoint": self.entrypoint or self.name,
+            "workflow": self.workflow,
+            "kind": self.kind,
+            "attachment_behavior": self.attachment_behavior,
+            "side_agent_handler": self.side_agent_handler or "general",
+            "card": self.card,
             "data_access": "metadata_only_until_user_authorization",
             "authorization_policy": "method_review_then_execute",
         }
@@ -84,10 +118,24 @@ class SkillRegistry(BaseModel):
     def get(self, name: str) -> SkillSpec | None:
         return next((skill for skill in self.skills if skill.name == name), None)
 
-    def manifest_for_llm(self) -> list[dict[str, str | list[str]]]:
+    def resolve(self, name_or_alias: str) -> SkillSpec | None:
+        """Resolve a canonical Skill name or a configured alias."""
+        normalized = name_or_alias.casefold()
+        return next(
+            (
+                skill
+                for skill in self.skills
+                if skill.name.casefold() == normalized
+                or (skill.entrypoint and skill.entrypoint.casefold() == normalized)
+                or any(alias.casefold() == normalized for alias in skill.aliases)
+            ),
+            None,
+        )
+
+    def manifest_for_llm(self) -> list[dict[str, Any]]:
         return [skill.manifest_entry() for skill in self.skills]
 
-    def detail_for_skill(self, name: str) -> dict[str, str | list[str]] | None:
+    def detail_for_skill(self, name: str) -> dict[str, Any] | None:
         skill = self.get(name)
         return skill.detail_spec() if skill else None
 

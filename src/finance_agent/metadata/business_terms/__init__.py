@@ -10,7 +10,7 @@
         name="退款",
         description="退款类交易。",
         aliases=["refund", "退回"],
-        candidate_fields=["type"],
+        candidate_tables=["card_transaction"],
         filters=[{"field": "type", "op": "=", "value": "refund"}],
     )
     def _():
