@@ -92,17 +92,6 @@ class MethodSetReviewCard(BaseModel):
     approval_required: bool = True
 
 
-class AnalysisPlanReviewCard(BaseModel):
-    goal: str
-    skill_id: str | None = None
-    skill_title: str | None = None
-    assumptions: list[str] = Field(default_factory=list)
-    steps: list[AnalysisStep] = Field(default_factory=list)
-    required_metadata: list[str] = Field(default_factory=list)
-    real_data_read: bool = False
-    approval_required: bool = True
-
-
 class DataAuthorizationCard(BaseModel):
     status: Literal["pending"]
     purpose: str
@@ -119,7 +108,7 @@ class DataAuthorizationCard(BaseModel):
 
 class ExecutionResultCard(BaseModel):
     status: Literal["executed"]
-    execution_mode: Literal["simulated_real"]
+    execution_mode: Literal["simulated_real", "direct_db"]
     method_name: str
     method_hash: str
     data_authorization: DataAuthorizationCard

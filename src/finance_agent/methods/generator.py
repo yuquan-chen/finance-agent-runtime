@@ -239,9 +239,20 @@ def _extract_fields_from_sql(sql: str, table: str) -> list[str]:
         add(match.group(1))
 
     # WHERE / JOIN 条件同样属于实际读取范围，必须出现在确认卡并接受字段校验。
-    # 这里仅追加带表前缀的引用；未限定的字段仍由上面的 SELECT 解析处理。
+    # 无前缀的谓词字段归入主表，避免时间筛选字段显示为“未指定”。
     for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b", sql):
         add(f"{match.group(1)}.{match.group(2)}")
+    predicate_fields = re.finditer(
+        r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)\s*"
+        r"(?:<>|!=|>=|<=|=|>|<|(?:NOT\s+)?(?:LIKE|ILIKE)|IS(?:\s+NOT)?|IN\s*\()",
+        sql,
+        re.IGNORECASE,
+    )
+    sql_keywords = {"where", "and", "or", "on", "not", "null", "true", "false"}
+    for match in predicate_fields:
+        field = match.group(1)
+        if field.lower() not in sql_keywords and not field.lower().startswith("input_"):
+            add(field)
 
     return list(dict.fromkeys(fields))
 

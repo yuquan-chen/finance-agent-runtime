@@ -43,7 +43,9 @@ SYSTEM_PROMPT = """# 角色
 # 关键规则
 1. 每个步骤必须有 sql 字段，写完整的 SELECT 语句
 1.1 你是唯一生成 SQL 模板的阶段。必须以 user_query（已合并且已脱值的目标）为准；你不会收到原始对话或真实参数值。
-1.2 如果 action_context.base_query_reference 存在，它是同一会话中已执行查询的安全参考：保留其中仍然有效的表、JOIN、过滤条件和参数占位符，再把当前 user_query 的新要求合并进去；必须重新生成 SQL 并重新查询，不能读取 prior result。
+1.2 如果 action_context.base_query_reference 存在，它是同一会话中已执行查询的安全参考：根据当前 user_query 判断哪些历史约束仍然有效，再把当前请求的变化合并进去；必须重新生成 SQL 并重新查询，不能读取 prior result。relation=expand_detail 通常只把聚合/计数改为明细投影；relation=change_filter 或 change_time 时用当前明确的新条件覆盖同名旧条件；relation=sort 或 group 时只改变排序/分组。
+1.2a 历史条件不是永久锁定：当前用户明确要求移除、替换或新增条件时，分别移除、覆盖或追加对应条件。用户没有提及的范围条件（例如原查询的时间范围、客户范围）默认保留；无法判断是否仍然有效时必须澄清。
+1.2b 对 expand_detail，必须保留历史查询仍然有效的业务范围，但不能因为表名、业务术语或当前目标中的泛化名词自行新增过滤条件。例如“支付交易”可以用于选择 pay_transaction 表，但不能仅凭这个词新增 `type = 'payment'`。新的过滤条件必须来自当前用户明确表达并在 context.input_slots 中有对应槽位；没有槽位时不得写过滤字面量。
 1.3 用户要求查看某个主体的交易/付款等明细记录（没有明确指定返回字段）时，使用主表别名的 ``SELECT p.*``，不要自行枚举列名；JOIN 的表只用于过滤时不选取其列。这样读取范围明确且不会猜测字段。
 1.4 如果 action_context.revision=true，current_method_set 是当前待确认的方法集合：保持步骤编号和未被用户明确修改的步骤不变，只修改用户指明的步骤，并输出完整的方法集合。
 1.5 如果 action_context.selected_capability_detail 存在，它是第一层已经由用户问题选中的受控能力。优先使用该 capability 作为主步骤 operation；不要把它替换成不相关的 operation。
@@ -51,7 +53,8 @@ SYSTEM_PROMPT = """# 角色
 3. 只写 SELECT，绝不写 INSERT/UPDATE/DELETE
 4. 多表用 JOIN，关系参考 visible_metadata 中的 relationships
 5. 业务术语参考 context.business_terms（如"消费"= type='consumption'）
-6. 参数只能使用 context.input_slots 中提供的 :input_N 占位符。绝不猜测、复述或写入任何真实筛选值；需要按值筛选时必须引用一个 input_slot。必须根据 slot 的 type 和 semantic 选择兼容字段：公司名称等 text slot 应匹配名称字段，不能匹配 UUID/金额/日期字段；UUID slot 才能匹配 UUID 字段。
+6. 参数只能使用 context.input_slots 中提供的占位符。普通值使用 :input_N；范围值使用同一组的 :input_N_start 和 :input_N_end。绝不猜测、复述或写入任何真实筛选值；需要按值筛选时必须引用 input_slot，并遵守 slot 的 operator。必须根据 slot 的 type 和 semantic 选择兼容字段：公司名称等 text slot 应匹配名称字段，不能匹配 UUID/金额/日期字段；UUID slot 才能匹配 UUID 字段。
+6.1 date/date_range slot 必须匹配时间字段。date_range 必须展开成闭区间起点和开区间终点，例如 `time_field >= :input_N_start AND time_field < :input_N_end`，不能写成 `time_field BETWEEN :input_N`，也不能把自然语言时间直接写进 SQL。
 7. 文本字段的匹配必须根据用户意图选择：用户提供完整的主体名称或明确要求精确匹配时使用
    ``= :input_N``；用户只提供名称片段，或明确要求包含/模糊匹配时才使用
    ``ILIKE :input_N``。其他字段保持正确的类型比较，不能把 UUID/数值字段写成 ILIKE。
@@ -60,6 +63,7 @@ SYSTEM_PROMPT = """# 角色
 - 从宏观到微观：先看整体趋势，再拆维度
 - 每个步骤解决一个问题，不要把多个分析塞进步骤
 - 常见组合：状态分布 + 时间趋势 + 维度拆分
+- 用户使用“分析”“概览”“健康度”或“从多个方面/维度”等综合分析表达时，必须输出至少 2 个互补步骤；如果目标包含状态，至少覆盖状态分布，并补充交易量或金额趋势等独立角度。这里的“比较”是比较本次分析的多个方法，不是引用多条历史查询。
 - 如果用户指定了 skill，按 skill 的 suggested_capabilities 组织步骤
 
 # 示例
@@ -104,6 +108,8 @@ def _catalog_payload(catalog: Catalog) -> dict[str, Any]:
                         "type": column.type,
                         "semantic": column.semantic,
                         "sensitive": column.sensitive,
+                        "semantic_aliases": column.semantic_aliases,
+                        "value_aliases": column.value_aliases,
                     }
                     for column in table.columns
                 ],

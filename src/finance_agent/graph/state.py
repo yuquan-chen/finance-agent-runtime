@@ -12,7 +12,7 @@ class AgentState(MessagesState):
     # 只需要添加自定义字段
 
     request_id: str
-    # A run can create several review-card versions after revisions.
+    # Retained only for idempotency and legacy confirmation endpoints.
     review_id: str
     session_id: str
     user_id: str
@@ -21,12 +21,14 @@ class AgentState(MessagesState):
     requested_skill_id: str | None
     status: str
     errors: list[str]
+    execution_diagnostics: list[str]
     public_memory_context: list[dict[str, Any]]
     public_memory_entry: dict[str, Any]
     result_ref: str
     plan_result_ref: str
     result_refs: list[str]
     response_plan: dict[str, Any]
+    query_request: dict[str, Any]
     action_validation: dict[str, Any]
     query_candidate_selection: dict[str, Any]
     pending_query_candidate: dict[str, Any]
@@ -49,6 +51,8 @@ class AgentState(MessagesState):
     analysis_plan_review_card: dict[str, Any]
     method_draft: dict[str, Any]
     method_drafts: list[dict[str, Any]]
+    compiled_queries: list[dict[str, Any]]
+    validation_report: dict[str, Any]
     harness_review: dict[str, Any]
     harness_reviews: list[dict[str, Any]]
     mock_result: dict[str, Any]
@@ -85,3 +89,6 @@ class AgentState(MessagesState):
     public_memory_entries: list[dict[str, Any]]
     # SQL fields
     completed_sql: str
+    sql_input_slots: list[dict[str, Any]]
+    base_query_params: dict[str, Any]
+    base_query_filter_specs: list[dict[str, Any]]

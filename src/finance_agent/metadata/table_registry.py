@@ -36,6 +36,9 @@ class ColumnMeta(BaseModel):
     sensitive: bool = False
     foreign_key: str | None = None  # 格式: "table.column"
     enum_values: list[str] = Field(default_factory=list)
+    semantic_aliases: list[str] = Field(default_factory=list)
+    # canonical value -> user/business aliases, maintained in the schema overlay
+    value_aliases: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class TableMeta(BaseModel):
@@ -51,6 +54,18 @@ class TableMeta(BaseModel):
 
     def get_column(self, name: str) -> ColumnMeta | None:
         return next((col for col in self.columns if col.name == name), None)
+
+    def canonical_value(self, column_name: str, value: str) -> str | None:
+        """Resolve a configured alias to the column's canonical value."""
+        column = self.get_column(column_name)
+        if column is None or not column.value_aliases:
+            return None
+        normalized = "".join(value.casefold().split())
+        for canonical, aliases in column.value_aliases.items():
+            candidates = [canonical, *aliases]
+            if any("".join(candidate.casefold().split()) == normalized for candidate in candidates):
+                return canonical
+        return None
 
     def get_relationships(self) -> list[dict[str, str]]:
         """提取外键关系。"""
@@ -72,6 +87,7 @@ class TableMeta(BaseModel):
 _pending_tables: list[dict[str, Any]] = []
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DESCRIPTION_OVERLAY_PATH = PROJECT_ROOT / "schema_catalog" / "table_descriptions.yaml"
+VALUE_ALIASES_OVERLAY_PATH = PROJECT_ROOT / "schema_catalog" / "value_aliases.yaml"
 SCHEMA_TABLES_PATH = PROJECT_ROOT / "schema_catalog" / "tables"
 
 
@@ -88,6 +104,34 @@ def _load_description_overlay(path: Path = DESCRIPTION_OVERLAY_PATH) -> dict[str
         for table_name, description in tables.items()
         if str(description).strip()
     }
+
+
+def _load_value_aliases_overlay(path: Path = VALUE_ALIASES_OVERLAY_PATH) -> dict[str, dict[str, dict[str, Any]]]:
+    """Load canonical business values without embedding them in runtime code."""
+    if not path.exists():
+        return {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    tables = raw.get("tables", {}) if isinstance(raw, dict) else {}
+    if not isinstance(tables, dict):
+        return {}
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    for table_name, columns in tables.items():
+        if not isinstance(columns, dict):
+            continue
+        result[str(table_name)] = {}
+        for column_name, aliases in columns.items():
+            if not isinstance(aliases, dict):
+                continue
+            values = aliases.get("values", aliases)
+            result[str(table_name)][str(column_name)] = {
+                "semantic_aliases": [str(alias) for alias in aliases.get("semantic_aliases", [])],
+                "value_aliases": {
+                    str(canonical): [str(alias) for alias in alias_values if alias is not None]
+                    for canonical, alias_values in values.items()
+                    if isinstance(alias_values, list) and canonical not in {"semantic_aliases", "values"}
+                },
+            }
+    return result
 
 
 def register_table(
@@ -216,6 +260,7 @@ def get_default_table_registry() -> TableRegistry:
     registry = TableRegistry()
 
     description_overlay = _load_description_overlay()
+    value_aliases_overlay = _load_value_aliases_overlay()
     for table_data in _pending_tables:
         columns = [
             ColumnMeta(
@@ -226,6 +271,14 @@ def get_default_table_registry() -> TableRegistry:
                 sensitive=col.get("sensitive", False),
                 foreign_key=col.get("foreign_key"),
                 enum_values=col.get("enum_values", []),
+                semantic_aliases=(
+                    value_aliases_overlay.get(table_data["name"], {}).get(col["name"], {}).get("semantic_aliases", [])
+                    or col.get("semantic_aliases", [])
+                ),
+                value_aliases=(
+                    value_aliases_overlay.get(table_data["name"], {}).get(col["name"], {}).get("value_aliases", {})
+                    or col.get("value_aliases", {})
+                ),
             )
             for col in table_data["columns"]
         ]

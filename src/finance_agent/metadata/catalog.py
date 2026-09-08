@@ -12,6 +12,8 @@ class ColumnMeta(BaseModel):
     type: str
     semantic: str = ""
     sensitive: bool = False
+    semantic_aliases: list[str] = Field(default_factory=list)
+    value_aliases: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class RelationshipMeta(BaseModel):

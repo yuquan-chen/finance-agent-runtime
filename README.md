@@ -101,12 +101,10 @@ docker compose up --build
   -> 直接回复 / 澄清 / 受控拒绝
   -> Schema 候选检索与选择
   -> 字段和关系披露
-  -> Analysis Plan
-  -> Method Draft
-  -> Harness Review + Synthetic Check
-  -> Method Review
-  -> Data Authorization
-  -> 受控执行
+  -> Analysis Plan（内部中间结构）
+  -> Method Draft（内部可执行结构）
+  -> Query Guard（只读 SQL、字段和合成预检）
+  -> 通过后自动受控执行
   -> Private Result Store
   -> 结果渲染和安全记忆
 ```

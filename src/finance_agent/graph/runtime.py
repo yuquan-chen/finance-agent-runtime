@@ -11,6 +11,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from finance_agent.audit.audit_logger import AuditLogger, stable_hash
 from finance_agent.chat.response_plan import (
     MethodProposal,
+    QueryReference,
     ResponsePlan,
     ResponseValidationResult,
     plan_response_with_llm_and_registry,
@@ -19,7 +20,17 @@ from finance_agent.chat.response_plan import (
 from finance_agent.chat.tool_decision import response_plan_to_tool_decision
 from finance_agent.config import Settings, get_settings
 from finance_agent.executor.executor_registry import ExecutorRegistry, get_default_executor_registry
+from finance_agent.executor.method_adapter import execute_method
 from finance_agent.graph.state import AgentState
+from finance_agent.graph.input_binding import (
+    bound_input_params,
+    merge_filter_specs,
+    parse_count,
+    planner_input_slots,
+    redact_sql_planning_goal,
+    resolve_range_value,
+    sql_input_slots,
+)
 from finance_agent.harness.analysis_schema import (
     AnalysisPlan,
     DataAuthorizationCard,
@@ -29,7 +40,12 @@ from finance_agent.harness.analysis_schema import (
 from finance_agent.harness.method_validator import validate_method_draft
 from finance_agent.llm.provider import LlmProvider, build_llm_provider
 from finance_agent.memory.private_result_store import PrivateResultStore
-from finance_agent.memory.query_candidate_selector import parse_candidate_reply, select_query_candidate
+from finance_agent.memory.query_candidate_selector import (
+    is_explicit_query_continuation,
+    is_explicit_historical_reference,
+    parse_candidate_reply,
+    select_query_candidate,
+)
 from finance_agent.memory.contracts import MemoryKind
 from finance_agent.memory.memory_store import MemoryStore
 from finance_agent.memory.public_memory import PublicMemoryEntry
@@ -43,18 +59,20 @@ from finance_agent.metadata.policy import Policy, load_policy
 from finance_agent.metadata.pruner import prune_catalog
 from finance_agent.metadata.schema_selector import select_schema_with_llm
 from finance_agent.metadata.table_registry import TableRegistry, get_default_table_registry
-from finance_agent.methods.generator import generate_dependent_method, generate_method_drafts
+from finance_agent.metadata.value_normalizer import normalize_filter_bindings
+from finance_agent.methods.generator import generate_dependent_method
 from finance_agent.operations.handler_registry import OperationHandlerRegistry, get_default_registry
 from finance_agent.operations.registry import OperationRegistry, load_operation_registry
 from finance_agent.planner.analysis_planner import plan_analysis_with_lmstudio, plan_analysis_with_rules
+from finance_agent.query.compiler import compile_analysis_plan, compile_method
+from finance_agent.query.contracts import CompiledQuery, QueryRequest
+from finance_agent.query.guard import QueryGuard
 from finance_agent.renderer.method_review_renderer import (
-    build_analysis_plan_review_card,
     build_data_authorization_card,
     build_data_authorization_card_for_methods,
     build_execution_result_card,
     build_method_review_card,
     build_method_set_review_card,
-    render_analysis_plan_review_data,
     render_data_authorization_data,
     render_execution_result_data,
     render_execution_result_set_data,
@@ -65,7 +83,7 @@ from finance_agent.renderer.method_review_renderer import (
 )
 from finance_agent.renderer.reply_generator import generate_reply
 from finance_agent.renderer.result_narrator import narrate_execution_result, render_user_narration
-from finance_agent.sandbox.mock_sandbox import run_mock_dry_run, run_simulated_real_execution
+from finance_agent.sandbox.mock_sandbox import run_mock_dry_run
 from finance_agent.session.manager import SessionManager
 from finance_agent.session.run_store import RunStore
 from finance_agent.skills.registry import SkillRegistry, load_skill_registry
@@ -139,13 +157,11 @@ class FinanceAgentRuntime:
         graph.add_node("select_schema", self.select_schema)
         graph.add_node("load_metadata", self.load_metadata)
         graph.add_node("plan_analysis", self.plan_analysis)
-        graph.add_node("render_analysis_plan_card", self.render_analysis_plan_card)
         graph.add_node("generate_method", self.generate_method)
-        graph.add_node("review_method", self.review_method)
-        graph.add_node("synthetic_check", self.synthetic_check)
+        graph.add_node("query_guard", self.query_guard)
         graph.add_node("repair_method", self.repair_method)
         graph.add_node("prepare_schema_repair", self.prepare_schema_repair)
-        graph.add_node("render_method_card", self.render_method_card)
+        graph.add_node("execute_readonly", self.execute_readonly)
         graph.add_node("refuse_method", self.refuse_method)
         graph.add_node("load_prior_result", self.load_prior_result)
         graph.add_node("generate_dependent_method", self.generate_dependent_method)
@@ -169,26 +185,19 @@ class FinanceAgentRuntime:
         graph.add_conditional_edges(
             "plan_analysis",
             self.after_analysis_plan,
-            {"method": "generate_method", "plan_review": "render_analysis_plan_card", "fail": "audit"},
+            {"method": "generate_method", "fail": "audit"},
         )
-        graph.add_edge("render_analysis_plan_card", "audit")
-        graph.add_edge("generate_method", "review_method")
+        graph.add_edge("generate_method", "query_guard")
         graph.add_conditional_edges(
-            "review_method",
-            self.after_method_review,
-            {"ok": "synthetic_check", "repair": "prepare_schema_repair", "refuse": "refuse_method"},
-        )
-        graph.add_conditional_edges(
-            "synthetic_check",
-            self.after_synthetic_check,
-            {"ok": "render_method_card", "repair": "prepare_schema_repair", "refuse": "refuse_method"},
+            "query_guard",
+            self.after_query_guard,
+            {"execute": "execute_readonly", "repair": "prepare_schema_repair", "refuse": "refuse_method"},
         )
         graph.add_edge("prepare_schema_repair", "search_schema")
-        graph.add_edge("repair_method", "review_method")
-        graph.add_edge("render_method_card", "audit")
+        graph.add_edge("repair_method", "query_guard")
         graph.add_edge("refuse_method", "audit")
         graph.add_edge("load_prior_result", "generate_dependent_method")
-        graph.add_edge("generate_dependent_method", "review_method")
+        graph.add_edge("generate_dependent_method", "query_guard")
         graph.add_edge("audit", END)
         return graph.compile(checkpointer=self.checkpointer)
 
@@ -440,6 +449,16 @@ class FinanceAgentRuntime:
         """合并方法确认和数据授权为一步：确认后直接执行。"""
         if state.get("status") != "method_review_ready":
             raise ValueError(f"run is not pending method review: {state.get('status')}")
+        return await self._execute_methods(state)
+
+    async def execute_readonly(self, state: AgentState) -> AgentState:
+        """Execute a validated read-only query without a user confirmation card."""
+        if state.get("status") != "query_guard_passed":
+            raise ValueError(f"run is not ready for read-only execution: {state.get('status')}")
+        return await self._execute_methods(state)
+
+    async def _execute_methods(self, state: AgentState) -> AgentState:
+        """Persist and render validated read-only method results."""
         if not state.get("method_draft") and not state.get("method_drafts"):
             raise ValueError("run has no method draft")
 
@@ -447,6 +466,7 @@ class FinanceAgentRuntime:
         final_methods: list[MethodDraft] = []
         executions: list[Any] = []
         failures: list[str] = []
+        execution_diagnostics: list[str] = []
 
         # 一个确认卡可以包含多个 draft；确认后按生成顺序逐个执行。
         # 某一步失败时继续执行其余步骤，最后将成功结果与失败原因一起返回。
@@ -460,9 +480,18 @@ class FinanceAgentRuntime:
                 "repair_history": [],
                 "errors": [],
             }
-            _, final_method, execution, error = self._execute_one_method_with_repair(method_state, method)
+            _, final_method, execution, error = self._execute_one_method(
+                method_state,
+                method,
+                extra_tables=state.get("referenced_result_tables") or None,
+            )
             if execution is None or final_method is None:
-                failures.append(f"步骤 {index}（{method.name}）执行失败：{error or '未知错误'}")
+                if error:
+                    execution_diagnostics.append(f"步骤 {index}（{method.name}）：{error}")
+                failures.append(
+                    f"步骤 {index}（{method.name}）执行失败。"
+                    "请检查查询条件、筛选值或数据权限后重新发起查询。"
+                )
                 continue
             final_methods.append(final_method)
             executions.append(execution)
@@ -473,10 +502,15 @@ class FinanceAgentRuntime:
                 "status": "method_execution_failed",
                 "answer": "所有查询步骤均执行失败：\n" + "\n".join(failures),
                 "errors": state.get("errors", []) + failures,
+                "execution_diagnostics": execution_diagnostics,
             })
 
         proposal_params = ((state.get("action_validation") or {}).get("proposal") or {}).get("params") or {}
         source_params = {**(state.get("base_query_params") or {}), **proposal_params}
+        proposal = (state.get("action_validation") or {}).get("proposal") or {}
+        source_filter_specs = self._merge_filter_specs(
+            state.get("base_query_filter_specs") or [], proposal.get("filter_specs") or []
+        )
         cards = []
         private_records = []
         public_entries = []
@@ -511,6 +545,7 @@ class FinanceAgentRuntime:
                     "method_set_hash": aggregate_authorization.method_hash,
                     # 仅供后端下一轮重新生成查询路径恢复参数；不进入任何 LLM 上下文。
                     "source_params": source_params,
+                    "source_filter_specs": source_filter_specs,
                 },
             )
             public_memory = self.memory_store.upsert(
@@ -567,83 +602,25 @@ class FinanceAgentRuntime:
             "row_count": sum(card.row_count for card in cards),
             "answer": "\n\n".join(answer_parts),
             "errors": state.get("errors", []) + failures,
+            "execution_diagnostics": execution_diagnostics,
         }
         audited = self.audit(next_state)
         self._persist_private_analysis(audited)
         return audited
 
-    def _execute_one_method_with_repair(
+    def _execute_one_method(
         self,
         state: AgentState,
         method: MethodDraft,
+        *,
+        extra_tables: dict[str, list[dict[str, Any]]] | None = None,
     ) -> tuple[AgentState, MethodDraft | None, Any | None, str | None]:
-        """执行单个 draft；修复后必须重新经过 review_method 才能执行。"""
-        current_state = state
-        current_method = method
-        last_error: str | None = None
-
-        for attempt in range(MAX_METHOD_REPAIR_ATTEMPTS):
-            execution = run_simulated_real_execution(current_method)
-            if execution.status == "passed":
-                return current_state, current_method, execution, None
-
-            last_error = "; ".join(execution.errors) or f"simulated execution failed: {current_method.name}"
-            if attempt >= MAX_METHOD_REPAIR_ATTEMPTS - 1:
-                break
-
-            current_sql = current_state.get("sql") or current_method.sql_template or ""
-            user_goal = current_state.get("action_user_goal") or current_state["user_query"]
-            proposal = (current_state.get("action_validation") or {}).get("proposal") or {}
-            merged_params = {
-                **(current_state.get("base_query_params") or {}),
-                **(proposal.get("params") or {}),
-            }
-            sql_input_slots = current_state.get("sql_input_slots") or self._sql_input_slots(merged_params)
-            sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, merged_params)
-            repaired_sql = self._call_llm_for_repair(
-                sql_planning_goal,
-                current_sql,
-                last_error,
-                current_state.get("visible_catalog"),
-                input_slots=[
-                    {"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]}
-                    for slot in sql_input_slots
-                ],
-            )
-            if not repaired_sql:
-                break
-
-            table_match = re.search(r"FROM\s+(\w+)", repaired_sql, re.IGNORECASE)
-            repaired_method = MethodDraft(
-                method_type="sql",
-                name="llm_repaired_sql",
-                goal=user_goal,
-                operation="custom_sql",
-                table=table_match.group(1) if table_match else current_method.table,
-                data_source="table",
-                sql_template=repaired_sql,
-                params=self._bound_input_params(current_state),
-                required_fields=self._extract_fields_from_sql(repaired_sql),
-                output_schema={},
-                risk_level="medium",
-                logic_summary=[f"已完成查询校验与调整：{user_goal}"],
-            )
-            candidate_state = {
-                **current_state,
-                "method_draft": repaired_method.model_dump(mode="json"),
-                "method_drafts": [repaired_method.model_dump(mode="json")],
-                "sql": repaired_sql,
-                "repair_attempts": attempt + 1,
-                "errors": [],
-            }
-            reviewed = self.review_method(candidate_state)
-            if reviewed.get("status") != "method_reviewed":
-                last_error = "; ".join(reviewed.get("errors", [])[-5:]) or "repaired SQL failed validation"
-                break
-            current_state = reviewed
-            current_method = self._state_methods(reviewed)[0]
-
-        return current_state, None, None, last_error
+        """执行用户已确认的 draft；失败后不再改变查询内容或自动重试。"""
+        execution = execute_method(self.executor, method, extra_tables=extra_tables)
+        if execution.status == "passed":
+            return state, method, execution, None
+        error = "; ".join(execution.errors) or f"execution failed: {method.name}"
+        return state, None, None, error
 
     async def approve_analysis_plan(self, state: AgentState) -> AgentState:
         if state.get("status") != "analysis_plan_review_ready":
@@ -695,7 +672,7 @@ class FinanceAgentRuntime:
             **(revision_state.get("base_query_params") or {}),
             **proposal_params,
         }
-        slots = self._sql_input_slots(merged_params)
+        slots = self._sql_input_slots(merged_params, revised_proposal.get("filter_specs") or [])
         method_context = [
             {
                 "step_index": index,
@@ -732,10 +709,7 @@ class FinanceAgentRuntime:
                 self.settings,
                 self.llm_provider,
                 action_context=action_context,
-                input_slots=[
-                    {"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]}
-                    for slot in slots
-                ],
+                input_slots=self._planner_input_slots(slots),
                 handler_manifest=self.handler_registry.manifest_for_llm(),
                 business_term_manifest=self.business_term_registry.manifest_for_llm(),
             )
@@ -825,15 +799,19 @@ class FinanceAgentRuntime:
                 "status": "response_planned",
             }
 
-        # 选择相关记忆（新系统）- 使用同步版本
-        from finance_agent.memory.selector import select_relevant_memories_sync
-        relevant_memories = select_relevant_memories_sync(
-            state["user_query"],
-            self.memory_store,
-            self.llm_provider,
-            state["session_id"],
-            max_results=5,
-        )
+        # 查询历史是显式续接能力，不是当前会话的默认上下文。独立问题
+        # 不触发记忆选择器，避免前一次查询反过来影响本轮路由。
+        continuing_query = is_explicit_query_continuation(state["user_query"])
+        relevant_memories = []
+        if continuing_query:
+            from finance_agent.memory.selector import select_relevant_memories_sync
+            relevant_memories = select_relevant_memories_sync(
+                state["user_query"],
+                self.memory_store,
+                self.llm_provider,
+                state["session_id"],
+                max_results=5,
+            )
 
         # 构建记忆上下文
         memory_context = []
@@ -871,7 +849,7 @@ class FinanceAgentRuntime:
             handler_registry=self.handler_registry,
             business_term_registry=self.business_term_registry,
             relevant_memories=memory_context,
-            conversation_messages=conversation_history,
+            conversation_messages=conversation_history if continuing_query else [],
         )
         requested_skill_id = state.get("requested_skill_id")
         if requested_skill_id:
@@ -930,19 +908,73 @@ class FinanceAgentRuntime:
         validation = validate_response_plan(plan, state["user_query"], self.operation_registry, self.skill_registry)
         proposal = validation.proposal
         candidate = proposal.base_query_candidate if proposal else None
+        query_reference = proposal.query_reference if proposal else QueryReference()
+        continuing_query = is_explicit_query_continuation(state["user_query"])
+        if proposal and not continuing_query:
+            # The model may still emit a stale reference from an older client
+            # or checkpoint.  A fresh request must start from its own goal.
+            candidate = None
+            query_reference = QueryReference()
+            proposal = proposal.model_copy(
+                update={
+                    "base_query_candidate": None,
+                    "query_reference": query_reference,
+                }
+            )
+            validation = validation.model_copy(update={"proposal": proposal})
+        if (
+            proposal
+            and query_reference.mode == "queries"
+            and len(query_reference.query_ids) > 1
+            and not is_explicit_historical_reference(validation.user_goal, state["user_query"])
+        ):
+            # "从多个方面分析" compares methods on one dataset, not prior
+            # query results.  Drop an over-eager model reference and let the
+            # analysis planner create a fresh method set.
+            query_reference = QueryReference()
+            proposal = proposal.model_copy(update={"query_reference": query_reference})
+            validation = validation.model_copy(update={"proposal": proposal})
         candidate_selection = select_query_candidate(
             self.memory_store.context_for_llm(state["session_id"]),
             candidate=candidate,
             current_goal=validation.user_goal,
             user_query=state["user_query"],
+            query_ids=query_reference.query_ids,
             confirmed_candidate=(state.get("resume_query_candidate") or {}).get("candidate"),
         )
         response_plan = dict(state["response_plan"])
         if candidate_selection["status"] == "selected" and proposal is not None:
+            selected_query_id = candidate_selection.get("selected_query_id")
+            normalized_reference = query_reference
+            if selected_query_id:
+                normalized_reference = query_reference.model_copy(
+                    update={
+                        "mode": "query",
+                        "query_ids": [selected_query_id],
+                    }
+                )
+            if candidate_selection.get("resolution") == "latest":
+                # The model may have chosen an older query's wording even
+                # after the backend resolved "刚才/最近一次" to the newest
+                # record.  Rebuild the planning goal from the resolved safe
+                # history metadata so the SQL planner follows the same base
+                # query as the parameter and schema binding layers.
+                selected_goal = str(candidate_selection.get("selected_goal") or "").strip()
+                relation = normalized_reference.relation
+                if selected_goal:
+                    if relation == "expand_detail":
+                        resolved_goal = f"展开以下历史查询的明细记录：{selected_goal}"
+                    else:
+                        resolved_goal = f"基于以下历史查询继续处理：{selected_goal}；当前请求：{state['user_query']}"
+                    proposal = proposal.model_copy(update={"goal": resolved_goal})
+                    validation = validation.model_copy(update={"proposal": proposal, "user_goal": resolved_goal})
             validation = validation.model_copy(
                 update={
                     "proposal": proposal.model_copy(
-                        update={"base_query_candidate": candidate_selection["selected_candidate"]}
+                        update={
+                            "base_query_candidate": candidate_selection["selected_candidate"],
+                            "query_reference": normalized_reference,
+                        }
                     )
                 }
             )
@@ -982,6 +1014,10 @@ class FinanceAgentRuntime:
         return {
             **state,
             "response_plan": response_plan,
+            "query_request": QueryRequest.from_proposal(
+                validation.proposal.model_dump(mode="json") if validation.proposal else None,
+                goal=validation.user_goal,
+            ).model_dump(mode="json") if validation.proposal else None,
             "action_validation": validation.model_dump(mode="json"),
             "query_candidate_selection": candidate_selection,
             "selected_capability_detail": selected_capability_detail,
@@ -1016,6 +1052,8 @@ class FinanceAgentRuntime:
                     type=col.type,
                     semantic=col.description,
                     sensitive=col.sensitive,
+                    semantic_aliases=col.semantic_aliases,
+                    value_aliases=col.value_aliases,
                 )
                 for col in t.columns
             ]
@@ -1158,6 +1196,8 @@ class FinanceAgentRuntime:
                             "qualified_name": f"{table.name}.{column.name}",
                             "type": column.type,
                             "description": column.semantic,
+                            "semantic_aliases": column.semantic_aliases,
+                            "value_aliases": column.value_aliases,
                         }
                         for column in table.columns
                     ],
@@ -1188,9 +1228,27 @@ class FinanceAgentRuntime:
         errors = list(state.get("errors", []))
         user_goal = state.get("action_user_goal") or state["user_query"]
         proposal = (state.get("action_validation") or {}).get("proposal") or {}
-        base_query_reference, base_query_params = self._resolve_base_query_reference(state)
-        merged_params = {**base_query_params, **(proposal.get("params") or {})}
-        sql_input_slots = self._sql_input_slots(merged_params)
+        base_query_reference, base_query_params, base_query_filter_specs = self._resolve_base_query_reference(state)
+        selected_tables = list(state.get("selected_schema_tables") or [table.name for table in visible.tables])
+        normalized_base_params, normalized_base_specs = normalize_filter_bindings(
+            base_query_params,
+            base_query_filter_specs,
+            selected_tables,
+            self.table_registry,
+            self.business_term_registry,
+            user_goal,
+        )
+        normalized_proposal_params, normalized_proposal_specs = normalize_filter_bindings(
+            proposal.get("params") or {},
+            proposal.get("filter_specs") or [],
+            selected_tables,
+            self.table_registry,
+            self.business_term_registry,
+            user_goal,
+        )
+        filter_specs = self._merge_filter_specs(normalized_base_specs, normalized_proposal_specs)
+        merged_params = {**normalized_base_params, **normalized_proposal_params}
+        sql_input_slots = self._sql_input_slots(merged_params, filter_specs)
         sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, merged_params)
         action_context = {
             # 不传完整 response_plan / action_validation：其中可能有用户真实筛选值。
@@ -1216,7 +1274,7 @@ class FinanceAgentRuntime:
                 self.settings,
                 self.llm_provider,
                 action_context=action_context,
-                input_slots=[{"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]} for slot in sql_input_slots],
+                input_slots=self._planner_input_slots(sql_input_slots),
                 handler_manifest=self.handler_registry.manifest_for_llm(),
                 business_term_manifest=self.business_term_registry.manifest_for_llm(),
             )
@@ -1228,11 +1286,21 @@ class FinanceAgentRuntime:
             plan = self._apply_action_constraints(plan, state)
             planner_used = "rule"
         plan = self._apply_skill_constraints(plan, state)
+        normalized_validation = {
+            **(state.get("action_validation") or {}),
+            "proposal": {
+                **proposal,
+                "params": normalized_proposal_params,
+                "filter_specs": normalized_proposal_specs,
+            },
+        }
         return {
             **state,
+            "action_validation": normalized_validation,
             "analysis_plan": plan.model_dump(mode="json"),
             "sql_input_slots": sql_input_slots,
-            "base_query_params": base_query_params,
+            "base_query_params": normalized_base_params,
+            "base_query_filter_specs": filter_specs,
             "planner_used": planner_used,
             "status": "analysis_planned",
             "errors": errors,
@@ -1251,23 +1319,16 @@ class FinanceAgentRuntime:
         ][-limit:]
 
     @staticmethod
-    def _sql_input_slots(params: dict[str, Any]) -> list[dict[str, str]]:
-        """Create opaque slots for SQL planning; values never leave the backend boundary."""
-        slots: list[dict[str, str]] = []
-        for index, (source_name, value) in enumerate(sorted(params.items()), start=1):
-            if value is None:
-                continue
-            value_type = "number" if isinstance(value, (int, float)) and not isinstance(value, bool) else "text"
-            slots.append(
-                {
-                    "id": f"input_{index}",
-                    "source_param": str(source_name),
-                    "type": value_type,
-                    # Intent label only; neither a parameter name nor a value.
-                    "semantic": str(source_name).replace("_", " "),
-                }
-            )
-        return slots
+    def _sql_input_slots(
+        params: dict[str, Any],
+        filter_specs: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, str]]:
+        """Compatibility wrapper for the extracted binding module."""
+        return sql_input_slots(params, filter_specs)
+
+    @staticmethod
+    def _planner_input_slots(slots: list[dict[str, str]]) -> list[dict[str, str]]:
+        return planner_input_slots(slots)
 
     @staticmethod
     def _redact_sql_planning_goal(
@@ -1275,15 +1336,7 @@ class FinanceAgentRuntime:
         slots: list[dict[str, str]],
         params: dict[str, Any],
     ) -> str:
-        """Remove known user values before they reach the SQL-planning LLM."""
-        redacted = goal
-        for slot in slots:
-            value = params.get(slot["source_param"])
-            if isinstance(value, str) and value.strip():
-                redacted = re.sub(re.escape(value), f"[{slot['id']}]", redacted, flags=re.IGNORECASE)
-            elif isinstance(value, (int, float)) and not isinstance(value, bool):
-                redacted = redacted.replace(str(value), f"[{slot['id']}]")
-        return redacted
+        return redact_sql_planning_goal(goal, slots, params)
 
     @staticmethod
     def _bound_input_params(state: AgentState) -> dict[str, Any]:
@@ -1292,48 +1345,83 @@ class FinanceAgentRuntime:
         proposal_params = proposal.get("params") or {}
         base_params = state.get("base_query_params") or {}
         merged_params = {**base_params, **proposal_params}
-        slots = state.get("sql_input_slots") or FinanceAgentRuntime._sql_input_slots(merged_params)
-        return {
-            slot["id"]: merged_params[slot["source_param"]]
-            for slot in slots
-            if slot.get("source_param") in merged_params
-        }
+        filter_specs = FinanceAgentRuntime._merge_filter_specs(
+            state.get("base_query_filter_specs") or [], proposal.get("filter_specs") or []
+        )
+        slots = state.get("sql_input_slots") or FinanceAgentRuntime._sql_input_slots(merged_params, filter_specs)
+        return bound_input_params(merged_params, filter_specs, slots)
 
-    def _resolve_base_query_reference(self, state: AgentState) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-        """Resolve the safe candidate number to a session-scoped query card."""
+    @staticmethod
+    def _resolve_range_value(value: Any, value_type: str = "") -> tuple[str, str]:
+        return resolve_range_value(value, value_type)
+
+    @staticmethod
+    def _parse_count(value: str) -> int:
+        return parse_count(value)
+
+    def _resolve_base_query_reference(
+        self, state: AgentState
+    ) -> tuple[dict[str, Any] | None, dict[str, Any], list[dict[str, Any]]]:
+        """Resolve a structured query reference, with legacy candidate fallback."""
         proposal = (state.get("action_validation") or {}).get("proposal") or {}
+        reference = proposal.get("query_reference") or {}
+        query_ids = [str(item) for item in (reference.get("query_ids") or []) if str(item).strip()]
         candidate = proposal.get("base_query_candidate")
-        if candidate is None:
-            return None, {}
-        if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate < 1:
-            return None, {}
-        entries = self.memory_store.query_history(state.get("session_id") or "", limit=5)
-        if candidate > len(entries):
-            return None, {}
-        entry = entries[candidate - 1]
+        if not query_ids and candidate is None:
+            return None, {}, []
+        entries = self.memory_store.query_history(state.get("session_id") or "", limit=50)
+        entry = None
+        if query_ids:
+            entry = next(
+                (
+                    item
+                    for item in entries
+                    if str(item.metadata.get("query_id") or item.id) in query_ids
+                ),
+                None,
+            )
+        else:
+            if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate < 1:
+                return None, {}, []
+            if candidate <= len(entries):
+                entry = entries[candidate - 1]
+        if entry is None:
+            return None, {}, []
         records = self.private_result_store.latest(limit=50, session_id=state.get("session_id"))
         result_ref = str(entry.metadata.get("result_ref") or "")
         record = next((item for item in records if item.result_ref == result_ref), None)
         private_params: dict[str, Any] = {}
+        private_filter_specs: list[dict[str, Any]] = []
         if record:
             source_params = record.metadata.get("source_params")
             if isinstance(source_params, dict):
                 private_params = dict(source_params)
+            source_filter_specs = record.metadata.get("source_filter_specs")
+            if isinstance(source_filter_specs, list):
+                private_filter_specs = [spec for spec in source_filter_specs if isinstance(spec, dict)]
         return {
             "goal": entry.metadata.get("goal") or "",
             "sql_template": entry.metadata.get("sql_template") or "",
             "fields": entry.metadata.get("fields") or [],
             "result_shape": entry.metadata.get("result_shape") or {},
             "row_count": entry.metadata.get("row_count") or 0,
+            "relation": reference.get("relation") or "refine",
             "status": "executed",
-        }, private_params
+        }, private_params, private_filter_specs
+
+    @staticmethod
+    def _merge_filter_specs(
+        base_specs: list[dict[str, Any]], current_specs: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        return merge_filter_specs(base_specs, current_specs)
 
     @staticmethod
     def after_analysis_plan(state: AgentState) -> str:
         if state.get("status") != "analysis_planned":
             return "fail"
-        # 分析计划保留为后端内部规划，不再单独阻塞用户确认。
-        # 所有请求统一继续生成最终 method_drafts，再进入一次 method review。
+        # AnalysisPlan is an internal planning artifact. The current product
+        # scope is read-only, so a valid plan always continues to method
+        # generation and Query Guard without a user-facing review card.
         return "method"
 
     @staticmethod
@@ -1367,19 +1455,16 @@ class FinanceAgentRuntime:
         try:
             # ResponsePlan 中的 SQL / 代码只是意图提示，不能绕过 schema 约束。
             # 唯一可执行来源是已加载可见元数据后的 AnalysisPlan.steps。
-            proposal = (state.get("action_validation") or {}).get("proposal") or {}
             plan = AnalysisPlan.model_validate(state["analysis_plan"])
-            methods = generate_method_drafts(plan, self.handler_registry)
             # SQL 规划器只能看到 input_N 槽位；到这里才把真实值映射回来。
             # 校验器会要求每个槽位都被 SQL 引用，避免参数被悄悄丢弃。
             bound_params = self._bound_input_params(state)
-            methods = [
-                method.model_copy(update={"params": bound_params})
-                for method in methods
-            ]
+            compiled = compile_analysis_plan(plan, self.handler_registry, params=bound_params)
+            methods = [query.method for query in compiled]
             method = methods[0]
             return {
                 **state,
+                "compiled_queries": [query.model_dump(mode="json") for query in compiled],
                 "method_draft": method.model_dump(mode="json"),
                 "method_drafts": [method.model_dump(mode="json") for method in methods],
                 "sql": method.sql_template,
@@ -1445,6 +1530,17 @@ class FinanceAgentRuntime:
             re.IGNORECASE,
         ):
             add(match.group(1))
+        predicate_fields = re.finditer(
+            r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)\s*"
+            r"(?:<>|!=|>=|<=|=|>|<|(?:NOT\s+)?(?:LIKE|ILIKE)|IS(?:\s+NOT)?|IN\s*\()",
+            sql,
+            re.IGNORECASE,
+        )
+        sql_keywords = {"where", "and", "or", "on", "not", "null", "true", "false"}
+        for match in predicate_fields:
+            field = match.group(1)
+            if field.lower() not in sql_keywords and not field.lower().startswith("input_"):
+                add(field)
         return list(dict.fromkeys(fields))
 
     @staticmethod
@@ -1462,18 +1558,6 @@ class FinanceAgentRuntime:
         fields.extend(matches)
         # 去重
         return list(dict.fromkeys(fields))
-
-    async def render_analysis_plan_card(self, state: AgentState) -> AgentState:
-        plan = AnalysisPlan.model_validate(state["analysis_plan"])
-        card = build_analysis_plan_review_card(plan, state.get("selected_skill_detail"))
-        context = render_analysis_plan_review_data(card, self.handler_registry)
-        answer = await generate_reply(context, state["user_query"], self.llm_provider, state.get("conversation_history"))
-        return {
-            **state,
-            "analysis_plan_review_card": card.model_dump(mode="json"),
-            "answer": answer,
-            "status": "analysis_plan_review_ready",
-        }
 
     def review_method(self, state: AgentState) -> AgentState:
         if not state.get("method_draft") and not state.get("method_drafts"):
@@ -1532,7 +1616,54 @@ class FinanceAgentRuntime:
 
     def after_synthetic_check(self, state: AgentState) -> str:
         if state.get("status") == "synthetic_check_passed":
-            return "ok"
+            return "execute"
+        return "repair" if self._should_research_schema(state) else "refuse"
+
+    def query_guard(self, state: AgentState) -> AgentState:
+        """Run all deterministic query checks behind one runtime boundary."""
+        compiled = self._state_compiled_queries(state)
+        if not compiled:
+            return {
+                **state,
+                "status": "query_guard_failed",
+                "errors": state.get("errors", []) + ["no compiled query"],
+            }
+        visible = Catalog.model_validate(state["visible_catalog"]) if state.get("visible_catalog") else Catalog(
+            version="empty", tables=[], business_terms={}
+        )
+        report = QueryGuard(
+            visible,
+            self.policy,
+            self.operation_registry,
+            self.table_registry,
+        ).validate(compiled, extra_tables=state.get("referenced_result_tables") or None)
+        first_review = report.harness_review
+        first_mock = report.mock_result
+        return {
+            **state,
+            "validation_report": report.model_dump(mode="json"),
+            "harness_review": first_review.model_dump(mode="json") if first_review else None,
+            "harness_reviews": [review.model_dump(mode="json") for review in report.harness_reviews],
+            "mock_result": first_mock.model_dump(mode="json") if first_mock else None,
+            "mock_results": [result.model_dump(mode="json") for result in report.mock_results],
+            "internal_method_review": {
+                "status": report.status,
+                "checks": report.checks,
+                "real_database_used": False,
+                "visible_to_user": "summary_only",
+                "repair_attempts": state.get("repair_attempts", 0),
+                "method_count": len(compiled),
+            },
+            "row_count": first_mock.input_summary.get("row_count") if first_mock else None,
+            "status": "query_guard_passed" if report.allowed else "query_guard_failed",
+            "errors": state.get("errors", []) + report.errors,
+        }
+
+    def after_query_guard(self, state: AgentState) -> str:
+        if state.get("status") == "query_guard_passed":
+            # 当前产品范围全部是只读查询；通过 Runtime 校验后直接执行。
+            # 有副作用的能力未来应进入独立命令流程，而不是复用此分支。
+            return "execute"
         return "repair" if self._should_research_schema(state) else "refuse"
 
     @staticmethod
@@ -1549,6 +1680,20 @@ class FinanceAgentRuntime:
         if not self._can_schema_repair(state):
             return False
         error_text = " ".join(str(error).lower() for error in state.get("errors", [])[-5:])
+        # Binding/context errors cannot be repaired by changing tables or SQL.
+        # Stop before entering the schema-research loop and surface the missing
+        # reference or filter to the user-facing failure path.
+        binding_markers = (
+            "placeholders have no bound value",
+            "missing bound value",
+            "unbound sql filter literal",
+            "user input value must use a placeholder",
+            "query reference",
+            "历史查询候选",
+            "上下文引用",
+        )
+        if any(marker in error_text for marker in binding_markers):
+            return False
         infrastructure_markers = (
             "failed to connect",
             "connection refused",
@@ -1602,7 +1747,9 @@ class FinanceAgentRuntime:
             current_sql = state.get("sql") or (state.get("method_draft") or {}).get("sql_template", "")
             user_goal = state.get("action_user_goal") or state["user_query"]
             proposal = (state.get("action_validation") or {}).get("proposal") or {}
-            sql_input_slots = state.get("sql_input_slots") or self._sql_input_slots(proposal.get("params") or {})
+            sql_input_slots = state.get("sql_input_slots") or self._sql_input_slots(
+                proposal.get("params") or {}, proposal.get("filter_specs") or []
+            )
             sql_planning_goal = self._redact_sql_planning_goal(user_goal, sql_input_slots, proposal.get("params") or {})
 
             # 调用 LLM 修复 SQL
@@ -1611,7 +1758,7 @@ class FinanceAgentRuntime:
                 current_sql,
                 error_summary,
                 state.get("visible_catalog"),
-                input_slots=[{"id": slot["id"], "type": slot["type"], "semantic": slot["semantic"]} for slot in sql_input_slots],
+                input_slots=self._planner_input_slots(sql_input_slots),
             )
 
             if repaired_sql:
@@ -1636,6 +1783,7 @@ class FinanceAgentRuntime:
                 )
                 return {
                     **state,
+                    "compiled_queries": [compile_method(method).model_dump(mode="json")],
                     "method_draft": method.model_dump(mode="json"),
                     "method_drafts": [method.model_dump(mode="json")],
                     "sql": repaired_sql,
@@ -1667,6 +1815,7 @@ class FinanceAgentRuntime:
                 )
                 return {
                     **state,
+                    "compiled_queries": [compile_method(method).model_dump(mode="json")],
                     "method_draft": method.model_dump(mode="json"),
                     "method_drafts": [method.model_dump(mode="json")],
                     "repair_attempts": attempts,
@@ -1695,6 +1844,7 @@ class FinanceAgentRuntime:
                 )
                 return {
                     **state,
+                    "compiled_queries": [compile_method(method).model_dump(mode="json")],
                     "method_draft": method.model_dump(mode="json"),
                     "method_drafts": [method.model_dump(mode="json")],
                     "sql": llm_sql,
@@ -1706,10 +1856,12 @@ class FinanceAgentRuntime:
 
             # 回退：从 analysis_plan 生成
             plan = AnalysisPlan.model_validate(state["analysis_plan"]) if state.get("analysis_plan") else AnalysisPlan(goal=user_goal, steps=[])
-            methods = generate_method_drafts(plan, self.handler_registry)
+            compiled = compile_analysis_plan(plan, self.handler_registry, params=self._bound_input_params(state))
+            methods = [query.method for query in compiled]
             method = methods[0]
             return {
                 **state,
+                "compiled_queries": [query.model_dump(mode="json") for query in compiled],
                 "method_draft": method.model_dump(mode="json"),
                 "method_drafts": [method.model_dump(mode="json") for method in methods],
                 "sql": method.sql_template,
@@ -1757,7 +1909,7 @@ class FinanceAgentRuntime:
 2. 只能使用下方列出的表名和字段名；不得猜测替代表或字段
 3. 使用 PostgreSQL 语法
 4. 如果需要多表查询，使用 JOIN
-5. 只能使用下方 input_slots 里的 :input_N 占位符，绝不把筛选实际值写成 SQL 字符串
+5. 只能使用下方 input_slots 里的占位符；范围槽位使用同一组的 _start/_end，绝不把筛选实际值写成 SQL 字符串
 
 可用 input_slots:
 {input_slots or []}
@@ -1968,6 +2120,7 @@ class FinanceAgentRuntime:
 
         return {
             **state,
+            "compiled_queries": [compile_method(method).model_dump(mode="json")],
             "method_draft": method.model_dump(mode="json"),
             "method_drafts": [method.model_dump(mode="json")],
             "sql": method.sql_template,
@@ -1983,9 +2136,18 @@ class FinanceAgentRuntime:
         extra_tables = state.get("referenced_result_tables") or {"prior_result": state.get("referenced_result_data", [])}
         total_rows = sum(len(rows) for rows in extra_tables.values())
 
-        execution = run_simulated_real_execution(method, extra_tables=extra_tables)
+        execution = execute_method(self.executor, method, extra_tables=extra_tables)
         if execution.status != "passed":
-            raise RuntimeError("; ".join(execution.errors) or f"dependent execution failed: {method.name}")
+            diagnostic = "; ".join(execution.errors) or f"dependent execution failed: {method.name}"
+            return self.audit(
+                {
+                    **state,
+                    "status": "method_execution_failed",
+                    "answer": "执行失败。请检查查询条件、筛选值或数据权限后重新发起查询。",
+                    "errors": state.get("errors", []) + ["历史结果分析执行失败"],
+                    "execution_diagnostics": [diagnostic],
+                }
+            )
 
         authorization = DataAuthorizationCard(
             status="pending",
@@ -2010,9 +2172,9 @@ class FinanceAgentRuntime:
             result=card.result,
             row_count=card.row_count,
             metadata={
-                "execution_mode": "dependent",
+                "execution_mode": card.execution_mode,
                 "source_result_ref": state.get("referenced_result_ref"),
-                "real_database_used": False,
+                "real_database_used": card.real_database_used,
             },
         )
         public_memory = self.memory_store.upsert(
@@ -2046,6 +2208,7 @@ class FinanceAgentRuntime:
                 "public_memory_entries": [PublicMemoryEntry.from_record(public_memory).model_dump(mode="json")],
                 "row_count": card.row_count,
                 "answer": answer,
+                "execution_diagnostics": [],
             }
         )
         self._persist_private_analysis(audited)
@@ -2077,6 +2240,7 @@ class FinanceAgentRuntime:
         )
 
     async def _prepare_method_after_analysis_plan(self, state: AgentState) -> AgentState:
+        """Compatibility path for an already-pending legacy review run."""
         next_state = self.generate_method(state)
         while True:
             next_state = self.review_method(next_state)
@@ -2100,6 +2264,12 @@ class FinanceAgentRuntime:
             return [MethodDraft.model_validate(method) for method in state["method_drafts"]]
         return [MethodDraft.model_validate(state["method_draft"])]
 
+    @staticmethod
+    def _state_compiled_queries(state: AgentState) -> list[CompiledQuery]:
+        if state.get("compiled_queries"):
+            return [CompiledQuery.model_validate(query) for query in state["compiled_queries"]]
+        return [compile_method(method) for method in FinanceAgentRuntime._state_methods(state)]
+
     def audit(self, state: AgentState) -> AgentState:
         execution_card = self._safe_audit_execution_card(state.get("execution_result_card"))
         execution_cards = [
@@ -2122,8 +2292,10 @@ class FinanceAgentRuntime:
             "user_query": state.get("user_query"),
             "status": state.get("status"),
             "errors": state.get("errors", []),
+            "execution_diagnostics": state.get("execution_diagnostics", []),
             "tool_decision": state.get("tool_decision"),
             "response_plan": state.get("response_plan"),
+            "query_request": state.get("query_request"),
             "action_validation": state.get("action_validation"),
             "selected_skill_detail": state.get("selected_skill_detail"),
             "planner_used": state.get("planner_used"),
@@ -2136,6 +2308,7 @@ class FinanceAgentRuntime:
             "mock_result": mock_result,
             "mock_results": mock_results,
             "internal_method_review": state.get("internal_method_review"),
+            "validation_report": self._validation_report_summary(state.get("validation_report")),
             "repair_attempts": state.get("repair_attempts"),
             "repair_history": state.get("repair_history"),
             "method_review_card": state.get("method_review_card"),
@@ -2193,6 +2366,17 @@ class FinanceAgentRuntime:
             conversation_history.append({"role": "assistant", "content": answer})
 
         return {**state, "audit": audit, "conversation_history": conversation_history}
+
+    @staticmethod
+    def _validation_report_summary(value: Any) -> dict[str, Any] | None:
+        """Keep audit data inspectable without duplicating mock/result rows."""
+        if not isinstance(value, dict):
+            return None
+        return {
+            key: value.get(key)
+            for key in ("status", "allowed", "errors", "warnings", "checks")
+            if key in value
+        }
 
     @staticmethod
     def _safe_audit_execution_card(value: Any) -> dict[str, Any] | None:

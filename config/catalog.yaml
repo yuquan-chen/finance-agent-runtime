@@ -72,6 +72,10 @@ tables:
         sensitive: false
     relationships: []
 business_terms:
+  virtual_account_transaction:
+    description: "虚拟账户（VA）交易查询，使用虚拟账户交易表。"
+    aliases: ["VA", "va", "虚拟账户", "虚拟账户交易", "VA交易"]
+    candidate_tables: ["va_transaction"]
   kyc_status:
     description: "客户 KYC/KYB 状态查询，第一版以账户表中的状态字段为主。"
     aliases: ["KYC", "KYB", "kyc", "kyb", "身份认证", "身份验证", "合规状态"]

@@ -1,0 +1,42 @@
+version: "2026-09-07"
+description: "Canonical database values and business-language aliases."
+tables:
+  va_transaction:
+    status:
+      semantic_aliases: ["状态", "交易状态"]
+      values:
+        completed: ["success", "succeeded", "settled", "成功", "已完成", "完成"]
+    type:
+      semantic_aliases: ["类型", "交易类型"]
+      values:
+        deposit: ["入金", "充值", "收款"]
+        payment: ["支付", "付款"]
+  card_transaction:
+    status:
+      semantic_aliases: ["状态", "交易状态"]
+      values:
+        completed: ["success", "succeeded", "settled", "成功", "已完成", "完成"]
+    type:
+      semantic_aliases: ["类型", "交易类型"]
+      values:
+        consumption: ["消费", "购买", "purchase"]
+  pay_transaction:
+    status:
+      semantic_aliases: ["状态", "交易状态"]
+      values:
+        completed: ["success", "succeeded", "settled", "成功", "已完成", "完成"]
+    type:
+      semantic_aliases: ["类型", "交易类型", "订单类型"]
+      values:
+        payment: ["支付", "支付订单", "付款"]
+        refund: ["退款"]
+  payout_transaction:
+    status:
+      semantic_aliases: ["状态", "交易状态"]
+      values:
+        completed: ["success", "succeeded", "settled", "成功", "已完成", "完成"]
+  account_transaction:
+    status:
+      semantic_aliases: ["状态", "交易状态"]
+      values:
+        completed: ["success", "succeeded", "settled", "成功", "已完成", "完成"]

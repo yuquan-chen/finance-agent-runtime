@@ -58,7 +58,12 @@ class ExecutorRegistry:
         factory = self.get(mode)
         if not factory:
             raise ValueError(f"unsupported executor mode: {mode}")
-        return factory(settings, policy)
+        executor = factory(settings, policy)
+        if not callable(getattr(executor, "execute_method", None)):
+            raise TypeError(
+                f"executor mode {mode!r} must implement execute_method(method, extra_tables=...)"
+            )
+        return executor
 
 
 # ---------------------------------------------------------------------------

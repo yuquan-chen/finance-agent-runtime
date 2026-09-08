@@ -25,6 +25,7 @@ docs/
 !docs/
 docs/*
 !docs/product_prd_summary.md
+!docs/dogpay_admin_agent_product.md
 STARTUP.md
 
 # Python build

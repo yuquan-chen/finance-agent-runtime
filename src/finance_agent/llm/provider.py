@@ -74,6 +74,39 @@ class OpenAICompatibleLlmProvider:
         self.settings = settings
         self._json_format_supported: bool | None = None  # 缓存格式检测结果
 
+    def _post_chat_completion(
+        self,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        timeout: int,
+    ) -> httpx.Response:
+        """Make a bounded retry for transient upstream transport failures."""
+        retryable_statuses = {408, 429, 500, 502, 503, 504}
+        last_response: httpx.Response | None = None
+        attempts = max(1, self.settings.lmstudio_retry_attempts)
+        for attempt in range(attempts):
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    response = client.post(
+                        f"{self.settings.lmstudio_base_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    )
+                last_response = response
+            except httpx.TransportError:
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(0.4 * (attempt + 1))
+                continue
+
+            if response.status_code not in retryable_statuses or attempt + 1 >= attempts:
+                return response
+            time.sleep(0.4 * (attempt + 1))
+
+        if last_response is None:
+            raise RuntimeError("LLM request ended without a response")
+        return last_response
+
     def chat(
         self,
         messages: list[Message],
@@ -98,16 +131,15 @@ class OpenAICompatibleLlmProvider:
             "Content-Type": "application/json",
         }
         timeout = timeout_seconds or self.settings.lmstudio_timeout_seconds
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(f"{self.settings.lmstudio_base_url}/chat/completions", headers=headers, json=payload)
-            if response.status_code != 200:
-                error_detail = response.text
-                raise httpx.HTTPStatusError(
-                    f"LM Studio 返回错误: {response.status_code} - {error_detail}",
-                    request=response.request,
-                    response=response,
-                )
-            data = response.json()
+        response = self._post_chat_completion(payload, headers, timeout)
+        if response.status_code != 200:
+            error_detail = response.text
+            raise httpx.HTTPStatusError(
+                f"LM Studio 返回错误: {response.status_code} - {error_detail}",
+                request=response.request,
+                response=response,
+            )
+        data = response.json()
         message = data["choices"][0]["message"]
         # DeepSeek 返回 reasoning_content 和 content，优先用 content
         content = message.get("content") or message.get("reasoning_content") or ""
@@ -157,20 +189,15 @@ class OpenAICompatibleLlmProvider:
             "Content-Type": "application/json",
         }
         timeout = timeout_seconds or self.settings.lmstudio_timeout_seconds
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(
-                f"{self.settings.lmstudio_base_url}/chat/completions",
-                headers=headers,
-                json=payload,
+        response = self._post_chat_completion(payload, headers, timeout)
+        if response.status_code != 200:
+            error_detail = response.text
+            raise httpx.HTTPStatusError(
+                f"LM Studio 返回错误: {response.status_code} - {error_detail}",
+                request=response.request,
+                response=response,
             )
-            if response.status_code != 200:
-                error_detail = response.text
-                raise httpx.HTTPStatusError(
-                    f"LM Studio 返回错误: {response.status_code} - {error_detail}",
-                    request=response.request,
-                    response=response,
-                )
-            data = response.json()
+        data = response.json()
 
         message = data["choices"][0]["message"]
         calls: list[LlmToolCall] = []

@@ -133,6 +133,24 @@ def _validate_sql_parameter_bindings(sql: str, params: dict[str, object]) -> lis
                 if normalized_literal == normalized_value:
                     errors.append(f"user input value must use a placeholder, not a SQL literal: {name}")
                     break
+
+    # A planner may still invent a business filter such as
+    # ``type = 'payment'`` even when no input slot exists. That is more
+    # dangerous than a validation error: the query can return plausible but
+    # semantically wrong data. Filter literals must therefore be parameterized
+    # as well; SQL function literals such as DATE_TRUNC('month', ...) do not
+    # match this predicate and remain allowed.
+    filter_literal_pattern = re.compile(
+        r"(?:\s*(?:<>|!=|>=|<=|=|>|<)\s*|\b(?:NOT\s+)?(?:LIKE|ILIKE)\s*|\bIN\s*\(\s*)"
+        r"'((?:''|[^'])*)'",
+        re.IGNORECASE,
+    )
+    for match in filter_literal_pattern.finditer(sql):
+        literal = match.group(1).replace("''", "'").strip()
+        errors.append(
+            "unbound SQL filter literal is not allowed; use a declared input placeholder"
+            + (f" (literal: {literal})" if literal else "")
+        )
     return errors
 
 

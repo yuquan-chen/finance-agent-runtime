@@ -19,15 +19,49 @@ _FOLLOWUP_MARKERS = (
     "再加",
     "添加",
     "刚才",
-    "上一",
-    "之前",
     "继续",
     "分组",
     "拆分",
+    "展开",
+    "明细",
+    "详细",
+    "筛选",
+    "过滤",
     "the previous",
     "sort",
     "order",
     "only",
+)
+_HISTORICAL_REFERENCE_MARKERS = (
+    "刚才的查询",
+    "之前的查询",
+    "上次的查询",
+    "上一条查询",
+    "历史查询",
+    "之前的结果",
+    "刚才的结果",
+    "上次的结果",
+    "以前的查询",
+    "以前的结果",
+    "这两个结果",
+    "这两条结果",
+    "两个查询",
+    "两次查询",
+)
+_LATEST_QUERY_MARKERS = (
+    "刚才查询",
+    "刚才的查询",
+    "刚刚查询",
+    "刚刚的查询",
+    "最近一次查询",
+    "最近一次的查询",
+    "上一次查询",
+    "上一次的查询",
+    "上一条查询",
+    "刚才的结果",
+    "刚刚的结果",
+    "最近一次结果",
+    "上一次的结果",
 )
 _STOP_WORDS = {
     "查询", "统计", "分析", "查看", "请", "帮我", "一下", "记录", "数据", "结果",
@@ -104,12 +138,56 @@ def _is_followup(query: str) -> bool:
     return bool(re.search(r"(?:按|按照).*(?:排序|拆分|分组|筛选|过滤)", lowered))
 
 
+def is_explicit_query_continuation(user_query: str) -> bool:
+    """Return whether the user explicitly asks to continue a prior query.
+
+    Query history is opt-in.  A standalone request such as ``统计上个月的
+    交易`` must not inherit the previous query merely because the session has
+    one.  Transformation requests (``按金额排序``) remain valid follow-ups,
+    while relative time phrases such as ``上一年`` do not match any history
+    marker by themselves.
+    """
+    text = str(user_query or "").strip().casefold()
+    if not text:
+        return False
+    if parse_candidate_reply(text) is not None:
+        return True
+    if is_explicit_historical_reference(text, text):
+        return True
+    if _is_followup(text):
+        return True
+    return bool(
+        re.search(
+            r"(?:这(?:批|些|\s*\d+\s*笔|\s*[一二两三四五六七八九十百千万]+\s*笔)|该|上述|它们).{0,12}(?:订单|交易|结果|记录|查询|数据)",
+            text,
+        )
+    )
+
+
+def is_explicit_historical_reference(current_goal: str, user_query: str) -> bool:
+    """Distinguish historical-result comparison from multi-angle analysis.
+
+    This is a safety boundary for the structured reference field, not the
+    primary router.  A request such as "从多个方面分析" must remain a new
+    analysis over one dataset; multiple query ids are reserved for an
+    explicitly named historical comparison.
+    """
+    text = f"{current_goal} {user_query}".casefold()
+    return any(marker.casefold() in text for marker in _HISTORICAL_REFERENCE_MARKERS)
+
+
+def _requests_latest_query(user_query: str) -> bool:
+    lowered = str(user_query or "").casefold()
+    return any(marker.casefold() in lowered for marker in _LATEST_QUERY_MARKERS)
+
+
 def select_query_candidate(
     entries: list[dict[str, Any]],
     *,
     candidate: int | None,
     current_goal: str,
     user_query: str,
+    query_ids: list[str] | None = None,
     confirmed_candidate: int | None = None,
 ) -> dict[str, Any]:
     """返回安全历史查询候选的选择结果。
@@ -131,6 +209,7 @@ def select_query_candidate(
         [
             {
                 "query_candidate": entry.get("query_candidate"),
+                "query_id": entry.get("query_id"),
                 "goal": entry.get("goal") or entry.get("name") or "历史查询",
                 "score": _score(f"{current_goal} {user_query}", entry),
             }
@@ -142,12 +221,71 @@ def select_query_candidate(
     second_score = ranked[1]["score"] if len(ranked) > 1 else -1
     margin = top["score"] - second_score
 
+    requested_query_ids = [str(item) for item in (query_ids or []) if str(item).strip()]
+    if _requests_latest_query(user_query):
+        # "刚才查询/刚才的结果" is an ordinal reference, not a semantic
+        # search.  The context projection is already ordered newest first;
+        # do not let the model select an older query because its SQL happens
+        # to share more words with "展开明细".
+        latest = next(
+            (item for item in ranked if item.get("query_candidate") == entries[0].get("query_candidate")),
+            None,
+        )
+        if latest is not None:
+            return {
+                "status": "selected",
+                "selected_candidate": latest["query_candidate"],
+                "selected_query_id": latest.get("query_id"),
+                "selected_query_ids": [str(latest.get("query_id"))] if latest.get("query_id") else [],
+                "selected_goal": latest.get("goal") or "",
+                "resolution": "latest",
+                "ranked": ranked,
+            }
+    if requested_query_ids:
+        if len(requested_query_ids) > 1:
+            matched = [
+                item
+                for item in ranked
+                if str(item.get("query_id") or "") in requested_query_ids
+            ]
+            if len(matched) != len(requested_query_ids):
+                message = "部分历史查询无法在当前会话中定位，请重新选择查询。"
+            else:
+                message = "当前查询一次只能展开一条历史查询，请先选择具体的查询。"
+            return {
+                "status": "ambiguous",
+                "selected_candidate": None,
+                "selected_query_id": None,
+                "ranked": ranked,
+                "message": message,
+            }
+        selected = next(
+            (item for item in ranked if str(item.get("query_id") or "") in requested_query_ids),
+            None,
+        )
+        if selected is None:
+            return {
+                "status": "ambiguous",
+                "selected_candidate": None,
+                "selected_query_id": None,
+                "ranked": ranked,
+                "message": "引用的历史查询已不存在或不属于当前会话，请重新说明查询条件。",
+            }
+        return {
+            "status": "selected",
+            "selected_candidate": selected["query_candidate"],
+            "selected_query_id": selected.get("query_id"),
+            "selected_query_ids": requested_query_ids,
+            "ranked": ranked,
+        }
+
     if confirmed_candidate is not None:
         selected = next((item for item in ranked if item["query_candidate"] == confirmed_candidate), None)
         if selected is not None:
             return {
                 "status": "selected",
                 "selected_candidate": confirmed_candidate,
+                "selected_query_id": selected.get("query_id"),
                 "ranked": ranked,
             }
 
@@ -161,11 +299,26 @@ def select_query_candidate(
                 "message": "引用的历史查询候选已不存在，请重新说明要修改哪一次查询。",
             }
         if len(ranked) == 1 or (selected["query_candidate"] == top["query_candidate"] and selected["score"] >= 2 and margin >= 2):
-            return {"status": "selected", "selected_candidate": candidate, "ranked": ranked}
+            return {
+                "status": "selected",
+                "selected_candidate": candidate,
+                "selected_query_id": selected.get("query_id"),
+                "ranked": ranked,
+            }
     elif _is_followup(user_query) and len(ranked) == 1:
-        return {"status": "selected", "selected_candidate": top["query_candidate"], "ranked": ranked}
+        return {
+            "status": "selected",
+            "selected_candidate": top["query_candidate"],
+            "selected_query_id": top.get("query_id"),
+            "ranked": ranked,
+        }
     elif _is_followup(user_query) and top["score"] >= 2 and margin >= 2:
-        return {"status": "selected", "selected_candidate": top["query_candidate"], "ranked": ranked}
+        return {
+            "status": "selected",
+            "selected_candidate": top["query_candidate"],
+            "selected_query_id": top.get("query_id"),
+            "ranked": ranked,
+        }
     elif not _is_followup(user_query):
         return {"status": "none", "selected_candidate": None, "ranked": ranked}
 

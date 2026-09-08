@@ -26,6 +26,7 @@ class Settings:
     lmstudio_model: str
     lmstudio_api_key: str
     lmstudio_timeout_seconds: int
+    lmstudio_retry_attempts: int
     result_narration_timeout_seconds: int
     executor_mode: str
     database_url: str
@@ -58,6 +59,7 @@ def get_settings() -> Settings:
         lmstudio_model=os.environ.get("LMSTUDIO_MODEL", "qwen2.5-coder-7b-instruct-mlx"),
         lmstudio_api_key=os.environ.get("LMSTUDIO_API_KEY", "lm-studio"),
         lmstudio_timeout_seconds=int(os.environ.get("LMSTUDIO_TIMEOUT_SECONDS", "30")),
+        lmstudio_retry_attempts=max(1, int(os.environ.get("LMSTUDIO_RETRY_ATTEMPTS", "2"))),
         result_narration_timeout_seconds=int(os.environ.get("RESULT_NARRATION_TIMEOUT_SECONDS", "8")),
         executor_mode=os.environ.get("EXECUTOR_MODE", "mock"),
         database_url=os.environ.get("DATABASE_URL", ""),

@@ -14,11 +14,28 @@ from finance_agent.operations.handler_registry import OperationHandlerRegistry
 from finance_agent.operations.registry import OperationRegistry
 from finance_agent.skills.registry import SkillRegistry
 from finance_agent.chat.tool_registry import build_skill_tools
+from finance_agent.memory.query_candidate_selector import is_explicit_query_continuation
 
 
 # ---------------------------------------------------------------------------
 # 核心类型
 # ---------------------------------------------------------------------------
+
+
+class QueryReference(BaseModel):
+    """结构化的历史查询引用，不暴露私有结果句柄。"""
+
+    mode: Literal["none", "query", "queries"] = "none"
+    query_ids: list[str] = Field(default_factory=list)
+    relation: Literal[
+        "refine",
+        "change_filter",
+        "change_time",
+        "sort",
+        "group",
+        "expand_detail",
+        "compare",
+    ] = "refine"
 
 
 class MethodProposal(BaseModel):
@@ -29,6 +46,8 @@ class MethodProposal(BaseModel):
     result_refs: list[str] = Field(default_factory=list)
     # 当前会话安全查询卡的候选编号（1=最新）。不是 result_ref，也不直接代表结果数据。
     base_query_candidate: int | None = None
+    # 结构化的历史查询引用。候选编号仅保留给旧客户端和旧历史数据。
+    query_reference: QueryReference = Field(default_factory=QueryReference)
     goal: str = ""                          # 分析目标
     preferred_runtime: str = "auto"         # sql | python | auto
     reason: str = ""
@@ -36,6 +55,9 @@ class MethodProposal(BaseModel):
     schema_search_terms: list[str] = Field(default_factory=list)
     sql: str | None = None                  # LLM 自写的 SQL（当通用操作不覆盖时）
     params: dict[str, Any] = Field(default_factory=dict)  # SQL 参数值，如 {"customer_name": "Company 10"}
+    # Tool filters retain operator/type semantics for the private binding layer.
+    # They are never sent to the SQL planner with their values.
+    filter_specs: list[dict[str, Any]] = Field(default_factory=list)
     code: str | None = None                 # LLM 自写的 Python 代码
 
 
@@ -147,6 +169,11 @@ INSTRUCTIONS = """# 角色
     "entity_type": "capability 或 skill，无匹配留空",
     "result_refs": [],
     "base_query_candidate": null,
+    "query_reference": {
+      "mode": "none",
+      "query_ids": [],
+      "relation": "refine"
+    },
     "goal": "不包含用户实际筛选值的分析目标",
     "preferred_runtime": "sql | python | auto",
     "reason": "简短原因",
@@ -161,7 +188,7 @@ INSTRUCTIONS = """# 角色
 
 ## 0. 模型路由协议
 - 如果请求只是说明、能力咨询、帮助或闲聊，直接返回自然语言 message，不调用 Skill。
-- 如果请求需要业务能力，优先调用 context.skills 中唯一匹配的 Skill function；tool 参数只包含 goal 和用户明确提供的 params。
+- 如果请求需要业务能力，优先调用 context.skills 中唯一匹配的 Skill function；调用参数必须遵循该 function 声明的 input schema。
 - Skill function 只表示业务入口；身份校验、权限、Schema 校验、审计、审批、状态保存和执行均由系统 Runtime 完成，不作为模型工具。
 - 不要生成 SQL，也不要调用未出现在 context.skills 中的名称。
 
@@ -206,15 +233,17 @@ skill > capability > operations > 新查询
   绝不能填客户名称、账户号、金额、日期等用户实际筛选值，也不能填猜测的表名或字段名。
 - 用户补充筛选、字段、时间或排序要求时，结合最近聊天消息，把原需求和新要求合并到 goal。
 - 【连续查询强制规则】如果最近一条消息只是补充、修改或指代上一条数据请求（例如“按金额排序”“改成近三个月”“只看失败的”“再加上渠道”），必须继承上一条请求的查询对象、时间范围和筛选条件，生成一条完整的新 goal；不得把它当成新的、信息不足的问题，也不得要求用户重复主体。
-- 补充排序/字段/时间时，保留上一条请求中仍然有效的 params；只有用户明确替换筛选值时才替换对应 params。
-- 例如：上一条“查询 Company 11 近一年的付款记录”，当前“按金额排序吧” → goal 必须为“查询指定公司近一年的付款记录，并按金额降序排序”，params 仍为 {"customer_name": "Company 11"}。
+- 补充排序/字段/时间时，继承上一条请求中仍然有效的查询约束；具体值由系统在后续查询阶段绑定。
+- 连续查询中的筛选值由系统从用户请求和安全会话状态中解析，不把数据库字段名或 SQL 放入 Skill function 参数。
+- 如果当前消息引用了历史查询，必须填写 query_reference：从 context.prior_results.entries 中选择已有的 query_id，填写 relation；不要使用 result_ref，也不要猜造 query_id。
+- “把统计结果列出来”“查看这些订单”“展开具体记录”等请求属于 expand_detail；“改时间/改状态/只看某类”属于 change_time 或 change_filter；明确比较多次查询时使用 queries + compare。
+- “从多个方面分析”“多个维度分析”“多个方法比较”表示对同一个业务对象生成多个互补分析步骤，query_reference 必须使用 mode=none、query_ids=[]；这不是比较历史查询。
+- 只有用户明确说“刚才/之前/上次的查询或结果”“这两个结果”等历史对象时，才使用 mode=queries；不要因为 context.prior_results 中有多条记录就自动填入多个 query_id。
+- 如果无法确定引用哪条历史查询，query_reference.mode 设为 none，并通过 message 请求澄清，不要猜测。
 
-# 命名参数规则
-- params 字段只存储用户提供、将用于筛选的数据值；排序字段、"近一年"这类查询语义不要放入 params。
-- goal 必须使用脱值描述，绝不能复述 params 中的实际值。例如用户说"查询 Company 10 的 KYC 状态"，goal 写"查询指定公司的 KYC 状态"。
-- 从用户输入中提取参数值，不要写死在 goal 中，更不要写 SQL 中
-- 【强制】不要改变参数值的大小写！用户输入什么就保留什么
-- 例如用户说"查询 Company 10 的 KYC 状态"，则 params: {"customer_name": "Company 10"}。
+# 查询值规则
+- Skill function 参数必须遵循已注册的 input schema；不要写入表名、字段名或 SQL。
+- goal 只表达用户目标；具体筛选值由后续受控查询流程解析和绑定。
 - result_refs 必须始终为空；内部结果句柄不属于你的输出。
 - 所有后续查询都走“重新生成查询路径”：参考安全的历史 goal/参数化 SQL，重新生成完整 SQL，
   再按当前最新数据执行。不要尝试直接读取或计算上一次结果。
@@ -319,10 +348,18 @@ def plan_response_with_llm_and_registry(
     if safety:
         return safety
 
+    # Query history is opt-in.  A session can contain many earlier business
+    # questions, but they must not shape a new request unless the user clearly
+    # asks to continue, modify, or expand one of them.
+    continuing_query = is_explicit_query_continuation(message)
+
     # Layer 1: Instructions（稳定，可缓存）
     # Layer 2: Context（动态，每轮更新）
     # Layer 3: User query（纯用户消息）
-    all_memory = public_memory_context or []
+    effective_memory = public_memory_context if continuing_query else []
+    effective_relevant_memories = relevant_memories if continuing_query else []
+    effective_conversation_messages = conversation_messages if continuing_query else []
+    all_memory = effective_memory or []
     new_memory = all_memory[sent_memory_count:]  # 增量：只发新增的 memory
     context_block = build_context_block(
         capability_manifest=operation_registry.manifest_for_llm() if operation_registry else None,
@@ -332,7 +369,7 @@ def plan_response_with_llm_and_registry(
         handler_manifest=handler_registry.manifest_for_llm() if handler_registry else None,
         business_term_manifest=business_term_registry.manifest_for_llm() if business_term_registry else None,
         table_summary=table_manifest,
-        relevant_memories=relevant_memories,
+        relevant_memories=effective_relevant_memories,
         table_detail_level=table_detail_level,
     )
 
@@ -343,8 +380,8 @@ def plan_response_with_llm_and_registry(
     ]
 
     # 注入对话历史（最近 6 轮）
-    if conversation_messages:
-        for msg in conversation_messages[-12:]:  # 最近 12 条消息（6 轮对话）
+    if effective_conversation_messages:
+        for msg in effective_conversation_messages[-12:]:  # 最近 12 条消息（6 轮对话）
             if hasattr(msg, 'type') and hasattr(msg, 'content'):
                 # LangChain 消息对象
                 role = "user" if msg.type == "human" else "assistant"
@@ -396,6 +433,8 @@ def _try_model_tool_call(
                     "这类回答只能依据 context 中的已注册能力，保持简洁，不要虚构表名、字段名或未注册的业务类型。"
                     "除非用户要求，否则不要堆叠示例。"
                     "不要因为上下文里出现某个 Skill 就调用它；不要调用与用户目标无关的 Skill。"
+                    "如果用户是在延续、修改或展开历史查询，必须在 function arguments.query_reference 中填写 context.prior_results.entries 里的 query_id 和 relation。"
+                    "如果用户说的是从多个方面/多个维度分析同一个业务对象，这是一次新的多步骤分析，query_reference 必须为空；只有明确比较刚才、之前或上次的查询结果时才填写多个 query_id。"
                 ),
             },
             *messages[1:],
@@ -421,19 +460,113 @@ def _plan_from_tool_calls(
             method_proposal=None,
             confidence=0.0,
         )
-    arguments = call.arguments if isinstance(call.arguments, dict) else {}
-    params = arguments.get("params")
+    arguments = dict(call.arguments) if isinstance(call.arguments, dict) else {}
+    # ``params`` belonged to the old open-ended tool contract. Accept it from
+    # older clients, but keep it out of the current model-visible schema.
+    legacy_params = arguments.pop("params", None)
+    if isinstance(legacy_params, dict) and "filters" not in arguments:
+        # Old callers had no filters field; validate them against the new
+        # closed contract without changing the compatibility input.
+        arguments["filters"] = []
+    arguments = _complete_filter_value_types(arguments)
+    argument_errors = skill.tool.validate_arguments(arguments)
+    if argument_errors:
+        return ResponsePlan(
+            message="这个业务请求的调用参数不完整，请重新描述你想查询的内容。",
+            method_proposal=None,
+            confidence=0.0,
+        )
+    params = _params_from_tool_filters(arguments.get("filters"))
+    filter_specs = _filter_specs_from_tool_filters(arguments.get("filters"))
+    if isinstance(legacy_params, dict):
+        params = {**params, **legacy_params}
     return ResponsePlan(
         message="",
         method_proposal=MethodProposal(
             entity_id=skill.name,
             entity_type="skill",
-            goal=str(arguments.get("goal") or message.strip()),
-            params=params if isinstance(params, dict) else {},
+            goal=str(arguments["goal"]),
+            params=params,
+            filter_specs=filter_specs,
+            query_reference=_parse_query_reference(arguments.get("query_reference")),
             reason=f"LLM selected registered skill: {skill.name}",
         ),
         confidence=1.0,
     )
+
+
+def _parse_query_reference(value: Any) -> QueryReference:
+    """Normalize the optional tool argument while keeping old tool clients valid."""
+    if not isinstance(value, dict):
+        return QueryReference()
+    if "query_id" in value and "query_ids" not in value:
+        value = {**value, "query_ids": [value["query_id"]]}
+    try:
+        return QueryReference.model_validate(value)
+    except Exception:
+        return QueryReference()
+
+
+def _params_from_tool_filters(filters: Any) -> dict[str, Any]:
+    """Convert generic business filters into the existing private bind map."""
+    if not isinstance(filters, list):
+        return {}
+    params: dict[str, Any] = {}
+    for item in filters:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip() and "value" in item:
+            params[name.strip()] = item["value"]
+    return params
+
+
+def _complete_filter_value_types(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Fill the semantic type for pre-schema legacy callers."""
+    filters = arguments.get("filters")
+    if not isinstance(filters, list):
+        return arguments
+    completed: list[Any] = []
+    for item in filters:
+        if not isinstance(item, dict) or "value_type" in item:
+            completed.append(item)
+            continue
+        value = item.get("value")
+        operator = item.get("operator")
+        if operator == "between":
+            value_type = "date_range" if isinstance(value, str) else "list"
+        elif isinstance(value, bool):
+            value_type = "boolean"
+        elif isinstance(value, (int, float)):
+            value_type = "number"
+        elif isinstance(value, list):
+            value_type = "list"
+        else:
+            value_type = "text"
+        completed.append({**item, "value_type": value_type})
+    return {**arguments, "filters": completed}
+
+
+def _filter_specs_from_tool_filters(filters: Any) -> list[dict[str, Any]]:
+    """Keep generic filter semantics available to the backend binder."""
+    if not isinstance(filters, list):
+        return []
+    specs: list[dict[str, Any]] = []
+    for item in filters:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip() or "value" not in item:
+            continue
+        spec = {
+            "name": name.strip(),
+            "operator": item.get("operator", "eq"),
+        }
+        value_type = item.get("value_type")
+        if isinstance(value_type, str) and value_type.strip():
+            spec["value_type"] = value_type.strip()
+        specs.append(spec)
+    return specs
 
 
 def validate_response_plan(
@@ -553,11 +686,13 @@ def _validate_proposal(
         result_refs=[],
         goal=user_goal,
         base_query_candidate=proposal.base_query_candidate,
+        query_reference=proposal.query_reference,
         preferred_runtime=proposal.preferred_runtime,
         reason=proposal.reason,
         schema_search_terms=_safe_schema_search_terms(proposal.schema_search_terms, proposal.params),
         sql=proposal.sql,
         params=proposal.params,
+        filter_specs=proposal.filter_specs,
     )
 
     # 路由：有 result_refs → result_ref_flow（现在合并到 method_flow）

@@ -17,40 +17,19 @@ def build_skill_tools(skill_registry: SkillRegistry | None) -> list[dict[str, An
 
     tools: list[dict[str, Any]] = []
     for skill in skill_registry.skills:
-        name = skill.entrypoint or skill.name
-        description_parts = [
-            part.strip()
-            for part in (
-                skill.title,
-                skill.description,
-                f"能力类型：{skill.kind}",
-                f"适用场景：{'；'.join(skill.when_to_use)}" if skill.when_to_use else "",
-            )
-            if isinstance(part, str) and part.strip()
-        ]
-        description = ". ".join(description_parts)
+        tool = skill.tool
+        if tool.exposure != "direct":
+            continue
+        name = skill.tool_name()
+        description = tool.description or skill.description or skill.title or name
         tools.append(
             {
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": description or name,
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "goal": {
-                                "type": "string",
-                                "description": "用户希望完成的业务目标，不要生成 SQL。",
-                            },
-                            "params": {
-                                "type": "object",
-                                "description": "用户明确提供的筛选值；没有筛选值时传空对象。",
-                                "additionalProperties": True,
-                            },
-                        },
-                        "required": ["goal"],
-                        "additionalProperties": False,
-                    },
+                    "description": description,
+                    "parameters": tool.input_schema,
+                    "strict": tool.strict,
                 },
             }
         )

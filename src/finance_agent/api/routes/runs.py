@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
@@ -120,7 +121,13 @@ async def create_run_stream(
             mod._sync_pending_review(state)
             yield f"data: {json.dumps({'type': 'complete', 'data': _response(state).model_dump()})}\n\n"
         except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            if isinstance(exc, httpx.TransportError):
+                message = "模型服务连接失败，请稍后重试。"
+            elif isinstance(exc, TimeoutError):
+                message = "模型服务响应超时，请稍后重试。"
+            else:
+                message = str(exc)
+            yield f"data: {json.dumps({'type': 'error', 'message': message})}\n\n"
 
     return StreamingResponse(
         event_generator(),

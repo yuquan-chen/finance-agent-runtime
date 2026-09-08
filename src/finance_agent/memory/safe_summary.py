@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from typing import Any
 
 from finance_agent.harness.analysis_schema import ExecutionResultCard, MethodDraft
@@ -23,8 +24,11 @@ def build_public_memory_entry(
     # 构建查询结果摘要
     result_summary = _build_result_summary(execution_card.result, execution_card.row_count)
 
+    query_id_source = f"{session_id}:{plan_result_ref or private_record.result_ref}"
+    query_id = f"query_{hashlib.sha256(query_id_source.encode('utf-8')).hexdigest()[:24]}"
     return PublicMemoryEntry(
         memory_id=f"memory_{private_record.result_ref}",
+        query_id=query_id,
         request_id=request_id,
         session_id=session_id,
         result_ref=private_record.result_ref,

@@ -11,7 +11,6 @@ from typing import Any
 from finance_agent.audit.audit_logger import stable_hash
 from finance_agent.harness.analysis_schema import (
     AnalysisPlan,
-    AnalysisPlanReviewCard,
     DataAuthorizationCard,
     ExecutionResultCard,
     MethodDraft,
@@ -62,50 +61,6 @@ def build_method_set_review_card(
         risk_level=risk_level,
         approval_required=True,
     )
-
-
-def build_analysis_plan_review_card(
-    plan: AnalysisPlan,
-    selected_skill_detail: dict | None = None,
-) -> AnalysisPlanReviewCard:
-    return AnalysisPlanReviewCard(
-        goal=plan.goal,
-        skill_id=(selected_skill_detail or {}).get("skill_id"),
-        skill_title=(selected_skill_detail or {}).get("title"),
-        assumptions=plan.assumptions,
-        steps=plan.steps,
-        required_metadata=plan.required_metadata,
-        real_data_read=False,
-        approval_required=True,
-    )
-
-
-def render_analysis_plan_review_data(
-    card: AnalysisPlanReviewCard,
-    registry: OperationHandlerRegistry | None = None,
-) -> dict[str, Any]:
-    """渲染分析计划审查数据（返回结构化数据，不生成文字）"""
-    registry = registry or get_default_registry()
-    steps_data = []
-    if card.steps:
-        for step in card.steps:
-            handler = registry.get(step.operation)
-            title = handler.title if handler else step.operation
-            description = step.rationale or (handler.description if handler else "")
-            steps_data.append({
-                "operation": step.operation,
-                "title": title,
-                "description": description,
-            })
-
-    return {
-        "type": "analysis_plan_review",
-        "step_count": len(steps_data),
-        "steps": steps_data,
-        "field_count": len(card.required_metadata),
-        "fields": card.required_metadata,
-        "requires_authorization": card.approval_required,
-    }
 
 
 def render_method_review_data(
@@ -242,9 +197,12 @@ def build_execution_result_card(
     # The result card describes returned rows, not fixture rows loaded into the
     # sandbox. Aggregate queries can read 100 rows and return one row.
     row_count = len(output) if isinstance(output, list) else (1 if isinstance(output, dict) else 0)
+    execution_mode = str(execution_result.input_summary.get("execution_mode") or "simulated_real")
+    if execution_mode not in {"simulated_real", "direct_db"}:
+        execution_mode = "simulated_real"
     return ExecutionResultCard(
         status="executed",
-        execution_mode="simulated_real",
+        execution_mode=execution_mode,
         method_name=method.name,
         method_hash=stable_hash(method.model_dump(mode="json")),
         data_authorization=authorization,
@@ -257,7 +215,7 @@ def build_execution_result_card(
             "fixture": execution_result.input_summary.get("fixture"),
             "execution_errors": execution_result.errors,
         },
-        real_database_used=False,
+        real_database_used=bool(execution_result.input_summary.get("real_database_used", False)),
     )
 
 

@@ -2,15 +2,77 @@ version: "2026-08-27"
 skills:
   - name: finance_query
     title: "财务查询"
-    description: "通过受控的业务表匹配、字段逐层披露、查询计划校验和用户确认，完成只读财务数据查询与分析。"
+    description: "通过受控的业务表匹配、字段逐层披露和查询计划校验，完成只读财务数据查询与分析。"
     aliases: ["查找", "查询", "finance query", "query"]
     entrypoint: "finance_query"
+    tool:
+      name: "finance_query"
+      description: "通过受控元数据完成只读财务查询和分析。"
+      strict: true
+      exposure: "direct"
+      input_schema:
+        type: "object"
+        properties:
+          goal:
+            type: "string"
+            description: "用户希望完成的业务目标。不要生成 SQL 或执行代码。"
+          filters:
+            type: "array"
+            description: "用户明确提供的筛选条件；name 使用业务语义，不使用表名或字段名。"
+            items:
+              type: "object"
+              properties:
+                name:
+                  type: "string"
+                  description: "筛选条件的业务语义，例如客户名称、状态或时间范围。"
+                operator:
+                  type: "string"
+                  enum: ["eq", "contains", "in", "gte", "lte", "between"]
+                  description: "筛选关系；范围值使用 between，单值使用 eq/gte/lte。"
+                value_type:
+                  type: "string"
+                  enum: ["text", "number", "boolean", "date", "datetime", "date_range", "list"]
+                  description: "值的语义类型；时间区间使用 date_range，数组使用 list。"
+                value:
+                  description: "用户明确提供的筛选值；保留用户原始大小写。"
+                  anyOf:
+                    - type: "string"
+                    - type: "number"
+                    - type: "boolean"
+                    - type: "array"
+                      items:
+                        type: "string"
+              required: ["name", "operator", "value_type", "value"]
+              additionalProperties: false
+          query_reference:
+            type: "object"
+            description: "可选的历史查询引用；只填写 context.prior_results 中出现的 query_id。"
+            properties:
+              mode:
+                type: "string"
+                enum: ["none", "query", "queries"]
+              query_ids:
+                type: "array"
+                items:
+                  type: "string"
+              relation:
+                type: "string"
+                enum: ["refine", "change_filter", "change_time", "sort", "group", "expand_detail", "compare"]
+            required: ["mode", "query_ids", "relation"]
+            additionalProperties: false
+        required: ["goal", "filters"]
+        additionalProperties: false
+    runtime:
+      executor: "query_workflow"
+      policy_ref: "readonly_finance"
+      state_scope: "session"
+      streaming: true
     workflow:
       - "business_language_to_candidate_tables"
       - "select_tables"
       - "disclose_selected_table_fields"
       - "plan_and_validate_readonly_query"
-      - "confirm_and_execute"
+      - "validate_and_execute_readonly"
     when_to_use:
       - "用户需要查询、统计、对比或分析财务业务数据。"
       - "用户通过 @finance_query 显式调用查询能力。"
@@ -18,13 +80,13 @@ skills:
     required_metadata_terms: []
     clarification_policy: "先匹配业务表，再根据已选表展开字段；信息不足时询问用户，不猜测表或字段。"
     risk_notes:
-      - "LLM 只处理 metadata 和查询方案，用户确认后才允许执行。"
+      - "LLM 只处理 metadata 和查询方案，系统校验通过后自动执行只读查询。"
       - "只允许只读查询，真实数据不会进入普通对话上下文。"
     card:
       type: "query"
       state_key: "finance_query"
       title: "财务查询"
-      subtitle: "填写查询目标后，继续走业务表匹配与 SQL 审查"
+      subtitle: "填写查询目标后，继续走业务表匹配与 SQL 校验"
       fields:
         - id: "goal"
           label: "想查询什么"
@@ -53,9 +115,9 @@ skills:
         - id: "tables"
           title: "匹配业务表"
           summary: "根据业务语言匹配候选表，再逐层披露所选表的字段。"
-        - id: "review"
-          title: "审查并执行"
-          summary: "保留原有 SQL 自检、只读校验和用户确认流程。"
+        - id: "validate"
+          title: "校验并执行"
+          summary: "执行 SQL 自检和只读校验，通过后自动运行查询。"
       actions: ["prepare_query"]
   - name: kyc_checklist
     title: "KYC 材料清单"

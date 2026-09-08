@@ -37,6 +37,7 @@ class RunResponse(BaseModel):
     public_memory_entry: dict[str, Any] | None = None
     public_memory_context: list[dict[str, Any]] | None = None
     response_plan: dict[str, Any] | None = None
+    query_request: dict[str, Any] | None = None
     action_validation: dict[str, Any] | None = None
     selected_skill_detail: dict[str, Any] | None = None
     skill_card: dict[str, Any] | None = None
@@ -56,6 +57,7 @@ class RunResponse(BaseModel):
     mock_result: dict[str, Any] | None = None
     mock_results: list[dict[str, Any]] | None = None
     internal_method_review: dict[str, Any] | None = None
+    validation_report: dict[str, Any] | None = None
     method_review_card: dict[str, Any] | None = None
     method_review_cards: list[dict[str, Any]] | None = None
     method_set_review_card: dict[str, Any] | None = None

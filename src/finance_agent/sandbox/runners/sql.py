@@ -7,6 +7,7 @@ from typing import Any
 import psycopg2
 
 from finance_agent.config import get_settings
+from finance_agent.executor.sql_parameters import normalize_sql_template
 from finance_agent.metadata.table_registry import get_default_table_registry
 from finance_agent.sandbox.provider import SandboxExecutionRequest
 from finance_agent.sandbox.runner_registry import register_runner
@@ -100,42 +101,9 @@ def _prepare_sql(sql: str, params: dict[str, Any] | None = None) -> tuple[str, d
         flags=re.I
     )
 
-    # Customer labels are a user-facing lookup key. Normalize generated
-    # equality predicates to the same case/space-tolerant contract as mock
-    # execution, without broadening UUID, numeric, or date comparisons.
-    prepared = re.sub(
-        r"\b(legal_name(?:_en)?)\s*=\s*:([a-zA-Z_][a-zA-Z0-9_]*)",
-        r"\1 ILIKE :\2",
-        prepared,
-        flags=re.IGNORECASE,
-    )
-    # Keep the readable ILIKE predicate for audit/debug output while adding a
-    # normalized fallback that matches ``Company1`` with ``Company 1``. The
-    # parameter itself stays unchanged so authorization and audit hashes keep
-    # the user's original value.
-    prepared = re.sub(
-        r"\b(legal_name(?:_en)?)\s+ILIKE\s+:([a-zA-Z_][a-zA-Z0-9_]*)",
-        r"(\1 ILIKE :\2 OR regexp_replace(\1, '\\s+', '', 'g') ILIKE regexp_replace(:\2, '\\s+', '', 'g'))",
-        prepared,
-        flags=re.IGNORECASE,
-    )
-
-    # 只为 SQL 明确写了 ILIKE 的文本参数启用模糊匹配。不能把所有
-    # ``= :param`` 改写为 ILIKE，否则 UUID、数字和日期条件会被破坏。
-    fuzzy_parameter_names = set(
-        re.findall(r"\bILIKE\s+:([a-zA-Z_][a-zA-Z0-9_]*)", prepared, re.IGNORECASE)
-    )
-
-    # ILIKE 参数只补全首尾通配符，保留用户输入中的空格；复制参数，避免
-    # 执行过程污染 method.params 和持久化的原始值。
-    prepared_params = dict(params or {})
-    for key in fuzzy_parameter_names:
-        value = prepared_params.get(key)
-        if not isinstance(value, str):
-            continue
-        value = value.strip()
-        if "%" not in value and "_" not in value:
-            prepared_params[key] = f"%{value}%"
+    # Keep driver-specific placeholder conversion below, but share all
+    # user-facing SQL semantics with the direct DB executor.
+    prepared, prepared_params = normalize_sql_template(prepared, params)
 
     # 提取命名参数并转换为 psycopg2 格式
     # :param_name → %(param_name)s，并收集参数值

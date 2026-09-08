@@ -15,6 +15,32 @@ from typing import Any
 
 from finance_agent.session.thread_store import SideThreadStore, ThreadStoreError
 
+PENDING_REVIEW_STATUSES = frozenset({
+    "analysis_plan_review_ready",
+    "method_review_ready",
+    "data_authorization_pending",
+    "prior_result_authorization_pending",
+})
+
+
+def _utc_now_iso() -> str:
+    """Return one sortable timestamp format for every session mutation."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _timestamp_value(value: Any) -> float:
+    """Normalize legacy naive/offset timestamps for chronological sorting."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            # Before this fix, update timestamps were written in the host's
+            # local timezone without an offset. Interpret those legacy values
+            # in the current local timezone rather than treating them as UTC.
+            parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo or timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return float("-inf")
+
 
 class SessionManager:
     """Session 管理器，负责 session 的 CRUD 操作。"""
@@ -58,7 +84,7 @@ class SessionManager:
     ) -> dict[str, Any]:
         """创建新的 session。"""
         session_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now_iso()
 
         session_data = {
             "session_id": session_id,
@@ -130,7 +156,15 @@ class SessionManager:
             except Exception:
                 continue
         # 文件名是随机 UUID，不能代表对话的新旧；按最近更新时间展示。
-        return sorted(sessions, key=lambda session: (session["pinned"], session["updated_at"]), reverse=True)
+        return sorted(
+            sessions,
+            key=lambda session: (
+                session["pinned"],
+                _timestamp_value(session["updated_at"]),
+                _timestamp_value(session["created_at"]),
+            ),
+            reverse=True,
+        )
 
     def owns_session(self, session_id: str, *, user_id: str, workspace_id: str) -> bool:
         session = self.get_session(session_id)
@@ -163,7 +197,7 @@ class SessionManager:
                 session_data[key] = value
 
         # 更新时间
-        session_data["updated_at"] = datetime.now().isoformat()
+        session_data["updated_at"] = _utc_now_iso()
 
         # 保存到文件
         self._session_path(session_id).write_text(
@@ -190,7 +224,7 @@ class SessionManager:
         message = {
             "role": role,
             "content": content,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": _utc_now_iso(),
         }
         if request_id:
             message["request_id"] = request_id
@@ -206,7 +240,7 @@ class SessionManager:
         )
 
         # 更新时间
-        session_data["updated_at"] = datetime.now().isoformat()
+        session_data["updated_at"] = _utc_now_iso()
 
         # 自动更新标题（如果是第一条用户消息）
         if role == "user" and len(session_data["conversation_history"]) == 1:
@@ -266,10 +300,10 @@ class SessionManager:
                 "analysis_id": entry["analysis_id"],
                 # created_at is UTC for result records; this timestamp follows the
                 # same clock as ordinary chat messages and is only for diagnostics.
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": _utc_now_iso(),
             }
         )
-        session_data["updated_at"] = datetime.now().isoformat()
+        session_data["updated_at"] = _utc_now_iso()
         self._session_path(session_id).write_text(
             json.dumps(session_data, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -293,7 +327,7 @@ class SessionManager:
             return []
         timeline = session_data.get("timeline")
         if isinstance(timeline, list) and timeline:
-            if self._backfill_legacy_review_cards(session_data, timeline):
+            if self._remove_non_pending_review_snapshots(timeline):
                 self._session_path(session_id).write_text(
                     json.dumps(session_data, ensure_ascii=False, indent=2),
                     encoding="utf-8",
@@ -329,7 +363,7 @@ class SessionManager:
         events.sort(key=event_timestamp)
         if events:
             session_data["timeline"] = events
-            self._backfill_legacy_review_cards(session_data, events)
+            self._remove_non_pending_review_snapshots(events)
             self._session_path(session_id).write_text(
                 json.dumps(session_data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -337,55 +371,19 @@ class SessionManager:
         return events
 
     @staticmethod
-    def _backfill_legacy_review_cards(
-        session_data: dict[str, Any],
+    def _remove_non_pending_review_snapshots(
         timeline: list[dict[str, Any]],
     ) -> bool:
-        """从旧执行结果补出已确认的只读卡片，不暴露额外结果数据。"""
-        analyses = {
-            str(item.get("analysis_id")): item
-            for item in session_data.get("private_analysis", [])
-            if item.get("analysis_id")
-        }
+        """Remove completed/failed review snapshots left by older versions."""
         changed = False
-        for index, event in enumerate(timeline):
-            if event.get("kind") != "private_analysis":
+        for event in timeline:
+            review = event.get("review")
+            if not isinstance(review, dict):
                 continue
-            analysis = analyses.get(str(event.get("analysis_id")))
-            if not analysis:
+            if review.get("status") in PENDING_REVIEW_STATUSES:
                 continue
-            for previous in reversed(timeline[:index]):
-                if previous.get("kind") != "message" or previous.get("role") != "assistant":
-                    continue
-                if previous.get("review"):
-                    break
-                card = analysis.get("execution_result_card") or {}
-                authorization = card.get("data_authorization") or {}
-                evidence = card.get("evidence") or {}
-                method = {
-                    "method_type": evidence.get("method_type", "sql"),
-                    "name": card.get("method_name", "受控数据查询"),
-                    "goal": authorization.get("purpose", "已执行分析"),
-                    "required_fields": list(authorization.get("fields") or []),
-                    "sql_template": evidence.get("sql_template"),
-                    "logic_summary": [],
-                }
-                previous["request_id"] = analysis.get("request_id") or previous.get("request_id")
-                previous["review"] = {
-                    "request_id": analysis.get("request_id", ""),
-                    "status": "executed_simulated_real",
-                    "method_draft": method,
-                    "method_drafts": [method],
-                    "method_review_card": {
-                        "method_name": method["name"],
-                        "method_type": method["method_type"],
-                        "goal": method["goal"],
-                        "required_fields": method["required_fields"],
-                        "logic_summary": [],
-                    },
-                }
-                changed = True
-                break
+            event.pop("review", None)
+            changed = True
         return changed
 
     def set_review_snapshot(
@@ -453,6 +451,51 @@ class SessionManager:
                 )
                 return True
         return False
+
+    def clear_review_snapshot(self, session_id: str, request_id: str) -> bool:
+        """Remove one stale UI review snapshot without deleting the chat message."""
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return False
+        for event in reversed(session_data.get("timeline") or []):
+            if (
+                event.get("kind") == "message"
+                and event.get("request_id") == request_id
+                and "review" in event
+            ):
+                event.pop("review", None)
+                self._session_path(session_id).write_text(
+                    json.dumps(session_data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return True
+        return False
+
+    def clear_review_snapshots(self, session_id: str, *, keep_request_id: str | None = None) -> int:
+        """Remove review snapshots not backed by the current pending run.
+
+        A legacy session can contain several review snapshots, while only one
+        run can be pending for the session.  Keeping only the explicitly
+        matched request prevents refresh from reviving unrelated old cards.
+        """
+        session_data = self.get_session(session_id)
+        if session_data is None:
+            return 0
+        removed = 0
+        for event in session_data.get("timeline") or []:
+            review = event.get("review")
+            if not isinstance(review, dict):
+                continue
+            if keep_request_id and str(event.get("request_id") or "") == keep_request_id:
+                continue
+            event.pop("review", None)
+            removed += 1
+        if removed:
+            self._session_path(session_id).write_text(
+                json.dumps(session_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return removed
 
     def set_pending_review(self, session_id: str, review: dict[str, Any] | None) -> dict[str, Any] | None:
         """保存或清除会话中尚未确认的安全审查卡片数据。"""
@@ -537,7 +580,7 @@ class SessionManager:
         """Create a first-class side thread owned by a parent session."""
         if self.get_session(session_id) is None:
             return None
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now_iso()
         return self.side_thread_store.create_thread(
             thread_id=str(uuid.uuid4()),
             parent_session_id=session_id,

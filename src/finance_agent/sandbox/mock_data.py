@@ -17,8 +17,16 @@ def _mock_uuid(prefix: str, index: int) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
 
-def generate_mock_data(row_count: int = 100) -> dict[str, list[dict[str, Any]]]:
-    """生成所有表的 mock 数据。"""
+def generate_mock_data(
+    row_count: int = 100,
+    reference_time: datetime | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """生成所有表的 mock 数据。
+
+    ``reference_time`` is injectable so relative-time tests stay deterministic;
+    the default keeps local fixtures aligned with the current rolling window.
+    """
+    reference_time = _normalize_reference_time(reference_time)
     # 生成基础数据
     accounts = _generate_accounts(20)
     cards = _generate_cards(accounts, 35)
@@ -26,18 +34,18 @@ def generate_mock_data(row_count: int = 100) -> dict[str, list[dict[str, Any]]]:
     budgets = _generate_budgets(accounts, balances, 15)
     cdd_kyc = _generate_cdd_kyc(accounts, 25)
     cdd_kyb = _generate_cdd_kyb(accounts, 20)
-    card_transactions = _generate_card_transactions(accounts, cards, row_count)
-    va_transactions = _generate_va_transactions(accounts, 80)
-    payout_transactions = _generate_payout_transactions(accounts, 60)
-    transactions = _generate_transactions(accounts, balances, 200)
+    card_transactions = _generate_card_transactions(accounts, cards, row_count, reference_time)
+    va_transactions = _generate_va_transactions(accounts, 80, reference_time)
+    payout_transactions = _generate_payout_transactions(accounts, 60, reference_time)
+    transactions = _generate_transactions(accounts, balances, 200, reference_time)
 
     # 生成新增的转账相关数据
-    pay_transactions = _generate_pay_transactions(accounts, balances, transactions, 50)
-    funds_transfers = _generate_funds_transfers(accounts, balances, transactions, 30)
-    p2p_funds_transfers = _generate_p2p_funds_transfers(accounts, balances, transactions, 25)
-    funds_in = _generate_funds_in(accounts, balances, transactions, 35)
-    funds_out = _generate_funds_out(accounts, balances, transactions, 40)
-    account_transactions = _generate_account_transactions(accounts, cards, balances, transactions, 150)
+    pay_transactions = _generate_pay_transactions(accounts, balances, transactions, 50, reference_time)
+    funds_transfers = _generate_funds_transfers(accounts, balances, transactions, 30, reference_time)
+    p2p_funds_transfers = _generate_p2p_funds_transfers(accounts, balances, transactions, 25, reference_time)
+    funds_in = _generate_funds_in(accounts, balances, transactions, 35, reference_time)
+    funds_out = _generate_funds_out(accounts, balances, transactions, 40, reference_time)
+    account_transactions = _generate_account_transactions(accounts, cards, balances, transactions, 150, reference_time)
 
     return {
         "account": accounts,
@@ -57,6 +65,14 @@ def generate_mock_data(row_count: int = 100) -> dict[str, list[dict[str, Any]]]:
         "funds_out": funds_out,
         "account_transaction": account_transactions,
     }
+
+
+def _normalize_reference_time(reference_time: datetime | None) -> datetime:
+    """Return a naive local timestamp used by the fixture's +08:00 strings."""
+    value = reference_time or datetime.now()
+    if value.tzinfo is not None:
+        value = value.replace(tzinfo=None)
+    return value.replace(second=0, microsecond=0)
 
 
 def _generate_accounts(count: int) -> list[dict[str, Any]]:
@@ -215,7 +231,9 @@ def _generate_cdd_kyb(accounts: list[dict], count: int) -> list[dict[str, Any]]:
     return kyb_records
 
 
-def _generate_card_transactions(accounts: list[dict], cards: list[dict], count: int) -> list[dict[str, Any]]:
+def _generate_card_transactions(
+    accounts: list[dict], cards: list[dict], count: int, reference_time: datetime
+) -> list[dict[str, Any]]:
     """生成卡交易数据。"""
     statuses = ["completed", "completed", "completed", "completed", "completed",
                 "completed", "completed", "completed", "pending", "failed", "reversed"]
@@ -224,7 +242,6 @@ def _generate_card_transactions(accounts: list[dict], cards: list[dict], count: 
     currencies = ["USD", "USD", "USD", "EUR", "GBP", "HKD"]
     channels = ["c_001_prepaid", "c_002_prepaid", "c_003_ota_prepaid", "c_005_prepaid", "c_007_prepaid"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     transactions = []
 
     for i in range(count):
@@ -234,7 +251,7 @@ def _generate_card_transactions(accounts: list[dict], cards: list[dict], count: 
         tx_type = types[i % len(types)]
         sign = -1 if tx_type in ("refund", "reversal") else 1
         amount = sign * round(15.0 + ((i * 37) % 800) + ((i % 7) * 0.85), 2)
-        tx_time = base_time + timedelta(days=(i * 3) % 181, hours=(i * 5) % 24, minutes=(i * 7) % 60)
+        tx_time = reference_time - timedelta(days=(i * 3) % 181, hours=(i * 5) % 24, minutes=(i * 7) % 60)
 
         transactions.append({
             "id": _mock_uuid("card_tx", i),
@@ -263,14 +280,15 @@ def _generate_card_transactions(accounts: list[dict], cards: list[dict], count: 
     return transactions
 
 
-def _generate_va_transactions(accounts: list[dict], count: int) -> list[dict[str, Any]]:
+def _generate_va_transactions(
+    accounts: list[dict], count: int, reference_time: datetime
+) -> list[dict[str, Any]]:
     """生成 VA 交易数据。"""
     statuses = ["completed", "completed", "completed", "pending", "failed"]
     types = ["deposit", "deposit", "payment", "refund", "conversion"]
     channels = ["va_001", "va_002", "va_005", "va_007", "va_009"]
     currencies = ["USD", "USD", "EUR", "GBP"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     transactions = []
 
     for i in range(count):
@@ -279,7 +297,7 @@ def _generate_va_transactions(accounts: list[dict], count: int) -> list[dict[str
         tx_type = types[i % len(types)]
         sign = -1 if tx_type == "refund" else 1
         amount = sign * round(100 + ((i * 41) % 5000) + ((i % 5) * 0.5), 2)
-        tx_time = base_time + timedelta(days=(i * 4) % 181, hours=(i * 3) % 24)
+        tx_time = reference_time - timedelta(days=(i * 4) % 181, hours=(i * 3) % 24)
 
         transactions.append({
             "id": _mock_uuid("va_tx", i),
@@ -304,21 +322,22 @@ def _generate_va_transactions(accounts: list[dict], count: int) -> list[dict[str
     return transactions
 
 
-def _generate_payout_transactions(accounts: list[dict], count: int) -> list[dict[str, Any]]:
+def _generate_payout_transactions(
+    accounts: list[dict], count: int, reference_time: datetime
+) -> list[dict[str, Any]]:
     """生成付款交易数据。"""
     statuses = ["completed", "completed", "pending", "failed", "pending_review"]
     business_sources = ["va", "va", "cw", "ca"]
     payout_channels = ["bank_wire", "bank_wire", "swift", "local_transfer"]
     payee_currencies = ["USD", "EUR", "GBP", "HKD"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     transactions = []
 
     for i in range(count):
         account = accounts[i % len(accounts)]
         status = statuses[i % len(statuses)]
         amount = round(500 + ((i * 53) % 10000) + ((i % 3) * 0.25), 2)
-        tx_time = base_time + timedelta(days=(i * 6) % 181, hours=(i * 4) % 24)
+        tx_time = reference_time - timedelta(days=(i * 6) % 181, hours=(i * 4) % 24)
 
         transactions.append({
             "id": _mock_uuid("payout_tx", i),
@@ -344,13 +363,14 @@ def _generate_payout_transactions(accounts: list[dict], count: int) -> list[dict
     return transactions
 
 
-def _generate_transactions(accounts: list[dict], balances: list[dict], count: int) -> list[dict[str, Any]]:
+def _generate_transactions(
+    accounts: list[dict], balances: list[dict], count: int, reference_time: datetime
+) -> list[dict[str, Any]]:
     """生成通用交易流水（余额变动）。"""
     types = ["card_debit", "card_refund", "account_recharge", "account_transfer_in",
              "account_transfer_out", "va_deposit", "va_payout", "commission_withdrawal"]
     statuses = ["completed", "completed", "completed", "pending", "failed"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     transactions = []
 
     for i in range(count):
@@ -373,9 +393,9 @@ def _generate_transactions(accounts: list[dict], balances: list[dict], count: in
             "before_balance": round(5000 + i * 100, 2),
             "after_balance": round(5000 + i * 100 - amount, 2) if "debit" in tx_type or "payout" in tx_type else round(5000 + i * 100 + amount, 2),
             "operation_type": tx_type,
-            "transaction_at": (base_time + timedelta(days=(i * 2) % 181)).isoformat() + "+08:00",
+            "transaction_at": (reference_time - timedelta(days=(i * 2) % 181)).isoformat() + "+08:00",
             "relation_id": _mock_uuid("relation", i),
-            "created_at": (base_time + timedelta(days=(i * 2) % 181)).isoformat() + "+08:00",
+            "created_at": (reference_time - timedelta(days=(i * 2) % 181)).isoformat() + "+08:00",
         })
 
     return transactions
@@ -386,6 +406,7 @@ def _generate_pay_transactions(
     balances: list[dict],
     transactions: list[dict],
     count: int,
+    reference_time: datetime,
 ) -> list[dict[str, Any]]:
     """生成支付交易数据。"""
     statuses = ["completed", "completed", "completed", "pending", "failed"]
@@ -393,7 +414,6 @@ def _generate_pay_transactions(
     pay_channels = ["bank_card", "bank_card", "crypto", "bank_transfer", "e_wallet"]
     currencies = ["USD", "USD", "EUR", "GBP", "HKD"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     pay_transactions = []
 
     for i in range(count):
@@ -403,7 +423,7 @@ def _generate_pay_transactions(
         status = statuses[i % len(statuses)]
         tx_type = types[i % len(types)]
         amount = round(200 + ((i * 47) % 5000) + ((i % 5) * 0.5), 2)
-        tx_time = base_time + timedelta(days=(i * 3) % 181, hours=(i * 7) % 24)
+        tx_time = reference_time - timedelta(days=(i * 3) % 181, hours=(i * 7) % 24)
 
         pay_transactions.append({
             "id": _mock_uuid("pay_tx", i),
@@ -461,6 +481,7 @@ def _generate_funds_transfers(
     balances: list[dict],
     transactions: list[dict],
     count: int,
+    reference_time: datetime,
 ) -> list[dict[str, Any]]:
     """生成内部转账数据。"""
     statuses = ["completed", "completed", "completed", "pending", "failed"]
@@ -468,7 +489,6 @@ def _generate_funds_transfers(
     to_currencies = ["EUR", "GBP", "USD", "USD", "USD"]
     business_types = ["exchange", "exchange", "transfer", "exchange", "transfer"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     transfers = []
 
     for i in range(count):
@@ -478,7 +498,7 @@ def _generate_funds_transfers(
         out_trx = transactions[(i * 2) % len(transactions)]
         in_trx = transactions[(i * 2 + 1) % len(transactions)]
         status = statuses[i % len(statuses)]
-        tx_time = base_time + timedelta(days=(i * 5) % 181, hours=(i * 3) % 24)
+        tx_time = reference_time - timedelta(days=(i * 5) % 181, hours=(i * 3) % 24)
 
         transfers.append({
             "id": _mock_uuid("funds_transfer", i),
@@ -510,6 +530,7 @@ def _generate_p2p_funds_transfers(
     balances: list[dict],
     transactions: list[dict],
     count: int,
+    reference_time: datetime,
 ) -> list[dict[str, Any]]:
     """生成 P2P 转账数据。"""
     statuses = ["completed", "completed", "completed", "pending", "failed"]
@@ -517,7 +538,6 @@ def _generate_p2p_funds_transfers(
     to_currencies = ["USD", "EUR", "USD", "USD", "USD"]
     business_types = ["p2p_transfer", "p2p_transfer", "p2p_payment", "p2p_transfer", "p2p_payment"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     transfers = []
 
     for i in range(count):
@@ -528,7 +548,7 @@ def _generate_p2p_funds_transfers(
         out_trx = transactions[(i * 2) % len(transactions)]
         in_trx = transactions[(i * 2 + 1) % len(transactions)]
         status = statuses[i % len(statuses)]
-        tx_time = base_time + timedelta(days=(i * 4) % 181, hours=(i * 6) % 24)
+        tx_time = reference_time - timedelta(days=(i * 4) % 181, hours=(i * 6) % 24)
 
         transfers.append({
             "id": _mock_uuid("p2p_transfer", i),
@@ -561,13 +581,13 @@ def _generate_funds_in(
     balances: list[dict],
     transactions: list[dict],
     count: int,
+    reference_time: datetime,
 ) -> list[dict[str, Any]]:
     """生成入金数据。"""
     statuses = ["completed", "completed", "completed", "pending", "failed"]
     to_currencies = ["USD", "USD", "EUR", "GBP", "HKD"]
     business_types = ["deposit", "deposit", "top_up", "deposit", "top_up"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     funds_in = []
 
     for i in range(count):
@@ -575,7 +595,7 @@ def _generate_funds_in(
         balance = balances[i % len(balances)]
         trx = transactions[i % len(transactions)]
         status = statuses[i % len(statuses)]
-        tx_time = base_time + timedelta(days=(i * 6) % 181, hours=(i * 4) % 24)
+        tx_time = reference_time - timedelta(days=(i * 6) % 181, hours=(i * 4) % 24)
 
         funds_in.append({
             "id": _mock_uuid("funds_in", i),
@@ -601,6 +621,7 @@ def _generate_funds_out(
     balances: list[dict],
     transactions: list[dict],
     count: int,
+    reference_time: datetime,
 ) -> list[dict[str, Any]]:
     """生成出金数据。"""
     statuses = ["completed", "completed", "completed", "pending", "failed"]
@@ -608,7 +629,6 @@ def _generate_funds_out(
     to_currencies = ["EUR", "GBP", "USD", "USD", "USD"]
     business_types = ["withdrawal", "withdrawal", "payout", "withdrawal", "payout"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     funds_out = []
 
     for i in range(count):
@@ -616,7 +636,7 @@ def _generate_funds_out(
         balance = balances[i % len(balances)]
         trx = transactions[i % len(transactions)]
         status = statuses[i % len(statuses)]
-        tx_time = base_time + timedelta(days=(i * 7) % 181, hours=(i * 5) % 24)
+        tx_time = reference_time - timedelta(days=(i * 7) % 181, hours=(i * 5) % 24)
 
         funds_out.append({
             "id": _mock_uuid("funds_out", i),
@@ -645,6 +665,7 @@ def _generate_account_transactions(
     balances: list[dict],
     transactions: list[dict],
     count: int,
+    reference_time: datetime,
 ) -> list[dict[str, Any]]:
     """生成账户交易数据。"""
     statuses = ["completed", "completed", "completed", "pending", "failed"]
@@ -653,7 +674,6 @@ def _generate_account_transactions(
     currencies = ["USD", "USD", "EUR", "GBP", "HKD"]
     tx_sources = ["card", "card", "transfer", "transfer", "payout"]
 
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
     account_transactions = []
 
     for i in range(count):
@@ -665,7 +685,7 @@ def _generate_account_transactions(
         tx_type = types[i % len(types)]
         action = actions[i % len(actions)]
         amount = round(50 + ((i * 37) % 2000) + ((i % 7) * 0.5), 2)
-        tx_time = base_time + timedelta(days=(i * 3) % 181, hours=(i * 5) % 24, minutes=(i * 7) % 60)
+        tx_time = reference_time - timedelta(days=(i * 3) % 181, hours=(i * 5) % 24, minutes=(i * 7) % 60)
 
         account_transactions.append({
             "id": _mock_uuid("acct_tx", i),

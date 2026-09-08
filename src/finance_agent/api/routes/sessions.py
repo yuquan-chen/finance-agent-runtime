@@ -113,14 +113,38 @@ async def get_session_history(session_id: str, request: Request, limit: int | No
     if persisted_state and persisted_state.get("request_id"):
         mod.PENDING_RUNS[persisted_state["request_id"]] = dict(persisted_state)
         mod.PENDING_RUNS[session_id] = dict(persisted_state)
-        if persisted_state.get("status") in mod.PENDING_REVIEW_STATUSES:
-            mod._sync_pending_review(persisted_state)
-            pending_review = manager.get_pending_review(session_id)
+        # 已完成/失败的运行也要经过同步，以清理升级前遗留的待确认状态。
+        mod._sync_pending_review(persisted_state)
+        pending_review = manager.get_pending_review(session_id)
+    if pending_review is not None and pending_review.get("status") not in mod.PENDING_REVIEW_STATUSES:
+        manager.clear_review_snapshot(session_id, str(pending_review.get("request_id") or ""))
+        manager.set_pending_review(session_id, None)
+        pending_review = None
     if pending_review is None:
         in_memory_state = mod.PENDING_RUNS.get(session_id)
         if in_memory_state and in_memory_state.get("status") in mod.PENDING_REVIEW_STATUSES:
             mod._sync_pending_review(in_memory_state)
             pending_review = manager.get_pending_review(session_id)
+
+    # A review snapshot is restorable only when it is backed by the same
+    # currently pending run.  Older versions could leave a card in the
+    # timeline after the run had already failed or completed; never revive
+    # those cards on refresh.
+    pending_state = None
+    if persisted_state and persisted_state.get("status") in mod.PENDING_REVIEW_STATUSES:
+        pending_state = persisted_state
+    elif not persisted_state:
+        in_memory_state = mod.PENDING_RUNS.get(session_id)
+        if in_memory_state and in_memory_state.get("status") in mod.PENDING_REVIEW_STATUSES:
+            pending_state = in_memory_state
+    pending_request_id = str((pending_state or {}).get("request_id") or "")
+    review_request_id = str((pending_review or {}).get("request_id") or "")
+    if pending_request_id and pending_review and review_request_id == pending_request_id:
+        manager.clear_review_snapshots(session_id, keep_request_id=pending_request_id)
+    elif pending_review or manager.get_timeline(session_id):
+        manager.clear_review_snapshots(session_id)
+        manager.set_pending_review(session_id, None)
+        pending_review = None
 
     kyc_state = manager.get_skill_state(session_id, "kyc_intake") or {}
     side_attachment_ids: set[str] = set()

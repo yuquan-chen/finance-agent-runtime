@@ -271,22 +271,41 @@ class MemoryStore:
 
     def context_for_llm(self, session_id: str, limit: int = 5) -> list[dict[str, Any]]:
         """Safe query-history projection. Backend references stay private."""
-        return [
-            {
-                "type": "memory",
-                "query_candidate": candidate,
-                "name": record.name,
-                "description": f"之前的查询候选 {candidate}",
-                "content": record.content,
-                "goal": str(record.metadata.get("goal") or ""),
-                "sql_template": str(record.metadata.get("sql_template") or ""),
-                "plan_result_ref": record.metadata.get("plan_result_ref"),
-                "fields": list(record.metadata.get("fields") or []),
-                "row_count": int(record.metadata.get("row_count") or 0),
-                "result_shape": dict(record.metadata.get("result_shape") or {}),
-            }
-            for candidate, record in enumerate(self.query_history(session_id, limit), start=1)
-        ]
+        # One execution can produce several method records. Collapse those
+        # records into one logical query context before exposing history.
+        grouped: dict[str, list[MemoryRecord]] = {}
+        for record in self.query_history(session_id, max(limit * 10, 50)):
+            query_id = str(record.metadata.get("query_id") or record.id)
+            grouped.setdefault(query_id, []).append(record)
+
+        contexts: list[dict[str, Any]] = []
+        for candidate, (query_id, records) in enumerate(list(grouped.items())[:limit], start=1):
+            record = records[0]
+            contexts.append(
+                {
+                    "type": "memory",
+                    "query_candidate": candidate,
+                    "query_id": query_id,
+                    "name": record.name,
+                    "description": f"之前的查询候选 {candidate}",
+                    "content": record.content,
+                    "goal": str(record.metadata.get("goal") or ""),
+                    "sql_template": str(record.metadata.get("sql_template") or ""),
+                    "fields": list(record.metadata.get("fields") or []),
+                    "row_count": int(record.metadata.get("row_count") or 0),
+                    "result_shape": dict(record.metadata.get("result_shape") or {}),
+                    "method_count": len(records),
+                    "methods": [
+                        {
+                            "name": item.name,
+                            "goal": str(item.metadata.get("goal") or ""),
+                            "fields": list(item.metadata.get("fields") or []),
+                        }
+                        for item in records
+                    ],
+                }
+            )
+        return contexts
 
     def list_semantic_memories(self, namespace: str) -> list[MemoryRecord]:
         return [

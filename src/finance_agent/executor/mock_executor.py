@@ -6,8 +6,10 @@ from typing import Any
 
 from finance_agent.builder.sql_builder import assert_readonly_sql
 from finance_agent.harness.plan_schema import Intent, QueryPlan
+from finance_agent.harness.analysis_schema import MethodDraft, MockDryRunResult
 from finance_agent.metadata.policy import Policy
 from finance_agent.sandbox.mock_data import generate_mock_data
+from finance_agent.sandbox.mock_sandbox import run_simulated_real_execution
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,15 @@ class MockExecutor:
         rows = self._execute_plan(plan)
         rows = rows[: self.policy.max_rows]
         return QueryResult(rows=rows, row_count=len(rows), elapsed_ms=int((time.time() - started) * 1000))
+
+    def execute_method(
+        self,
+        method: MethodDraft,
+        *,
+        extra_tables: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> MockDryRunResult:
+        """Execute the current MethodDraft through the existing mock path."""
+        return run_simulated_real_execution(method, extra_tables=extra_tables)
 
     def _execute_plan(self, plan: QueryPlan) -> list[dict[str, Any]]:
         # 获取该表的 mock 数据

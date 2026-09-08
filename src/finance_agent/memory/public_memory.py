@@ -20,6 +20,9 @@ class PublicMemoryEntry(BaseModel):
     """Legacy query-card shape, mapped into the canonical memory record."""
 
     memory_id: str
+    # Stable, model-visible handle for a logical query run. This is not a
+    # private result_ref and remains stable when method ordering changes.
+    query_id: str | None = None
     request_id: str
     session_id: str = ""
     result_ref: str
@@ -44,6 +47,7 @@ class PublicMemoryEntry(BaseModel):
                 "name": self.method_name,
                 "description": "之前的查询候选",
                 "request_id": self.request_id,
+                "query_id": self.query_id,
                 "result_ref": self.result_ref,
                 "plan_result_ref": self.plan_result_ref,
                 "method_type": self.method_type,
@@ -65,6 +69,7 @@ class PublicMemoryEntry(BaseModel):
         return cls(
             memory_id=record.id,
             request_id=str(metadata.get("request_id") or ""),
+            query_id=str(metadata.get("query_id") or "") or None,
             session_id=record.namespace.partition(":")[2] if record.namespace.startswith("session:") else "",
             result_ref=str(metadata.get("result_ref") or ""),
             plan_result_ref=metadata.get("plan_result_ref"),
