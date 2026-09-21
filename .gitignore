@@ -31,4 +31,7 @@ STARTUP.md
 # Python build
 *.egg-info/
 
+# Generated business schema files
+/schema_catalog/tables/*.py
+
 server.log
