@@ -1,0 +1,41 @@
+version: 1
+queries:
+  admin.account.sample:
+    description: Return a small, safe account sample for connectivity checks.
+    max_page_size: 20
+    allowed_params: {}
+    sql: |
+      SELECT
+        id::text AS account_id,
+        COALESCE(NULLIF(legal_name, ''), legal_name_en) AS customer_name,
+        kyc_status,
+        va_kyb_status,
+        card_kyb_status,
+        status
+      FROM public.account
+      WHERE delete_at IS NULL
+      ORDER BY created_at NULLS LAST, id
+      LIMIT :page_size OFFSET :offset
+
+  admin.account.kyc_kyb_search:
+    description: Search account KYC and KYB statuses by customer name.
+    max_page_size: 20
+    allowed_params:
+      customer_name: text
+    sql: |
+      SELECT
+        id::text AS account_id,
+        COALESCE(NULLIF(legal_name, ''), legal_name_en) AS customer_name,
+        kyc_status,
+        va_kyb_status,
+        card_kyb_status,
+        status
+      FROM public.account
+      WHERE delete_at IS NULL
+        AND (
+          CAST(:customer_name AS text) IS NULL
+          OR legal_name ILIKE CONCAT('%', CAST(:customer_name AS text), '%')
+          OR legal_name_en ILIKE CONCAT('%', CAST(:customer_name AS text), '%')
+        )
+      ORDER BY created_at NULLS LAST, id
+      LIMIT :page_size OFFSET :offset

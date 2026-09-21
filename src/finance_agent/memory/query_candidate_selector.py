@@ -133,9 +133,22 @@ def _score(current_text: str, entry: dict[str, Any]) -> int:
 
 def _is_followup(query: str) -> bool:
     lowered = str(query or "").casefold()
+    if is_counted_result_reference(lowered):
+        return True
     if any(marker.casefold() in lowered for marker in _FOLLOWUP_MARKERS):
         return True
     return bool(re.search(r"(?:按|按照).*(?:排序|拆分|分组|筛选|过滤)", lowered))
+
+
+def is_counted_result_reference(user_query: str) -> bool:
+    """Recognize references such as ``把这98笔都列给我``.
+
+    The count is a confirmation of the immediately preceding result; the
+    query should not need to repeat the words "交易" or "订单".
+    """
+    text = str(user_query or "").strip().casefold()
+    number = r"(?:[0-9]+|[一二两三四五六七八九十百千万]+)"
+    return bool(re.search(rf"(?:这|该|上述)\s*{number}\s*笔", text))
 
 
 def is_explicit_query_continuation(user_query: str) -> bool:
@@ -153,6 +166,8 @@ def is_explicit_query_continuation(user_query: str) -> bool:
     if parse_candidate_reply(text) is not None:
         return True
     if is_explicit_historical_reference(text, text):
+        return True
+    if is_counted_result_reference(text):
         return True
     if _is_followup(text):
         return True
@@ -222,7 +237,7 @@ def select_query_candidate(
     margin = top["score"] - second_score
 
     requested_query_ids = [str(item) for item in (query_ids or []) if str(item).strip()]
-    if _requests_latest_query(user_query):
+    if _requests_latest_query(user_query) or is_counted_result_reference(user_query):
         # "刚才查询/刚才的结果" is an ordinal reference, not a semantic
         # search.  The context projection is already ordered newest first;
         # do not let the model select an older query because its SQL happens
@@ -238,7 +253,7 @@ def select_query_candidate(
                 "selected_query_id": latest.get("query_id"),
                 "selected_query_ids": [str(latest.get("query_id"))] if latest.get("query_id") else [],
                 "selected_goal": latest.get("goal") or "",
-                "resolution": "latest",
+                "resolution": "counted_latest" if is_counted_result_reference(user_query) else "latest",
                 "ranked": ranked,
             }
     if requested_query_ids:

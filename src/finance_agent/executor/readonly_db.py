@@ -12,6 +12,7 @@ from finance_agent.builder.sql_builder import assert_readonly_sql
 from finance_agent.executor.sql_parameters import normalize_sql_template
 from finance_agent.harness.analysis_schema import MethodDraft, MockDryRunResult
 from finance_agent.metadata.policy import Policy
+from finance_agent.query.safe_requests import SafeQueryRegistry, SafeQueryRequest
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,11 @@ class ReadonlyDbExecutor:
             self._configure_readonly_transaction(connection)
             rows = self._execute_query(connection, normalized_sql, normalized_params)
         return QueryResult(rows=rows, row_count=len(rows), elapsed_ms=int((time.time() - started) * 1000))
+
+    def execute_safe_request(self, request: SafeQueryRequest, registry: SafeQueryRegistry) -> QueryResult:
+        """Execute an allowlisted request without accepting caller-supplied SQL."""
+        definition, params = registry.bind(request)
+        return self.execute(definition.sql, params=params)
 
     def execute_method(
         self,
@@ -74,7 +80,7 @@ class ReadonlyDbExecutor:
                 "real_database_used": True,
                 "row_count": result.row_count,
                 "elapsed_ms": result.elapsed_ms,
-                "extra_tables": sorted(extra_tables),
+                "extra_tables": sorted(extra_tables or {}),
             },
         )
 

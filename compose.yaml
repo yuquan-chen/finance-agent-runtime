@@ -1,4 +1,20 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${PG_DATABASE:-finance_sandbox}
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
+    volumes:
+      - finance_agent_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres} -d ${PG_DATABASE:-finance_sandbox}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   finance-agent:
     build: .
     ports:
@@ -19,3 +35,6 @@ services:
       KYC_DRAFT_PATH: /app/data/kyc_drafts
     volumes:
       - ./data:/app/data
+
+volumes:
+  finance_agent_postgres_data:

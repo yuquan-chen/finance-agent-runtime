@@ -1,5 +1,5 @@
-version: "2026-09-07"
-description: "Canonical database values and business-language aliases."
+version: "2026-09-11"
+description: "DogPay Admin Agent business-value aliases for the current database baseline."
 tables:
   va_transaction:
     status:

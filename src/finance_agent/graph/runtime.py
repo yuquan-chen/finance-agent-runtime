@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import inspect
 import re
 import uuid
+from functools import wraps
 from typing import Any
 
 from langgraph.graph import END, StateGraph
@@ -41,6 +43,7 @@ from finance_agent.harness.method_validator import validate_method_draft
 from finance_agent.llm.provider import LlmProvider, build_llm_provider
 from finance_agent.memory.private_result_store import PrivateResultStore
 from finance_agent.memory.query_candidate_selector import (
+    is_counted_result_reference,
     is_explicit_query_continuation,
     is_explicit_historical_reference,
     parse_candidate_reply,
@@ -54,7 +57,7 @@ from finance_agent.memory.selector import select_relevant_memories
 from finance_agent.memory.extractor import extract_memories_from_state
 from finance_agent.metadata.business_registry import BusinessTermRegistry, load_business_registry_from_catalog
 from finance_agent.metadata.business_knowledge import BusinessKnowledge
-from finance_agent.metadata.catalog import Catalog, load_catalog
+from finance_agent.metadata.catalog import Catalog, load_catalog, load_table_metadata
 from finance_agent.metadata.policy import Policy, load_policy
 from finance_agent.metadata.pruner import prune_catalog
 from finance_agent.metadata.schema_selector import select_schema_with_llm
@@ -64,6 +67,7 @@ from finance_agent.methods.generator import generate_dependent_method
 from finance_agent.operations.handler_registry import OperationHandlerRegistry, get_default_registry
 from finance_agent.operations.registry import OperationRegistry, load_operation_registry
 from finance_agent.planner.analysis_planner import plan_analysis_with_lmstudio, plan_analysis_with_rules
+from finance_agent.planner.deterministic_plans import build_deterministic_plan
 from finance_agent.query.compiler import compile_analysis_plan, compile_method
 from finance_agent.query.contracts import CompiledQuery, QueryRequest
 from finance_agent.query.guard import QueryGuard
@@ -90,6 +94,7 @@ from finance_agent.skills.registry import SkillRegistry, load_skill_registry
 from finance_agent.skills.agent import SkillAgentExecutor
 from finance_agent.kyc.local_drafts import KycLocalDraftStore
 from finance_agent.kyc.conversation import update_from_conversation
+from finance_agent.observability import finalize_observability, new_observability, observe_span
 
 
 MAX_METHOD_REPAIR_ATTEMPTS = 3
@@ -112,6 +117,7 @@ class FinanceAgentRuntime:
     ):
         self.settings = settings or get_settings()
         self.catalog = catalog or load_catalog(self.settings.catalog_path)
+        self.table_metadata = load_table_metadata(self.settings.table_metadata_path)
         self.policy = policy or load_policy(self.settings.policy_path)
         self.operation_registry = operation_registry or load_operation_registry(self.settings.operations_path)
         self.skill_registry = skill_registry or load_skill_registry(self.settings.skills_path)
@@ -150,22 +156,29 @@ class FinanceAgentRuntime:
 
     def _build_graph(self):
         graph = StateGraph(AgentState)
-        graph.add_node("plan_response", self.plan_response)
-        graph.add_node("validate_action", self.validate_action)
-        graph.add_node("render_direct_response", self.render_direct_response)
-        graph.add_node("search_schema", self.search_schema)
-        graph.add_node("select_schema", self.select_schema)
-        graph.add_node("load_metadata", self.load_metadata)
-        graph.add_node("plan_analysis", self.plan_analysis)
-        graph.add_node("generate_method", self.generate_method)
-        graph.add_node("query_guard", self.query_guard)
-        graph.add_node("repair_method", self.repair_method)
-        graph.add_node("prepare_schema_repair", self.prepare_schema_repair)
-        graph.add_node("execute_readonly", self.execute_readonly)
-        graph.add_node("refuse_method", self.refuse_method)
-        graph.add_node("load_prior_result", self.load_prior_result)
-        graph.add_node("generate_dependent_method", self.generate_dependent_method)
-        graph.add_node("audit", self.audit)
+        graph.add_node("plan_response", self._instrument_node("plan_response", self.plan_response))
+        graph.add_node("validate_action", self._instrument_node("validate_action", self.validate_action))
+        graph.add_node(
+            "render_direct_response", self._instrument_node("render_direct_response", self.render_direct_response)
+        )
+        graph.add_node("search_schema", self._instrument_node("search_schema", self.search_schema))
+        graph.add_node("select_schema", self._instrument_node("select_schema", self.select_schema))
+        graph.add_node("load_metadata", self._instrument_node("load_metadata", self.load_metadata))
+        graph.add_node("plan_analysis", self._instrument_node("plan_analysis", self.plan_analysis))
+        graph.add_node("generate_method", self._instrument_node("generate_method", self.generate_method))
+        graph.add_node("query_guard", self._instrument_node("query_guard", self.query_guard))
+        graph.add_node("repair_method", self._instrument_node("repair_method", self.repair_method))
+        graph.add_node(
+            "prepare_schema_repair", self._instrument_node("prepare_schema_repair", self.prepare_schema_repair)
+        )
+        graph.add_node("execute_readonly", self._instrument_node("execute_readonly", self.execute_readonly))
+        graph.add_node("refuse_method", self._instrument_node("refuse_method", self.refuse_method))
+        graph.add_node("load_prior_result", self._instrument_node("load_prior_result", self.load_prior_result))
+        graph.add_node(
+            "generate_dependent_method",
+            self._instrument_node("generate_dependent_method", self.generate_dependent_method),
+        )
+        graph.add_node("audit", self._instrument_node("audit", self.audit))
 
         graph.set_entry_point("plan_response")
         graph.add_edge("plan_response", "validate_action")
@@ -200,6 +213,31 @@ class FinanceAgentRuntime:
         graph.add_edge("generate_dependent_method", "query_guard")
         graph.add_edge("audit", END)
         return graph.compile(checkpointer=self.checkpointer)
+
+    def _instrument_node(self, name: str, handler):
+        """Record every graph node without exposing its inputs or outputs."""
+        if inspect.iscoroutinefunction(handler):
+            @wraps(handler)
+            async def async_handler(state: AgentState):
+                observability = state.get("observability") or new_observability(state.get("request_id", ""))
+                with observe_span(observability, name):
+                    result = await handler(state)
+                if isinstance(result, dict):
+                    result["observability"] = observability
+                return result
+
+            return async_handler
+
+        @wraps(handler)
+        def sync_handler(state: AgentState):
+            observability = state.get("observability") or new_observability(state.get("request_id", ""))
+            with observe_span(observability, name):
+                result = handler(state)
+            if isinstance(result, dict):
+                result["observability"] = observability
+            return result
+
+        return sync_handler
 
     def _prepare_invocation(
         self,
@@ -271,6 +309,7 @@ class FinanceAgentRuntime:
             "repair_history": [],
             "pending_query_candidate": pending_candidate,
             "resume_query_candidate": resume_query_candidate,
+            "observability": new_observability(request_id),
         }
         # Persist the run before invoking the graph so a crash during planning
         # still leaves a durable lifecycle record to inspect or reconcile.
@@ -308,6 +347,10 @@ class FinanceAgentRuntime:
         if answer:
             self.session_manager.add_message(session_id, "assistant", answer, request_id=request_id)
 
+        observability = result.get("observability") or initial.get("observability")
+        if observability:
+            finalize_observability(observability, status=str(result.get("status") or "unknown"), settings=self.settings)
+            result["observability"] = observability
         self.run_store.save(result, result)
         return result
 
@@ -325,13 +368,7 @@ class FinanceAgentRuntime:
         session_id = initial["session_id"]
         if conversational_skill and conversational_skill.card.get("type") in {"intake", "identity"} and question.strip():
             result = self._invoke_kyc_conversation(initial, conversational_skill)
-            answer = result.get("answer")
-            if answer:
-                self.session_manager.add_message(
-                    session_id, "assistant", answer, request_id=initial["request_id"]
-                )
-            self.run_store.save(result, result)
-            return result
+            return self._finish_graph_result(initial, result)
 
         # 调用图
         result = await self.graph.ainvoke(initial, config=config)
@@ -355,10 +392,7 @@ class FinanceAgentRuntime:
         )
         if conversational_skill and conversational_skill.card.get("type") in {"intake", "identity"} and question.strip():
             result = self._invoke_kyc_conversation(initial, conversational_skill)
-            answer = result.get("answer")
-            if answer:
-                self.session_manager.add_message(initial["session_id"], "assistant", answer, request_id=initial["request_id"])
-            self.run_store.save(result, result)
+            result = self._finish_graph_result(initial, result)
             yield "skill_agent", result
             yield "complete", result
             return
@@ -838,6 +872,42 @@ class FinanceAgentRuntime:
             conversation_history.pop()
         conversation_history = self._llm_safe_user_history(conversation_history)
 
+        # A counted reference such as "把这98笔都列给我" is an explicit
+        # expansion of the immediately preceding result. Resolve it before
+        # asking the model to route the request so a weak/ambiguous model
+        # cannot turn a safe follow-up into a clarification response.
+        history = state.get("public_memory_context") or []
+        if continuing_query and is_counted_result_reference(state["user_query"]) and history:
+            latest = history[0]
+            query_id = str(latest.get("query_id") or "").strip()
+            previous_goal = str(latest.get("goal") or "").strip()
+            if query_id and previous_goal:
+                proposal = MethodProposal(
+                    entity_id="finance_query",
+                    entity_type="skill",
+                    goal=f"展开以下历史查询的明细记录：{previous_goal}",
+                    preferred_runtime="sql",
+                    query_reference=QueryReference(
+                        mode="query",
+                        query_ids=[query_id],
+                        relation="expand_detail",
+                    ),
+                    reason="用户明确引用上一条查询返回的计数结果。",
+                )
+                plan = ResponsePlan(
+                    message="我会列出上一条查询对应的明细记录。",
+                    method_proposal=proposal,
+                    confidence=1.0,
+                )
+                return {
+                    **state,
+                    "response_plan": plan.model_dump(mode="json"),
+                    "tool_decision": response_plan_to_tool_decision(plan).model_dump(mode="json"),
+                    "sent_memory_count": len(state.get("public_memory_context") or []),
+                    "relevant_memories": [],
+                    "status": "response_planned",
+                }
+
         plan = plan_response_with_llm_and_registry(
             state["user_query"],
             self.settings,
@@ -953,7 +1023,7 @@ class FinanceAgentRuntime:
                         "query_ids": [selected_query_id],
                     }
                 )
-            if candidate_selection.get("resolution") == "latest":
+            if candidate_selection.get("resolution") in {"latest", "counted_latest"}:
                 # The model may have chosen an older query's wording even
                 # after the backend resolved "刚才/最近一次" to the newest
                 # record.  Rebuild the planning goal from the resolved safe
@@ -1046,24 +1116,59 @@ class FinanceAgentRuntime:
 
         tables = []
         for t in self.table_registry.all_tables():
-            columns = [
-                ColumnMeta(
-                    name=col.name,
-                    type=col.type,
-                    semantic=col.description,
-                    sensitive=col.sensitive,
-                    semantic_aliases=col.semantic_aliases,
-                    value_aliases=col.value_aliases,
+            catalog_overlay = self.catalog.table(t.name)
+            table_overlay = self.table_metadata.get(t.name) or {}
+            overlay_columns = {
+                column.name: column
+                for column in (catalog_overlay.columns if catalog_overlay else [])
+            }
+            columns = []
+            for col in t.columns:
+                overlay_column = overlay_columns.get(col.name)
+                columns.append(
+                    ColumnMeta(
+                        name=col.name,
+                        type=col.type,
+                        semantic=col.description or (overlay_column.semantic if overlay_column else ""),
+                        sensitive=col.sensitive or (overlay_column.sensitive if overlay_column else False),
+                        semantic_aliases=col.semantic_aliases or (
+                            overlay_column.semantic_aliases if overlay_column else []
+                        ),
+                        value_aliases=col.value_aliases or (
+                            overlay_column.value_aliases if overlay_column else {}
+                        ),
+                    )
                 )
-                for col in t.columns
-            ]
             relationships = [
-                RelationshipMeta(**rel)
+                RelationshipMeta.model_validate(
+                    {"from": rel.get("from_field"), "to": rel.get("to"), "type": rel.get("type")}
+                )
                 for rel in t.get_relationships()
             ]
+            if catalog_overlay or table_overlay:
+                table_description = t.description or (
+                    catalog_overlay.description if catalog_overlay else ""
+                ) or str(table_overlay.get("description") or "")
+                known_relationships = {
+                    (relationship.from_field, relationship.to)
+                    for relationship in relationships
+                }
+                overlay_relationships = list(catalog_overlay.relationships) if catalog_overlay else []
+                overlay_relationships.extend(
+                    RelationshipMeta.model_validate(relationship)
+                    for relationship in table_overlay.get("relationships", [])
+                    if isinstance(relationship, dict)
+                )
+                relationships.extend(
+                    relationship
+                    for relationship in overlay_relationships
+                    if (relationship.from_field, relationship.to) not in known_relationships
+                )
+            else:
+                table_description = t.description
             tables.append(TableMeta(
                 name=t.name,
-                description=t.description,
+                description=table_description,
                 columns=columns,
                 relationships=relationships,
             ))
@@ -1164,7 +1269,7 @@ class FinanceAgentRuntime:
         )
         return {
             **state,
-            "visible_catalog": visible.model_dump(),
+            "visible_catalog": visible.model_dump(by_alias=True),
             "metadata_disclosure": metadata_disclosure,
             "status": "metadata_loaded",
         }
@@ -1257,7 +1362,7 @@ class FinanceAgentRuntime:
             "entity_type": proposal.get("entity_type"),
             "preferred_runtime": proposal.get("preferred_runtime"),
             # 第二层：只把首轮已选中的 capability 规格交给 SQL 规划器。
-            # 首轮路由不再携带 173 张表的摘要，避免模型在还没决定能力时
+            # 首轮路由不携带全量表摘要，避免模型在还没决定能力时
             # 就被完整 schema 索引干扰。
             "selected_capability_detail": state.get("selected_capability_detail"),
             "selected_skill_detail": state.get("selected_skill_detail"),
@@ -1266,25 +1371,34 @@ class FinanceAgentRuntime:
         if base_query_reference:
             # 只传参数化 SQL、脱敏目标和结构信息，不传 result_ref、参数值或结果行。
             action_context["base_query_reference"] = base_query_reference
-        try:
-            plan = plan_analysis_with_lmstudio(
-                sql_planning_goal,
-                visible,
-                self.operation_registry,
-                self.settings,
-                self.llm_provider,
-                action_context=action_context,
-                input_slots=self._planner_input_slots(sql_input_slots),
-                handler_manifest=self.handler_registry.manifest_for_llm(),
-                business_term_manifest=self.business_term_registry.manifest_for_llm(),
-            )
-            plan = self._apply_action_constraints(plan, state)
-            planner_used = self.llm_provider.provider_name
-        except Exception as exc:
-            errors.append(f"lmstudio analysis planner failed: {type(exc).__name__}: {exc}")
-            plan = plan_analysis_with_rules(user_goal, visible)
-            plan = self._apply_action_constraints(plan, state)
-            planner_used = "rule"
+        plan = build_deterministic_plan(
+            user_goal,
+            visible,
+            sql_input_slots,
+            query_context=state.get("user_query", ""),
+        )
+        if plan is not None:
+            planner_used = "deterministic"
+        else:
+            try:
+                plan = plan_analysis_with_lmstudio(
+                    sql_planning_goal,
+                    visible,
+                    self.operation_registry,
+                    self.settings,
+                    self.llm_provider,
+                    action_context=action_context,
+                    input_slots=self._planner_input_slots(sql_input_slots),
+                    handler_manifest=self.handler_registry.manifest_for_llm(),
+                    business_term_manifest=self.business_term_registry.manifest_for_llm(),
+                )
+                plan = self._apply_action_constraints(plan, state)
+                planner_used = self.llm_provider.provider_name
+            except Exception as exc:
+                errors.append(f"lmstudio analysis planner failed: {type(exc).__name__}: {exc}")
+                plan = plan_analysis_with_rules(user_goal, visible)
+                plan = self._apply_action_constraints(plan, state)
+                planner_used = "rule"
         plan = self._apply_skill_constraints(plan, state)
         normalized_validation = {
             **(state.get("action_validation") or {}),
@@ -1889,7 +2003,7 @@ class FinanceAgentRuntime:
     ) -> str | None:
         """调用 LLM 修复 SQL。"""
         try:
-            # 修复只能使用本次请求的可见 schema，避免让模型从 173 张表中猜表名。
+            # 修复只能使用本次请求的可见 schema，避免让模型猜表名。
             table_manifest = (visible_catalog or {}).get("tables") or self.table_registry.manifest_for_llm()
             table_info = "\n".join([
                 f"- {t['name']}: {', '.join(column['name'] if isinstance(column, dict) else str(column) for column in t['columns'])}"
@@ -2341,6 +2455,7 @@ class FinanceAgentRuntime:
             "result_hash": stable_hash(state.get("mock_result") or state.get("rows")),
             "row_count": state.get("row_count"),
             "elapsed_ms": state.get("elapsed_ms"),
+            "observability": state.get("observability"),
         }
         audit = self.audit_logger.append(event)
 

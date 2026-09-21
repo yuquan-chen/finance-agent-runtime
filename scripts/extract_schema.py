@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import re
 import sys
 from pathlib import Path
@@ -156,7 +157,7 @@ def _split_column_definitions(body: str) -> list[str]:
 
 def _normalize_sql_type(sql_type: str) -> str:
     """标准化 SQL 类型。"""
-    sql_type = sql_type.upper()
+    sql_type = sql_type.upper().strip()
     type_map = {
         'INT': 'integer',
         'INTEGER': 'integer',
@@ -167,7 +168,9 @@ def _normalize_sql_type(sql_type: str) -> str:
         'FLOAT': 'numeric',
         'REAL': 'numeric',
         'DOUBLE': 'numeric',
+        'DOUBLE PRECISION': 'numeric',
         'VARCHAR': 'varchar',
+        'CHARACTER VARYING': 'varchar',
         'CHAR': 'varchar',
         'TEXT': 'text',
         'BOOLEAN': 'boolean',
@@ -177,9 +180,15 @@ def _normalize_sql_type(sql_type: str) -> str:
         'JSONB': 'jsonb',
         'TIMESTAMP': 'timestamptz',
         'TIMESTAMPTZ': 'timestamptz',
+        'TIMESTAMP WITH TIME ZONE': 'timestamptz',
+        'TIMESTAMP WITHOUT TIME ZONE': 'timestamp',
         'DATE': 'date',
         'TIME': 'time',
     }
+
+    for type_name in sorted(type_map, key=len, reverse=True):
+        if sql_type.startswith(type_name):
+            return type_map[type_name]
 
     # 提取基础类型（去掉括号）
     base_type = re.match(r'(\w+)', sql_type)
@@ -564,66 +573,58 @@ def parse_database_connection(connection_string: str) -> list[dict[str, Any]]:
         sys.exit(1)
 
     conn = psycopg2.connect(connection_string)
-    cursor = conn.cursor()
+    try:
+        with conn.cursor() as cursor:
+            # Read directly from PostgreSQL system catalogs. This avoids the
+            # information_schema join plus per-column description function
+            # lookup that is expensive on the remote RDS instance.
+            cursor.execute("""
+                SELECT
+                    cls.relname,
+                    COALESCE(table_description.description, ''),
+                    attr.attname,
+                    format_type(attr.atttypid, attr.atttypmod),
+                    NOT attr.attnotnull,
+                    COALESCE(description.description, '')
+                FROM pg_catalog.pg_class AS cls
+                JOIN pg_catalog.pg_namespace AS ns
+                    ON ns.oid = cls.relnamespace
+                JOIN pg_catalog.pg_attribute AS attr
+                    ON attr.attrelid = cls.oid
+                   AND attr.attnum > 0
+                   AND NOT attr.attisdropped
+                LEFT JOIN pg_catalog.pg_description AS description
+                    ON description.objoid = cls.oid
+                   AND description.objsubid = attr.attnum
+                LEFT JOIN pg_catalog.pg_description AS table_description
+                    ON table_description.objoid = cls.oid
+                   AND table_description.objsubid = 0
+                WHERE ns.nspname = 'public'
+                  AND cls.relkind IN ('r', 'p', 'v', 'm')
+                ORDER BY cls.relname, attr.attnum
+            """)
+            column_rows = cursor.fetchall()
+    finally:
+        conn.close()
 
-    # 查询所有表
-    cursor.execute("""
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        ORDER BY table_name
-    """)
-    table_names = [row[0] for row in cursor.fetchall()]
-
-    tables = []
-    for table_name in table_names:
-        # 查询表注释
-        cursor.execute("""
-            SELECT pgd.description
-            FROM pg_catalog.pg_statio_all_tables st
-            LEFT JOIN pg_catalog.pg_description pgd
-                ON pgd.objoid = st.relid AND pgd.objsubid = 0
-            WHERE st.schemaname = 'public' AND st.relname = %s
-        """, (table_name,))
-        table_comment_row = cursor.fetchone()
-        table_comment = table_comment_row[0] if table_comment_row else ''
-
-        # 查询列信息
-        cursor.execute("""
-            SELECT
-                c.column_name,
-                c.data_type,
-                c.is_nullable,
-                pgd.description
-            FROM information_schema.columns c
-            LEFT JOIN pg_catalog.pg_statio_all_tables st
-                ON c.table_schema = st.schemaname AND c.table_name = st.relname
-            LEFT JOIN pg_catalog.pg_description pgd
-                ON pgd.objoid = st.relid AND pgd.objsubid = c.ordinal_position
-            WHERE c.table_schema = 'public' AND c.table_name = %s
-            ORDER BY c.ordinal_position
-        """, (table_name,))
-
-        columns = []
-        for row in cursor.fetchall():
-            col_name, data_type, is_nullable, description = row
-            columns.append({
-                'name': col_name,
-                'type': _normalize_sql_type(data_type),
-                'nullable': is_nullable == 'YES',
-                'description': description or '',
-            })
-
-        tables.append({
-            'table_name': table_name,
-            'table_comment': table_comment,
-            'columns': columns,
+    tables_by_name: dict[str, dict[str, Any]] = {}
+    for table_name, table_comment, col_name, data_type, nullable, description in column_rows:
+        table = tables_by_name.setdefault(
+            table_name,
+            {
+                'table_name': table_name,
+                'table_comment': table_comment or '',
+                'columns': [],
+            },
+        )
+        table['columns'].append({
+            'name': col_name,
+            'type': _normalize_sql_type(data_type.split('(')[0]),
+            'nullable': nullable,
+            'description': description or '',
         })
 
-    cursor.close()
-    conn.close()
-
-    return tables
+    return list(tables_by_name.values())
 
 
 # ---------------------------------------------------------------------------
@@ -683,14 +684,18 @@ def generate_python_file(table_name: str, columns: list[dict], output_dir: Path,
     existing_table_description, existing_column_descriptions = _existing_business_metadata(output_path)
 
     # 上游 ORM/DDL 的 comment 优先；没有时严格保留本地 LLM/人工补充。
-    description = (table_comment or existing_table_description).replace('"', '\\"')
+    description = table_comment or existing_table_description
+
+    def literal(value: Any) -> str:
+        """生成可安全嵌入 Python 源文件的字符串字面量。"""
+        return json.dumps(str(value), ensure_ascii=False)
 
     lines = [
         f'"""自动提取的 {table_name} 表 schema。"""',
         "from finance_agent.metadata.table_registry import register_table",
         "",
         "",
-        f'@register_table(name="{table_name}", description="{description}")',
+        f'@register_table(name={literal(table_name)}, description={literal(description)})',
         f"class {class_name}:",
     ]
 
@@ -702,13 +707,13 @@ def generate_python_file(table_name: str, columns: list[dict], output_dir: Path,
             col_name = col['name']
             col_type = col['type']
             nullable = col['nullable']
-            desc = (col.get('description') or existing_column_descriptions.get(col_name, '')).replace('"', '\\"')
+            desc = col.get('description') or existing_column_descriptions.get(col_name, '')
 
-            meta_parts = [f'"type": "{col_type}"']
+            meta_parts = [f'"type": {literal(col_type)}']
             if not nullable:
                 meta_parts.append('"nullable": False')
             if desc:
-                meta_parts.append(f'"description": "{desc}"')
+                meta_parts.append(f'"description": {literal(desc)}')
 
             meta_str = ', '.join(meta_parts)
             lines.append(f'        "{col_name}": {{{meta_str}}},')

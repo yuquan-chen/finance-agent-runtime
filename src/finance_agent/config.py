@@ -32,7 +32,9 @@ class Settings:
     database_url: str
     db_statement_timeout_ms: int
     db_max_rows: int
+    safe_query_definitions_path: Path
     catalog_path: Path
+    table_metadata_path: Path
     policy_path: Path
     operations_path: Path
     skills_path: Path
@@ -44,6 +46,9 @@ class Settings:
     session_store_path: Path
     auth_mode: str
     auth_secret: str
+    langsmith_tracing: bool
+    langsmith_project: str
+    langsmith_endpoint: str
     # PostgreSQL 配置
     pg_host: str
     pg_port: str
@@ -65,7 +70,13 @@ def get_settings() -> Settings:
         database_url=os.environ.get("DATABASE_URL", ""),
         db_statement_timeout_ms=int(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "30000")),
         db_max_rows=int(os.environ.get("DB_MAX_ROWS", "1000")),
+        safe_query_definitions_path=Path(
+            os.environ.get("SAFE_QUERY_DEFINITIONS_PATH", str(PROJECT_ROOT / "config" / "safe_queries.yaml"))
+        ),
         catalog_path=Path(os.environ.get("CATALOG_PATH", str(PROJECT_ROOT / "config" / "catalog.yaml"))),
+        table_metadata_path=Path(
+            os.environ.get("TABLE_METADATA_PATH", str(PROJECT_ROOT / "config" / "table_metadata.yaml"))
+        ),
         policy_path=Path(os.environ.get("POLICY_PATH", str(PROJECT_ROOT / "config" / "policy.yaml"))),
         operations_path=Path(os.environ.get("OPERATIONS_PATH", str(PROJECT_ROOT / "config" / "operations.yaml"))),
         skills_path=Path(os.environ.get("SKILLS_PATH", str(PROJECT_ROOT / "config" / "skills.yaml"))),
@@ -79,6 +90,11 @@ def get_settings() -> Settings:
         session_store_path=Path(os.environ.get("SESSION_STORE_PATH", str(PROJECT_ROOT / "data" / "sessions"))),
         auth_mode=os.environ.get("AUTH_MODE", "local").strip().lower(),
         auth_secret=os.environ.get("AUTH_SECRET", ""),
+        langsmith_tracing=os.environ.get(
+            "LANGSMITH_TRACING", os.environ.get("LANGCHAIN_TRACING_V2", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"},
+        langsmith_project=os.environ.get("LANGSMITH_PROJECT", "dogpay-admin-agent"),
+        langsmith_endpoint=os.environ.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
         # PostgreSQL 配置
         pg_host=os.environ.get("PG_HOST", "localhost"),
         pg_port=os.environ.get("PG_PORT", "5432"),

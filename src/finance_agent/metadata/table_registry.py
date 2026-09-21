@@ -86,24 +86,8 @@ class TableMeta(BaseModel):
 
 _pending_tables: list[dict[str, Any]] = []
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DESCRIPTION_OVERLAY_PATH = PROJECT_ROOT / "schema_catalog" / "table_descriptions.yaml"
 VALUE_ALIASES_OVERLAY_PATH = PROJECT_ROOT / "schema_catalog" / "value_aliases.yaml"
 SCHEMA_TABLES_PATH = PROJECT_ROOT / "schema_catalog" / "tables"
-
-
-def _load_description_overlay(path: Path = DESCRIPTION_OVERLAY_PATH) -> dict[str, str]:
-    """读取不属于 ORM 的业务说明覆盖层。"""
-    if not path.exists():
-        return {}
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    tables = raw.get("tables", {}) if isinstance(raw, dict) else {}
-    if not isinstance(tables, dict):
-        return {}
-    return {
-        str(table_name): str(description).strip()
-        for table_name, description in tables.items()
-        if str(description).strip()
-    }
 
 
 def _load_value_aliases_overlay(path: Path = VALUE_ALIASES_OVERLAY_PATH) -> dict[str, dict[str, dict[str, Any]]]:
@@ -259,7 +243,6 @@ def get_default_table_registry() -> TableRegistry:
 
     registry = TableRegistry()
 
-    description_overlay = _load_description_overlay()
     value_aliases_overlay = _load_value_aliases_overlay()
     for table_data in _pending_tables:
         columns = [
@@ -284,7 +267,7 @@ def get_default_table_registry() -> TableRegistry:
         ]
         registry.register(TableMeta(
             name=table_data["name"],
-            description=description_overlay.get(table_data["name"], table_data["description"]),
+            description=table_data["description"],
             columns=columns,
             source="decorator",
         ))

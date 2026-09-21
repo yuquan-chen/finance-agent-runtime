@@ -68,6 +68,7 @@ class RunResponse(BaseModel):
     result_narration: dict[str, Any] | None = None
     result_narrations: list[dict[str, Any]] | None = None
     audit: dict[str, Any] | None = None
+    observability: dict[str, Any] | None = None
 
 
 class SessionCreateRequest(BaseModel):

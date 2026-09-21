@@ -8,6 +8,7 @@ from typing import Any, Protocol
 import httpx
 
 from finance_agent.config import Settings
+from finance_agent.observability import record_llm_response
 
 
 Message = dict[str, str]
@@ -30,6 +31,7 @@ class LlmResponse:
     elapsed_ms: int
     raw: dict[str, Any]
     tool_calls: tuple[LlmToolCall, ...] = ()
+    token_usage: dict[str, int] | None = None
 
 
 class LlmProvider(Protocol):
@@ -143,13 +145,16 @@ class OpenAICompatibleLlmProvider:
         message = data["choices"][0]["message"]
         # DeepSeek 返回 reasoning_content 和 content，优先用 content
         content = message.get("content") or message.get("reasoning_content") or ""
-        return LlmResponse(
+        result = LlmResponse(
             content=content,
             provider=self.provider_name,
             model=self.settings.lmstudio_model,
             elapsed_ms=int((time.time() - started) * 1000),
             raw=data,
+            token_usage=_token_usage(data),
         )
+        record_llm_response(result, operation="chat")
+        return result
 
     def chat_json(
         self,
@@ -218,14 +223,17 @@ class OpenAICompatibleLlmProvider:
                     arguments=arguments,
                 )
             )
-        return LlmResponse(
+        result = LlmResponse(
             content=message.get("content") or "",
             provider=self.provider_name,
             model=self.settings.lmstudio_model,
             elapsed_ms=int((time.time() - started) * 1000),
             raw=data,
             tool_calls=tuple(calls),
+            token_usage=_token_usage(data),
         )
+        record_llm_response(result, operation="chat_with_tools")
+        return result
 
     def _chat_with_text_fallback(
         self,
@@ -252,6 +260,20 @@ class OpenAICompatibleLlmProvider:
 
 def build_llm_provider(settings: Settings) -> LlmProvider:
     return OpenAICompatibleLlmProvider(settings)
+
+
+def _token_usage(data: dict[str, Any]) -> dict[str, int] | None:
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+    output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+    total_tokens = usage.get("total_tokens", 0) or 0
+    return {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "total_tokens": int(total_tokens or input_tokens + output_tokens),
+    }
 
 
 def extract_json_object(text: str) -> dict[str, Any]:

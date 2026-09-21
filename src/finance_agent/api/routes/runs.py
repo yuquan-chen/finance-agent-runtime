@@ -13,6 +13,121 @@ from finance_agent.security.principal import Principal
 router = APIRouter()
 
 
+_THINKING_LABELS = {
+    "plan_response": "理解查询目标",
+    "validate_action": "校验查询意图",
+    "search_schema": "匹配业务表",
+    "select_schema": "选择查询范围",
+    "load_metadata": "加载字段信息",
+    "plan_analysis": "生成查询方案",
+    "generate_method": "生成查询方法",
+    "query_guard": "执行安全校验",
+    "repair_method": "修正查询方法",
+    "prepare_schema_repair": "重新匹配字段",
+    "execute_readonly": "查询数据库",
+    "render_direct_response": "整理返回结果",
+    "render_method_card": "整理查询结果",
+    "refuse_method": "检查查询边界",
+    "audit": "记录调用审计",
+}
+
+
+def _thinking_event(stage: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Expose safe progress facts, never the model's hidden chain of thought."""
+    detail = ""
+    if stage == "search_schema":
+        detail = f"已找到 {len(state.get('schema_candidates') or [])} 个候选表"
+    elif stage == "select_schema":
+        detail = f"已选择 {len(state.get('selected_schema_tables') or [])} 张表"
+    elif stage == "load_metadata":
+        detail = "字段和关系信息已加载"
+    elif stage == "query_guard":
+        report = state.get("validation_report") or {}
+        detail = "查询安全校验通过" if report.get("allowed") else "查询安全校验未通过"
+    elif stage == "execute_readonly":
+        detail = "正在执行只读查询，不执行写操作"
+    elif stage == "audit":
+        detail = "查询结果和调用指标已记录"
+    return {
+        "stage": stage,
+        "label": _THINKING_LABELS.get(stage, stage),
+        "detail": detail,
+        "status": state.get("status"),
+    }
+
+
+def _trace_event(stage: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Build a user-visible trace from safe, structured runtime artifacts.
+
+    This intentionally exposes the plan and generated method, not hidden model
+    reasoning or the full prompt/context sent to the model.
+    """
+    trace: dict[str, Any] = {
+        "stage": stage,
+        "label": _THINKING_LABELS.get(stage, stage),
+        "summary": _thinking_event(stage, state).get("detail", ""),
+        "artifacts": [],
+    }
+    response_plan = state.get("response_plan") or {}
+    if stage == "plan_response" and response_plan:
+        proposal = response_plan.get("method_proposal") or {}
+        trace["artifacts"] = [
+            {"label": "请求类型", "value": (response_plan.get("intent") or {}).get("intent") or "query"},
+            {"label": "查询目标", "value": proposal.get("goal") or response_plan.get("message") or "已识别"},
+            {"label": "查询能力", "value": proposal.get("entity_id") or "通用查询"},
+        ]
+    elif stage == "validate_action":
+        validation = state.get("action_validation") or {}
+        trace["artifacts"] = [
+            {"label": "校验结果", "value": "允许" if validation.get("allowed") else "需要阻止或补充信息"},
+            {"label": "查询目标", "value": validation.get("user_goal") or "已校验"},
+        ]
+    elif stage == "search_schema":
+        trace["artifacts"] = [{"label": "候选表", "value": [item.get("name") for item in state.get("schema_candidates") or []]}]
+    elif stage == "select_schema":
+        trace["artifacts"] = [{"label": "选中表", "value": state.get("selected_schema_tables") or []}]
+    elif stage == "load_metadata":
+        disclosure = state.get("metadata_disclosure") or {}
+        trace["artifacts"] = [
+            {"label": "可见表", "value": disclosure.get("selected_tables") or state.get("selected_schema_tables") or []},
+            {"label": "字段范围", "value": disclosure.get("field_count") or disclosure.get("selected_fields") or "已加载"},
+        ]
+    elif stage == "plan_analysis":
+        plan = state.get("analysis_plan") or {}
+        trace["artifacts"] = [
+            {"label": "分析步骤", "value": [
+                {
+                    "operation": step.get("operation"),
+                    "table": step.get("table"),
+                    "metric": step.get("metric"),
+                    "group_by": step.get("group_by") or step.get("dimension"),
+                }
+                for step in plan.get("steps") or []
+            ]},
+        ]
+    elif stage in {"generate_method", "repair_method"}:
+        method = state.get("method_draft") or {}
+        trace["artifacts"] = [
+            {"label": "方法类型", "value": method.get("method_type") or "sql"},
+            {"label": "使用表", "value": method.get("table")},
+            {"label": "使用字段", "value": method.get("required_fields") or []},
+        ]
+    elif stage == "query_guard":
+        report = state.get("validation_report") or {}
+        trace["artifacts"] = [
+            {"label": "只读校验", "value": "通过" if report.get("allowed") else "未通过"},
+            {"label": "检查项", "value": report.get("checks") or []},
+        ]
+    elif stage == "execute_readonly":
+        trace["artifacts"] = [
+            {"label": "执行模式", "value": state.get("execution_mode") or "direct_db"},
+            {"label": "返回行数", "value": state.get("row_count")},
+        ]
+    if state.get("sql") and stage in {"generate_method", "repair_method", "query_guard", "execute_readonly", "render_method_card", "render_direct_response"}:
+        trace["artifacts"].append({"label": "SQL 草稿", "value": state["sql"]})
+    return trace
+
+
 def _app():
     # Import lazily so the route group can be included by app.py without a
     # module cycle. The runtime and compatibility cache live in app.py.
@@ -109,10 +224,12 @@ async def create_run_stream(
                 if stage in {"render_direct_response", "render_method_card", "refuse_method", "audit"} and state.get("sql") and "sql" not in emitted_values:
                     emitted_values.add("sql")
                     yield f"data: {json.dumps({'type': 'sql', 'data': state['sql']})}\n\n"
+                yield f"data: {json.dumps({'type': 'trace', 'data': _trace_event(stage, state)}, ensure_ascii=False)}\n\n"
                 errors = tuple(state.get("errors") or [])
                 if errors and errors != emitted_errors:
                     emitted_errors = errors
                     yield f"data: {json.dumps({'type': 'errors', 'data': list(errors)})}\n\n"
+                yield f"data: {json.dumps({'type': 'thinking', 'data': _thinking_event(stage, state)}, ensure_ascii=False)}\n\n"
                 # 通用阶段事件用于调试面板，保持原有事件类型兼容。
                 yield f"data: {json.dumps({'type': 'stage', 'stage': stage, 'status': state.get('status')})}\n\n"
             if final_state is None:
@@ -120,7 +237,7 @@ async def create_run_stream(
             state = final_state
             mod._sync_pending_review(state)
             yield f"data: {json.dumps({'type': 'complete', 'data': _response(state).model_dump()})}\n\n"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - convert stream failures to safe client events
             if isinstance(exc, httpx.TransportError):
                 message = "模型服务连接失败，请稍后重试。"
             elif isinstance(exc, TimeoutError):

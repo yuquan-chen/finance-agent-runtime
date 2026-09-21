@@ -51,3 +51,16 @@ class Catalog(BaseModel):
 def load_catalog(path: Path) -> Catalog:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return Catalog.model_validate(raw)
+
+
+def load_table_metadata(path: Path) -> dict[str, dict[str, Any]]:
+    """Load table-level descriptions and explicit join relationships."""
+    if not path.exists():
+        return {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    tables = raw.get("tables", {}) if isinstance(raw, dict) else {}
+    return {
+        str(name): value
+        for name, value in tables.items()
+        if isinstance(value, dict)
+    }

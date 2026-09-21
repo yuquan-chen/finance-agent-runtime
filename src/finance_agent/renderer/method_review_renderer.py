@@ -198,7 +198,7 @@ def build_execution_result_card(
     # sandbox. Aggregate queries can read 100 rows and return one row.
     row_count = len(output) if isinstance(output, list) else (1 if isinstance(output, dict) else 0)
     execution_mode = str(execution_result.input_summary.get("execution_mode") or "simulated_real")
-    if execution_mode not in {"simulated_real", "direct_db"}:
+    if execution_mode not in {"simulated_real", "direct_db", "safe_db"}:
         execution_mode = "simulated_real"
     return ExecutionResultCard(
         status="executed",

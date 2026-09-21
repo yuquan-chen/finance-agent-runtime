@@ -8,7 +8,34 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+
+CATALOG_MOCK_DATA_PATH = Path(__file__).resolve().parents[1] / "executor" / "mock_data.json"
+CATALOG_MOCK_ROW_LIMIT = 20
+
+
+def load_catalog_mock_data() -> dict[str, list[dict[str, Any]]]:
+    """Load the bounded local test-environment snapshot when available.
+
+    This is the application mock source. Synthetic relational fixtures from
+    ``generate_mock_data`` are intentionally not merged here because they can
+    invent entities that do not exist in the selected test snapshot.
+    """
+    if not CATALOG_MOCK_DATA_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(CATALOG_MOCK_DATA_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(table_name): rows[:CATALOG_MOCK_ROW_LIMIT]
+        for table_name, rows in payload.items()
+        if isinstance(rows, list) and all(isinstance(row, dict) for row in rows)
+    }
 
 
 def _mock_uuid(prefix: str, index: int) -> str:

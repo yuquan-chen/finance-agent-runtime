@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 class AnalysisStep(BaseModel):
     operation: str
     table: str = "card_transaction"
+    query_id: str | None = None
     metric: str | None = None
     dimension: str | None = None
     group_by: str | None = None
@@ -43,6 +44,7 @@ class MethodDraft(BaseModel):
     goal: str
     operation: str
     table: str = "card_transaction"
+    query_id: str | None = None
     data_source: Literal["table", "result_ref"] = "table"
     result_ref: str | None = None
     required_fields: list[str] = Field(default_factory=list)
@@ -108,7 +110,7 @@ class DataAuthorizationCard(BaseModel):
 
 class ExecutionResultCard(BaseModel):
     status: Literal["executed"]
-    execution_mode: Literal["simulated_real", "direct_db"]
+    execution_mode: Literal["simulated_real", "direct_db", "safe_db"]
     method_name: str
     method_hash: str
     data_authorization: DataAuthorizationCard

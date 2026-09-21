@@ -165,7 +165,6 @@ def assert_readonly_sql(sql: str, policy: Policy) -> None:
         r"'\s*/etc/",  # 路径访问
         r"'\s*/tmp/",
         r"'\s*/var/",
-        r"'\s*\\",  # Windows 路径
         r"'\s*[A-Za-z]:\\",
     ]
     for pattern in dangerous_patterns:

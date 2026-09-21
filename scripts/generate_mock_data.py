@@ -209,8 +209,9 @@ def main():
 
     mock_data = {}
     for table in all_tables:
-        num_rows = 5 if len(table.columns) < 10 else 3
-        mock_data[table.name] = generate_mock_data_for_table(table.name, table.columns, num_rows)
+        # Keep the catalog fixture small and uniform. It is a local structural
+        # sample, not a copy of production data.
+        mock_data[table.name] = generate_mock_data_for_table(table.name, table.columns, 5)
 
     # 保存到文件
     output_path = Path(__file__).parent.parent / "src" / "finance_agent" / "executor" / "mock_data.json"

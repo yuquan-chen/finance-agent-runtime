@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 
 from finance_agent import __version__
+from finance_agent.api.routes.query import router as query_router
 from finance_agent.api.routes.runs import router as runs_router
 from finance_agent.api.routes.sessions import router as sessions_router
 from finance_agent.api.schemas import (
@@ -31,6 +32,7 @@ from finance_agent.graph.runtime import FinanceAgentRuntime
 from finance_agent.kyc.attachment_ingest import extract_attachment_reviews
 from finance_agent.kyc.attachment_intent import route_attachment_intent
 from finance_agent.kyc.local_drafts import KycDraftError
+from finance_agent.query.safe_requests import SafeQueryRegistry
 from finance_agent.security.principal import Principal, principal_from_headers
 from finance_agent.session.thread_store import RESUMABLE_STATUSES
 from finance_agent.skills.agent import SkillAgentError
@@ -53,6 +55,12 @@ PENDING_REVIEW_STATUSES = {
 }
 app.include_router(runs_router)
 app.include_router(sessions_router)
+app.include_router(query_router)
+
+
+@lru_cache(maxsize=1)
+def safe_query_registry() -> SafeQueryRegistry:
+    return SafeQueryRegistry.from_yaml(runtime().settings.safe_query_definitions_path)
 
 
 @app.post("/v1/frontend-events")
@@ -1052,6 +1060,7 @@ def _safe_run_detail(state: dict[str, Any]) -> dict[str, Any]:
         "status_text": status_text,
         "status_type": status_type,
         "entries": entries,
+        "observability": state.get("observability"),
         "skill_id": skill_detail.get("skill_id"),
         "skill_detail": skill_detail or None,
         "skill_card": state.get("skill_card"),
@@ -1125,4 +1134,5 @@ def _response_from_state(state: dict[str, Any]) -> RunResponse:
         result_narration=state.get("result_narration"),
         result_narrations=state.get("result_narrations"),
         audit=state.get("audit"),
+        observability=state.get("observability"),
     )

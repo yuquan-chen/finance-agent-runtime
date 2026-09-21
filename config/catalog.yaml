@@ -95,7 +95,7 @@ business_terms:
   customer:
     description: "Customer identity is resolved through the account name fields; transaction account identifiers remain available as join fields."
     aliases: ["客户", "公司", "企业", "company"]
-    candidate_tables: ["account", "card_transaction", "payout_transaction", "pay_transaction"]
+    candidate_tables: ["account", "card_transaction", "va_transaction", "payout_transaction", "pay_transaction"]
   card_channel:
     description: "Card channel dimension."
     aliases: ["卡渠道", "渠道", "channel"]

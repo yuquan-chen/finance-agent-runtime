@@ -8,7 +8,7 @@ from finance_agent.builder.sql_builder import assert_readonly_sql
 from finance_agent.harness.plan_schema import Intent, QueryPlan
 from finance_agent.harness.analysis_schema import MethodDraft, MockDryRunResult
 from finance_agent.metadata.policy import Policy
-from finance_agent.sandbox.mock_data import generate_mock_data
+from finance_agent.sandbox.mock_data import load_catalog_mock_data
 from finance_agent.sandbox.mock_sandbox import run_simulated_real_execution
 
 
@@ -19,8 +19,8 @@ class QueryResult:
     elapsed_ms: int
 
 
-# 生成全量 mock 数据
-_MOCK_DATA: dict[str, list[dict[str, Any]]] = generate_mock_data()
+# 应用 mock 查询只使用测试环境快照，不混入合成 Company 或交易记录。
+_MOCK_DATA: dict[str, list[dict[str, Any]]] = load_catalog_mock_data()
 
 
 class MockExecutor:

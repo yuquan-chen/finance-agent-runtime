@@ -1,14 +1,13 @@
-"""SQL Runner — 在 PostgreSQL 中执行只读 SQL。"""
+"""SQL Runner — 在进程内 SQLite 内存库中执行只读 mock SQL。"""
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
+from contextlib import closing
 from typing import Any
 
-import psycopg2
-
-from finance_agent.config import get_settings
 from finance_agent.executor.sql_parameters import normalize_sql_template
-from finance_agent.metadata.table_registry import get_default_table_registry
 from finance_agent.sandbox.provider import SandboxExecutionRequest
 from finance_agent.sandbox.runner_registry import register_runner
 
@@ -17,38 +16,22 @@ class SandboxSqlError(RuntimeError):
     pass
 
 
-def _get_connection():
-    """获取 PostgreSQL 连接。"""
-    settings = get_settings()
-    try:
-        conn = psycopg2.connect(
-            host=settings.pg_host,
-            port=settings.pg_port,
-            database=settings.pg_database,
-            user=settings.pg_user,
-            password=settings.pg_password,
-        )
-        conn.autocommit = True
-        return conn
-    except psycopg2.Error as e:
-        raise SandboxSqlError(f"Failed to connect to PostgreSQL: {e}")
-
-
 @register_runner("sql")
 def run_sql(request: SandboxExecutionRequest) -> list[dict[str, Any]]:
-    """执行 SQL 方法。"""
+    """执行 SQL 方法，不连接任何外部数据库。"""
     method = request.method
     if not method.sql_template:
         raise SandboxSqlError("sql method has no sql_template")
 
-    sql_query, params = _prepare_sql(method.sql_template, method.params)
+    sql_query, params = _prepare_sql(method.sql_template, method.params, dialect="sqlite")
     table = method.table
     extra = request.extra_tables or {}
 
-    conn = _get_connection()
+    conn = sqlite3.connect(":memory:")
+    conn.create_function("DATE_TRUNC", 2, _sqlite_date_trunc)
     try:
-        with conn.cursor() as cursor:
-            # 加载数据到临时表
+        with closing(conn.cursor()) as cursor:
+            # 加载数据到进程内临时表；extra_tables 只提供本次方法需要的本地样本。
             if table not in extra:
                 _load_table(cursor, table, request.rows)
             for extra_name, extra_rows in extra.items():
@@ -68,10 +51,7 @@ def run_sql(request: SandboxExecutionRequest) -> list[dict[str, Any]]:
                 row_dict = {}
                 for i, value in enumerate(row):
                     # 处理特殊类型
-                    if isinstance(value, memoryview):
-                        row_dict[columns[i]] = bytes(value).hex()
-                    else:
-                        row_dict[columns[i]] = value
+                    row_dict[columns[i]] = value
                 result.append(row_dict)
 
             return result
@@ -79,12 +59,20 @@ def run_sql(request: SandboxExecutionRequest) -> list[dict[str, Any]]:
         conn.close()
 
 
-def _prepare_sql(sql: str, params: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
-    """准备 SQL 语句（PostgreSQL 原生语法）。
+def _prepare_sql(
+    sql: str,
+    params: dict[str, Any] | None = None,
+    *,
+    dialect: str = "postgres",
+) -> tuple[str, dict[str, Any]]:
+    """准备 SQL 语句。
 
     返回 (sql, params) 元组：
     - sql: 参数化的 SQL，使用 %s 占位符
     - params: 参数值字典
+
+    默认保留 PostgreSQL 占位符，供 direct-db 兼容性测试使用；mock
+    runner 传入 ``dialect="sqlite"``，从而完全在本地内存库执行。
     """
     prepared = sql.strip().rstrip(";")
 
@@ -113,7 +101,7 @@ def _prepare_sql(sql: str, params: dict[str, Any] | None = None) -> tuple[str, d
         param_name = match.group(1)
         if param_name in prepared_params:
             param_values[param_name] = prepared_params[param_name]
-            return f"%({param_name})s"
+            return f"%({param_name})s" if dialect == "postgres" else f":{param_name}"
         else:
             # 没有提供参数值，使用 NULL
             return "NULL"
@@ -133,11 +121,29 @@ def _prepare_sql(sql: str, params: dict[str, Any] | None = None) -> tuple[str, d
     # = NULL → IS NULL
     prepared = re.sub(r"=\s*NULL", "IS NULL", prepared)
 
+    if dialect == "sqlite":
+        # normalize_sql_template uses PostgreSQL's regexp_replace/ILIKE for
+        # business-name matching. SQLite mock data only needs equivalent
+        # whitespace-tolerant matching for local tests.
+        prepared = re.sub(r"\bILIKE\b", "LIKE", prepared, flags=re.IGNORECASE)
+        prepared = re.sub(
+            r"regexp_replace\(([^(),]+),\s*'\\s\+',\s*'',\s*'g'\)",
+            r"replace(\1, ' ', '')",
+            prepared,
+            flags=re.IGNORECASE,
+        )
+        prepared = re.sub(
+            r"CURRENT_DATE\s*-\s*INTERVAL\s*'([0-9]+)\s+year'",
+            r"date('now', '-\1 year')",
+            prepared,
+            flags=re.IGNORECASE,
+        )
+
     return prepared, param_values
 
 
 def _load_table(cursor, table: str, rows: list[dict[str, Any]]) -> None:
-    """加载数据到 PostgreSQL 临时表。"""
+    """加载数据到 SQLite 临时表。"""
     if not rows:
         return
 
@@ -147,27 +153,24 @@ def _load_table(cursor, table: str, rows: list[dict[str, Any]]) -> None:
     # 获取列名
     columns = _columns(rows)
 
-    # 尝试从 schema 获取字段类型
-    schema_types = _get_schema_types(table)
-
     # 构建列定义
     column_defs = []
     for column in columns:
-        if column in schema_types:
-            pg_type = _schema_type_to_pg(schema_types[column])
-        else:
-            pg_type = _pg_type(rows, column)
-        column_defs.append(f"{_quote_identifier(column)} {pg_type}")
+        # Mock rows are intentionally partial fixtures, not a copy of the
+        # production table. Infer their temporary-table types from values so
+        # a refreshed production catalog cannot invalidate mock data.
+        sqlite_type = _sqlite_type(rows, column)
+        column_defs.append(f"{_quote_identifier(column)} {sqlite_type}")
 
     # 创建表
     cursor.execute(f"CREATE TABLE {_quote_identifier(table)} ({', '.join(column_defs)})")
 
     # 插入数据
-    placeholders = ", ".join(["%s"] * len(columns))
+    placeholders = ", ".join(["?"] * len(columns))
     column_sql = ", ".join(_quote_identifier(column) for column in columns)
     insert_sql = f"INSERT INTO {_quote_identifier(table)} ({column_sql}) VALUES ({placeholders})"
 
-    values = [tuple(row.get(column) for column in columns) for row in rows]
+    values = [tuple(_sqlite_value(row.get(column)) for column in columns) for row in rows]
     cursor.executemany(insert_sql, values)
 
 
@@ -183,8 +186,8 @@ def _columns(rows: list[dict[str, Any]]) -> list[str]:
     return ordered
 
 
-def _pg_type(rows: list[dict[str, Any]], column: str) -> str:
-    """推断 PostgreSQL 列类型。"""
+def _sqlite_type(rows: list[dict[str, Any]], column: str) -> str:
+    """根据本地样本推断 SQLite 临时列类型。"""
     # 时间字段后缀
     time_suffixes = ("_at", "_time", "_date", "_datetime", "_timestamp")
 
@@ -193,24 +196,37 @@ def _pg_type(rows: list[dict[str, Any]], column: str) -> str:
         if value is None:
             continue
         if isinstance(value, bool):
-            return "BOOLEAN"
+            return "INTEGER"
         if isinstance(value, int):
-            return "BIGINT"
+            return "INTEGER"
         if isinstance(value, float):
-            return "NUMERIC"
-        if isinstance(value, dict):
-            return "JSONB"
-        if isinstance(value, list):
-            return "JSONB"
-        if isinstance(value, str):
-            # 检查是否是时间字段（通过字段名）
-            if column.lower().endswith(time_suffixes):
-                return "TIMESTAMPTZ"
-            # 检查是否是 ISO 格式的时间字符串
-            if re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", value):
-                return "TIMESTAMPTZ"
-            return "TEXT"
+            return "REAL"
+        return "TEXT"
     return "TEXT"
+
+
+def _sqlite_value(value: Any) -> Any:
+    """将 JSON、数组和日期等值转换为 SQLite 可绑定的类型。"""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if hasattr(value, "isoformat") and not isinstance(value, (str, bytes)):
+        return value.isoformat()
+    return value
+
+
+def _sqlite_date_trunc(grain: Any, value: Any) -> str | None:
+    """Provide the small DATE_TRUNC subset used by generated mock SQL."""
+    if value is None:
+        return None
+    text = str(value)
+    normalized_grain = str(grain).lower()
+    if normalized_grain == "year":
+        return f"{text[:4]}-01-01"
+    if normalized_grain == "month":
+        return f"{text[:7]}-01"
+    if normalized_grain == "day":
+        return text[:10]
+    return text
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -218,39 +234,3 @@ def _quote_identifier(identifier: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier):
         raise SandboxSqlError(f"invalid identifier: {identifier}")
     return f'"{identifier}"'
-
-
-def _get_schema_types(table: str) -> dict[str, str]:
-    """从 schema 中获取表的字段类型。"""
-    try:
-        registry = get_default_table_registry()
-        table_meta = registry.get(table)
-        if table_meta:
-            return {col.name: col.type for col in table_meta.columns}
-    except Exception:
-        pass
-    return {}
-
-
-def _schema_type_to_pg(schema_type: str) -> str:
-    """将 schema 类型转换为 PostgreSQL 类型。"""
-    type_mapping = {
-        "varchar": "VARCHAR",
-        "text": "TEXT",
-        "bigint": "BIGINT",
-        "int": "INTEGER",
-        "integer": "INTEGER",
-        "numeric": "NUMERIC",
-        "float": "REAL",
-        "double": "DOUBLE PRECISION",
-        "boolean": "BOOLEAN",
-        "bool": "BOOLEAN",
-        "json": "JSONB",
-        "jsonb": "JSONB",
-        "timestamptz": "TIMESTAMPTZ",
-        "timestamp": "TIMESTAMP",
-        "date": "DATE",
-        "time": "TIME",
-        "uuid": "UUID",
-    }
-    return type_mapping.get(schema_type.lower(), "TEXT")

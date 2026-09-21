@@ -6,6 +6,12 @@ operations:
     preferred_mode: "sql"
     risk_level: low
     requires_method_review: false
+  - name: customer_transaction_top_n
+    description: "按客户统计交易笔数或交易金额并返回排名第一的客户。由后端固定交易表、账户表关联和排序规则。"
+    execution_modes: ["sql"]
+    preferred_mode: "sql"
+    risk_level: low
+    requires_method_review: false
   - name: group_by
     description: "按维度分组并计算聚合指标。"
     execution_modes: ["sql"]

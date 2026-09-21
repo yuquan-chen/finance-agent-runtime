@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from finance_agent.harness.analysis_schema import MethodDraft, MockDryRunResult
-from finance_agent.sandbox.mock_data import generate_mock_data
+from finance_agent.sandbox.mock_data import load_catalog_mock_data
 from finance_agent.sandbox.runtime import run_method_in_sandbox
 
 
@@ -53,8 +53,9 @@ def _status_for_index(index: int) -> str:
 
 SIMULATED_REAL_CARD_TRANSACTIONS: list[dict[str, Any]] = build_simulated_card_transactions()
 
-# 全量 mock 数据（所有表）
-ALL_MOCK_DATA: dict[str, list[dict[str, Any]]] = generate_mock_data()
+# 应用执行路径只使用测试环境快照。需要关系完整的合成数据时，测试应
+# 显式调用 generate_mock_data()，不能让它隐式覆盖应用快照。
+ALL_MOCK_DATA: dict[str, list[dict[str, Any]]] = load_catalog_mock_data()
 
 # 模拟真实数据（用于测试）
 SIMULATED_REAL_CARD_TRANSACTIONS: list[dict[str, Any]] = build_simulated_card_transactions()

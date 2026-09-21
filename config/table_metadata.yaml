@@ -1,0 +1,29 @@
+version: "2026-09-11"
+tables:
+  account:
+    description: "客户账户主表：保存客户/企业身份、账户状态及 KYC/KYB 状态。"
+    relationships: []
+  va_transaction:
+    description: "虚拟账户（VA）交易表：保存 VA 入金、出金、支付及相关交易状态和金额。"
+    relationships:
+      - from: account_id
+        to: account.id
+        type: many_to_one
+  card_transaction:
+    description: "卡交易主表：保存卡消费、转账、退款、冲正及手续费等卡业务交易记录。"
+    relationships:
+      - from: account_id
+        to: account.id
+        type: many_to_one
+  pay_transaction:
+    description: "支付交易主表：保存支付订单、退款、支付渠道、结算状态及金额信息。"
+    relationships:
+      - from: account_id
+        to: account.id
+        type: many_to_one
+  payout_transaction:
+    description: "付款交易主表：保存付款、收款人、审核、渠道执行、退款及付款金额信息。"
+    relationships:
+      - from: account_id
+        to: account.id
+        type: many_to_one

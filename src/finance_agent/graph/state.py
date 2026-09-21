@@ -73,6 +73,7 @@ class AgentState(MessagesState):
     rows: list[dict[str, Any]]
     row_count: int
     elapsed_ms: int
+    observability: dict[str, Any]
     answer: str
     audit: dict[str, Any]
     # Dependent execution fields

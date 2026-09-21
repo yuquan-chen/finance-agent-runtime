@@ -397,8 +397,23 @@ def plan_response_with_llm_and_registry(
     if tool_response is not None:
         if tool_response.tool_calls:
             return _plan_from_tool_calls(tool_response.tool_calls, message, skill_registry)
-        if tool_response.content.strip():
-            return ResponsePlan(message=tool_response.content.strip(), method_proposal=None)
+        tool_content = tool_response.content.strip()
+        if tool_content:
+            # Some tool-capable local models return the routing object as text
+            # instead of making a tool call. Parse it through the same
+            # boundary as chat_json so internal protocol fields never become
+            # the user-facing answer.
+            if tool_content.startswith("{"):
+                try:
+                    tool_payload = json.loads(tool_content)
+                except json.JSONDecodeError:
+                    tool_payload = None
+                if isinstance(tool_payload, dict) and any(
+                    key in tool_payload
+                    for key in ("intent", "method_proposal", "proposed_actions", "response_mode")
+                ):
+                    return _normalize(_parse_payload(tool_payload, message), message)
+            return ResponsePlan(message=tool_content, method_proposal=None)
 
     payload, _ = llm_provider.chat_json(llm_messages, temperature=0)
     plan = _parse_payload(payload, message)
@@ -756,6 +771,20 @@ def _looks_like_skill(entity_id: str) -> bool:
 
 def _parse_payload(payload: dict[str, Any], message: str) -> ResponsePlan:
     """解析 LLM 输出，兼容新旧格式。"""
+    # Some local models wrap the complete response object inside the
+    # top-level ``message`` string. Treat that as a transport-format mistake,
+    # otherwise the internal routing JSON is shown to the user verbatim.
+    nested_message = payload.get("message")
+    if isinstance(nested_message, str) and nested_message.lstrip().startswith("{"):
+        try:
+            nested_payload = json.loads(nested_message)
+        except json.JSONDecodeError:
+            nested_payload = None
+        if isinstance(nested_payload, dict) and any(
+            key in nested_payload for key in ("intent", "method_proposal", "proposed_actions", "response_mode")
+        ):
+            payload = {**payload, **nested_payload}
+
     # 兼容模型将 intent 简写为字符串的情况；正常输出仍使用结构化对象。
     if isinstance(payload.get("intent"), str):
         payload = {

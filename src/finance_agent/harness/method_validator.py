@@ -96,6 +96,7 @@ def validate_method_draft(
             )
             errors.extend(sql_errors)
             errors.extend(_validate_sql_column_references(method.sql_template, visible_catalog, table_registry))
+            errors.extend(_validate_sql_join_relationships(method.sql_template, visible_catalog))
     elif method.method_type == "code":
         if not method.code:
             errors.append("code method requires code")
@@ -256,6 +257,81 @@ def _validate_sql_column_references(sql: str, visible_catalog: Catalog, table_re
             errors.append(
                 f"SQL 字段错误：'{field}' 不属于本次查询的表 "
                 f"({', '.join(referenced_tables)})。"
+            )
+    return errors
+
+
+def _validate_sql_join_relationships(sql: str, visible_catalog: Catalog) -> list[str]:
+    """Validate configured foreign-key joins using canonical table/field pairs."""
+    if not visible_catalog:
+        return []
+
+    aliases: dict[str, str] = {}
+    for table_name, alias in re.findall(
+        r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?",
+        sql,
+        re.IGNORECASE,
+    ):
+        aliases[table_name.casefold()] = table_name
+        if alias and alias.casefold() not in {"where", "join", "on", "group", "order", "limit", "having"}:
+            aliases[alias.casefold()] = table_name
+
+    configured: dict[frozenset[str], set[tuple[str, str, str, str]]] = {}
+    for table in visible_catalog.tables:
+        for relationship in table.relationships:
+            if not relationship.from_field or not relationship.to or "." not in relationship.to:
+                continue
+            target_table, target_field = relationship.to.split(".", 1)
+            pair_key = frozenset({table.name.casefold(), target_table.casefold()})
+            configured.setdefault(pair_key, set()).add(
+                (
+                    table.name.casefold(),
+                    relationship.from_field.casefold(),
+                    target_table.casefold(),
+                    target_field.casefold(),
+                )
+            )
+    if not configured:
+        return []
+
+    errors: list[str] = []
+    present_tables = {table_name.casefold() for table_name in aliases.values()}
+    join_pattern = (
+        r"\bJOIN\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?"
+        r"\s+ON\s+(.*?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|$)"
+    )
+    for join_match in re.finditer(join_pattern, sql, re.IGNORECASE | re.DOTALL):
+        joined_name = join_match.group(1).casefold()
+        qualified_pairs = re.findall(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+            r"([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+            join_match.group(3),
+            re.IGNORECASE,
+        )
+        actual_pairs = {
+            frozenset(
+                {
+                    (aliases.get(left_alias.casefold(), left_alias).casefold(), left_field.casefold()),
+                    (aliases.get(right_alias.casefold(), right_alias).casefold(), right_field.casefold()),
+                }
+            )
+            for left_alias, left_field, right_alias, right_field in qualified_pairs
+        }
+        for pair_key, relationships in configured.items():
+            if joined_name not in pair_key or not pair_key.issubset(present_tables):
+                continue
+            relationship_pairs = {
+                frozenset({(source, field), (target, target_field)})
+                for source, field, target, target_field in relationships
+            }
+            if actual_pairs & relationship_pairs:
+                continue
+            expected = ", ".join(
+                f"{source}.{field} = {target}.{target_field}"
+                for source, field, target, target_field in relationships
+            )
+            errors.append(
+                f"SQL 关联关系错误：JOIN {join_match.group(1)} 未使用已配置的关联条件（应使用 {expected}）。"
             )
     return errors
 
