@@ -1,5 +1,6 @@
 # Environment & secrets
 .env
+.env.save
 .venv/
 __pycache__/
 *.pyc
@@ -33,5 +34,6 @@ STARTUP.md
 
 # Generated business schema files
 /schema_catalog/tables/*.py
+/schema_catalog.zip
 
 server.log
