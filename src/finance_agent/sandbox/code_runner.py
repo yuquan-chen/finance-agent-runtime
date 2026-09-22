@@ -34,7 +34,7 @@ def run_code_method(method: MethodDraft, rows: list[dict[str, Any]]) -> Any:
     if not method.code:
         raise SandboxCodeError("code method has no code")
     namespace: dict[str, Any] = {"__builtins__": SAFE_BUILTINS}
-    exec(method.code, namespace)
+    exec(method.code, namespace)  # noqa: S102 - execution is intentionally confined to SAFE_BUILTINS
     functions = [value for key, value in namespace.items() if callable(value) and not key.startswith("__")]
     if len(functions) != 1:
         raise SandboxCodeError("code method must define exactly one callable")

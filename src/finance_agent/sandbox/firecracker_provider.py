@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import socket
 import subprocess
@@ -108,7 +107,7 @@ class FirecrackerSandboxProvider:
                         "real_database_used": False,
                     },
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider returns a structured sandbox failure
             return MockDryRunResult(
                 status="failed",
                 errors=[f"{type(exc).__name__}: {exc}"],
@@ -147,7 +146,7 @@ class FirecrackerSandboxProvider:
             "Content-Type: application/json\r\n"
             f"Content-Length: {len(body)}\r\n"
             "\r\n"
-        ).encode("utf-8") + body
+        ).encode() + body
         response = self._send_http_over_unix_socket(socket_path, request)
         if b" 2" not in response.split(b"\r\n", 1)[0]:
             raise RuntimeError(response.decode("utf-8", errors="replace"))

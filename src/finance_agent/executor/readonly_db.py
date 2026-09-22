@@ -61,7 +61,7 @@ class ReadonlyDbExecutor:
                 result = self._execute_with_extra_tables(method, extra_tables)
             else:
                 result = self.execute(method.sql_template, params=method.params)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - executor must return a structured failure
             return MockDryRunResult(
                 status="failed",
                 errors=[f"{type(exc).__name__}: {exc}"],

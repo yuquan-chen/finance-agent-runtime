@@ -1,8 +1,8 @@
 """Direct DB 执行器工厂。"""
 from __future__ import annotations
 
-from finance_agent.executor.readonly_db import ReadonlyDbExecutor
 from finance_agent.executor.executor_registry import register_executor
+from finance_agent.executor.readonly_db import ReadonlyDbExecutor
 
 
 @register_executor("direct_db")

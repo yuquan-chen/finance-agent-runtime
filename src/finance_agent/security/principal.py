@@ -65,7 +65,7 @@ def _decode_bearer(token: str, secret: str) -> Principal:
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError, binascii.Error) as exc:
         raise ValueError("invalid bearer token payload") from exc
     if not isinstance(payload, dict):
-        raise ValueError("invalid bearer token payload")
+        raise TypeError("invalid bearer token payload")
     expires_at = payload.get("exp")
     if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at):
         raise ValueError("bearer token expiration is required")

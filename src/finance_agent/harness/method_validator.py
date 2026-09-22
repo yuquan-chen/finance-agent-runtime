@@ -9,7 +9,6 @@ from finance_agent.metadata.catalog import Catalog
 from finance_agent.metadata.policy import Policy
 from finance_agent.operations.registry import OperationRegistry
 
-
 FORBIDDEN_CODE_NAMES = {"open", "eval", "exec", "compile", "__import__", "print", "input"}
 FORBIDDEN_IMPORTS = {"os", "sys", "socket", "subprocess", "pathlib", "requests", "httpx", "sqlalchemy"}
 
@@ -85,7 +84,7 @@ def validate_method_draft(
             errors.extend(_validate_sql_parameter_bindings(method.sql_template, method.params))
             try:
                 assert_readonly_sql(_strip_parameters(method.sql_template), policy)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - SQL validators expose different parser errors
                 errors.append(f"sql validation failed: {type(exc).__name__}: {exc}")
             # 检查 SQL 语义合理性
             sql_errors = _validate_sql_semantics(

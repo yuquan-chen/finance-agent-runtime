@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from calendar import monthrange
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 
@@ -203,13 +203,13 @@ def resolve_range_value(value: Any, _value_type: str = "") -> tuple[str, str]:
     if isinstance(value, (list, tuple)) and len(value) == 2:
         return str(value[0]), str(value[1])
     if not isinstance(value, str):
-        raise ValueError("range filter requires two bounds or a temporal expression")
+        raise TypeError("range filter requires two bounds or a temporal expression")
     text = " ".join(value.split()).strip()
     text = re.sub(r"的$", "", text)
     explicit = re.findall(r"\d{4}-\d{1,2}-\d{1,2}", text)
     if len(explicit) == 2:
         return explicit[0], explicit[1]
-    today = date.today()
+    today = datetime.now().astimezone().date()
     if text in {"今年上半年", "本年上半年", "上半年"}:
         return date(today.year, 1, 1).isoformat(), date(today.year, 7, 1).isoformat()
     if text in {"今年下半年", "本年下半年", "下半年"}:

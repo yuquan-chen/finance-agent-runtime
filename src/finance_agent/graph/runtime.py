@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-import json
 import inspect
+import json
 import re
 import uuid
 from functools import wraps
 from typing import Any
 
-from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
 
 from finance_agent.audit.audit_logger import AuditLogger, stable_hash
 from finance_agent.chat.response_plan import (
     MethodProposal,
     QueryReference,
     ResponsePlan,
-    ResponseValidationResult,
     plan_response_with_llm_and_registry,
     validate_response_plan,
 )
@@ -23,7 +22,6 @@ from finance_agent.chat.tool_decision import response_plan_to_tool_decision
 from finance_agent.config import Settings, get_settings
 from finance_agent.executor.executor_registry import ExecutorRegistry, get_default_executor_registry
 from finance_agent.executor.method_adapter import execute_method
-from finance_agent.graph.state import AgentState
 from finance_agent.graph.input_binding import (
     bound_input_params,
     merge_filter_specs,
@@ -33,6 +31,7 @@ from finance_agent.graph.input_binding import (
     resolve_range_value,
     sql_input_slots,
 )
+from finance_agent.graph.state import AgentState
 from finance_agent.harness.analysis_schema import (
     AnalysisPlan,
     DataAuthorizationCard,
@@ -40,23 +39,23 @@ from finance_agent.harness.analysis_schema import (
     PriorResultAuthorizationCard,
 )
 from finance_agent.harness.method_validator import validate_method_draft
+from finance_agent.kyc.conversation import update_from_conversation
+from finance_agent.kyc.local_drafts import KycLocalDraftStore
 from finance_agent.llm.provider import LlmProvider, build_llm_provider
+from finance_agent.memory.contracts import MemoryKind
+from finance_agent.memory.memory_store import MemoryStore
 from finance_agent.memory.private_result_store import PrivateResultStore
+from finance_agent.memory.public_memory import PublicMemoryEntry
 from finance_agent.memory.query_candidate_selector import (
     is_counted_result_reference,
-    is_explicit_query_continuation,
     is_explicit_historical_reference,
+    is_explicit_query_continuation,
     parse_candidate_reply,
     select_query_candidate,
 )
-from finance_agent.memory.contracts import MemoryKind
-from finance_agent.memory.memory_store import MemoryStore
-from finance_agent.memory.public_memory import PublicMemoryEntry
 from finance_agent.memory.safe_summary import build_query_history_memory
-from finance_agent.memory.selector import select_relevant_memories
-from finance_agent.memory.extractor import extract_memories_from_state
-from finance_agent.metadata.business_registry import BusinessTermRegistry, load_business_registry_from_catalog
 from finance_agent.metadata.business_knowledge import BusinessKnowledge
+from finance_agent.metadata.business_registry import BusinessTermRegistry, load_business_registry_from_catalog
 from finance_agent.metadata.catalog import Catalog, load_catalog, load_table_metadata
 from finance_agent.metadata.policy import Policy, load_policy
 from finance_agent.metadata.pruner import prune_catalog
@@ -64,6 +63,7 @@ from finance_agent.metadata.schema_selector import select_schema_with_llm
 from finance_agent.metadata.table_registry import TableRegistry, get_default_table_registry
 from finance_agent.metadata.value_normalizer import normalize_filter_bindings
 from finance_agent.methods.generator import generate_dependent_method
+from finance_agent.observability import finalize_observability, new_observability, observe_span
 from finance_agent.operations.handler_registry import OperationHandlerRegistry, get_default_registry
 from finance_agent.operations.registry import OperationRegistry, load_operation_registry
 from finance_agent.planner.analysis_planner import plan_analysis_with_lmstudio, plan_analysis_with_rules
@@ -77,25 +77,17 @@ from finance_agent.renderer.method_review_renderer import (
     build_execution_result_card,
     build_method_review_card,
     build_method_set_review_card,
-    render_data_authorization_data,
-    render_execution_result_data,
-    render_execution_result_set_data,
+    refuse_method_data,
     render_method_review_data,
     render_method_set_review_data,
-    render_prior_result_authorization_data,
-    refuse_method_data,
 )
 from finance_agent.renderer.reply_generator import generate_reply
 from finance_agent.renderer.result_narrator import narrate_execution_result, render_user_narration
 from finance_agent.sandbox.mock_sandbox import run_mock_dry_run
 from finance_agent.session.manager import SessionManager
 from finance_agent.session.run_store import RunStore
-from finance_agent.skills.registry import SkillRegistry, load_skill_registry
 from finance_agent.skills.agent import SkillAgentExecutor
-from finance_agent.kyc.local_drafts import KycLocalDraftStore
-from finance_agent.kyc.conversation import update_from_conversation
-from finance_agent.observability import finalize_observability, new_observability, observe_span
-
+from finance_agent.skills.registry import SkillRegistry, load_skill_registry
 
 MAX_METHOD_REPAIR_ATTEMPTS = 3
 
@@ -126,7 +118,7 @@ class FinanceAgentRuntime:
         self.business_term_registry = business_term_registry or load_business_registry_from_catalog(
             self.catalog.business_terms if hasattr(self.catalog, "business_terms") else {}
         )
-        self.table_registry = table_registry or get_default_table_registry()
+        self.table_registry = table_registry or get_default_table_registry(self.settings.schema_catalog_path)
         self.business_knowledge = BusinessKnowledge(self.table_registry, self.business_term_registry)
         self.llm_provider = llm_provider or build_llm_provider(self.settings)
         self.audit_logger = AuditLogger(self.settings.audit_log_path)
@@ -423,7 +415,7 @@ class FinanceAgentRuntime:
             self.session_manager.set_skill_state(state["session_id"], skill_key, updated_state)
             answer = result["message"]
             errors: list[str] = []
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - KYC input must degrade to an editable card
             updated_state = current
             answer = "这句话暂时无法可靠映射到表单字段，请直接填写卡片，或换一种方式描述。"
             errors = [f"KYC 对话解析失败：{error}"]
@@ -618,9 +610,17 @@ class FinanceAgentRuntime:
         # Keep the response/audit payload stable while persistence itself uses
         # the canonical MemoryRecord schema.
         public_data = [PublicMemoryEntry.from_record(item).model_dump(mode="json") for item in public_entries]
+        execution_modes = {str(card.get("execution_mode") or "simulated_real") for card in card_data}
+        execution_mode = next(iter(execution_modes)) if len(execution_modes) == 1 else "mixed"
+        execution_status = {
+            "simulated_real": "executed_simulated_real",
+            "direct_db": "executed_direct_db",
+            "safe_db": "executed_safe_db",
+        }.get(execution_mode, "executed")
         next_state: AgentState = {
             **state,
-            "status": "method_execution_failed" if failures else "executed_simulated_real",
+            "status": "method_execution_failed" if failures else execution_status,
+            "execution_mode": execution_mode,
             "result_ref": private_records[0].result_ref,
             "result_refs": [record.result_ref for record in private_records],
             "plan_result_ref": plan_result_ref,
@@ -748,7 +748,7 @@ class FinanceAgentRuntime:
                 business_term_manifest=self.business_term_registry.manifest_for_llm(),
             )
             planner_used = self.llm_provider.provider_name
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - rule planner is the deliberate fallback
             plan = plan_analysis_with_rules(instruction, visible)
             planner_used = "rule"
             revision_state = {
@@ -1112,7 +1112,7 @@ class FinanceAgentRuntime:
 
     def _full_catalog(self) -> Catalog:
         """从注册的真实 Schema 构建仅供后端检索的完整目录。"""
-        from finance_agent.metadata.catalog import Catalog, ColumnMeta, TableMeta, RelationshipMeta
+        from finance_agent.metadata.catalog import Catalog, ColumnMeta, RelationshipMeta, TableMeta
 
         tables = []
         for t in self.table_registry.all_tables():
@@ -1226,7 +1226,7 @@ class FinanceAgentRuntime:
             selected = [name for name in selection.selected_tables if name in candidate_names]
             selection_data = selection.model_dump(mode="json")
             source = "llm"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - backend candidate fallback preserves safety
             # Schema 选择器不可用时不让模型猜表：只退回后端已经检索出的候选。
             selected = [candidate["name"] for candidate in candidates]
             selection_data = {"selected_tables": selected, "reason": f"schema selector fallback: {type(exc).__name__}"}
@@ -1394,7 +1394,7 @@ class FinanceAgentRuntime:
                 )
                 plan = self._apply_action_constraints(plan, state)
                 planner_used = self.llm_provider.provider_name
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - rule planner is the deliberate fallback
                 errors.append(f"lmstudio analysis planner failed: {type(exc).__name__}: {exc}")
                 plan = plan_analysis_with_rules(user_goal, visible)
                 plan = self._apply_action_constraints(plan, state)
@@ -1584,7 +1584,7 @@ class FinanceAgentRuntime:
                 "sql": method.sql_template,
                 "status": "method_generated",
             }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - method generation returns a structured failure
             return {
                 **state,
                 "status": "method_generation_failed",
@@ -1984,7 +1984,7 @@ class FinanceAgentRuntime:
                 "status": "method_repaired",
                 "errors": [],
             }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - repair returns a structured failure
             return {
                 **state,
                 "repair_attempts": attempts,
@@ -2041,12 +2041,9 @@ class FinanceAgentRuntime:
             repaired_sql = response.content.strip()
 
             # 清理 SQL（移除可能的 markdown 格式）
-            if repaired_sql.startswith("```sql"):
-                repaired_sql = repaired_sql[6:]
-            if repaired_sql.startswith("```"):
-                repaired_sql = repaired_sql[3:]
-            if repaired_sql.endswith("```"):
-                repaired_sql = repaired_sql[:-3]
+            repaired_sql = repaired_sql.removeprefix("```sql")
+            repaired_sql = repaired_sql.removeprefix("```")
+            repaired_sql = repaired_sql.removesuffix("```")
             repaired_sql = repaired_sql.strip()
 
             # 验证 SQL 是否有效
@@ -2054,7 +2051,7 @@ class FinanceAgentRuntime:
                 return repaired_sql
 
             return None
-        except Exception:
+        except Exception:  # noqa: BLE001 - malformed model repair is treated as unavailable
             return None
 
     async def render_method_card(self, state: AgentState) -> AgentState:
@@ -2179,7 +2176,7 @@ class FinanceAgentRuntime:
 
             columns = []
             if data:
-                for key in data[0].keys():
+                for key in data[0]:
                     val = data[0][key]
                     col_type = "integer" if isinstance(val, int) else "number" if isinstance(val, float) else "text"
                     columns.append({"name": key, "type": col_type})
@@ -2312,7 +2309,12 @@ class FinanceAgentRuntime:
         audited = self.audit(
             {
                 **state,
-                "status": "executed_simulated_real",
+                "status": {
+                    "simulated_real": "executed_simulated_real",
+                    "direct_db": "executed_direct_db",
+                    "safe_db": "executed_safe_db",
+                }.get(card.execution_mode, "executed"),
+                "execution_mode": card.execution_mode,
                 "result_ref": private_record.result_ref,
                 "public_memory_entry": PublicMemoryEntry.from_record(public_memory).model_dump(mode="json"),
                 "execution_result_card": card.model_dump(mode="json"),
@@ -2465,7 +2467,7 @@ class FinanceAgentRuntime:
             extracted_memories = extract_memories_from_state_sync(state, self.memory_store, self.llm_provider)
             if extracted_memories:
                 event["extracted_memories"] = [m.name for m in extracted_memories]
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - memory extraction must not fail the run
             event["memory_extraction_error"] = str(e)
 
         # 更新普通对话历史（保存到状态，LangGraph checkpointer 会自动持久化）。

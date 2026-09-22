@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from finance_agent.builder.sql_builder import assert_readonly_sql
-from finance_agent.harness.plan_schema import Intent, QueryPlan
 from finance_agent.harness.analysis_schema import MethodDraft, MockDryRunResult
+from finance_agent.harness.plan_schema import Intent, QueryPlan
 from finance_agent.metadata.policy import Policy
 from finance_agent.sandbox.mock_data import load_catalog_mock_data
 from finance_agent.sandbox.mock_sandbox import run_simulated_real_execution

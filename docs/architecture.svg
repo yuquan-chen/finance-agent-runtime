@@ -1,0 +1,209 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1260" viewBox="0 0 1800 1260" role="img" aria-labelledby="title desc">
+  <title id="title">敏感数据受控分析 Agent 架构与执行流程</title>
+  <desc id="desc">The request enters through the FastAPI API, passes identity and session boundaries, is converted into a response plan, then follows either a direct response path or a controlled query path with schema selection, query guard, execution, private result storage, rendering, audit, and extensible registered modules.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-15%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#334155" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#536675"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#765b9a"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#b65b5b"/>
+    </marker>
+    <style>
+      text { font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #263842; }
+      .title { font-size: 28px; font-weight: 700; }
+      .subtitle { font-size: 14px; fill: #687982; }
+      .group { stroke-width: 1.3; stroke-dasharray: 8 6; }
+      .group-title { font-size: 16px; font-weight: 700; }
+      .group-note { font-size: 12px; fill: #697a82; }
+      .node { fill: #ffffff; stroke: #61727b; stroke-width: 1.3; rx: 10; filter: url(#shadow); }
+      .node-title { font-size: 15px; font-weight: 700; text-anchor: middle; }
+      .node-sub { font-size: 12px; fill: #65767e; text-anchor: middle; }
+      .node-file { font-size: 11px; fill: #7a8990; text-anchor: middle; }
+      .edge { fill: none; stroke: #536675; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow); }
+      .edge-soft { fill: none; stroke: #84929a; stroke-width: 1.3; stroke-dasharray: 5 5; stroke-linecap: round; marker-end: url(#arrow); }
+      .edge-feedback { fill: none; stroke: #765b9a; stroke-width: 1.5; stroke-dasharray: 7 5; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowPurple); }
+      .edge-fail { fill: none; stroke: #b65b5b; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowRed); }
+      .edge-label { font-size: 12px; font-weight: 600; fill: #5d6f77; }
+      .legend { font-size: 12px; fill: #5d6f77; }
+      .small { font-size: 11px; fill: #6c7b82; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1260" fill="#ffffff"/>
+  <text x="54" y="52" class="title">敏感数据受控分析 Agent · 架构与执行流程</text>
+  <text x="54" y="80" class="subtitle">支持多轮对话、Schema 感知、权限校验、只读执行、结果隔离与审计。</text>
+
+  <!-- Main request boundary -->
+  <rect x="36" y="112" width="1728" height="246" rx="12" class="group" fill="#e9f3fc" stroke="#6f9fc3"/>
+  <text x="58" y="143" class="group-title">请求接入与响应规划</text>
+  <text x="58" y="166" class="group-note">所有请求先经过 API、身份和 Session 边界，再决定走直接回复还是受控查询流程。</text>
+
+  <rect x="70" y="207" width="240" height="106" class="node"/>
+  <text x="190" y="242" class="node-title">用户 / UI</text>
+  <text x="190" y="267" class="node-sub">自然语言问题</text>
+  <text x="190" y="289" class="node-file">api/static/index.html</text>
+
+  <rect x="360" y="207" width="250" height="106" class="node"/>
+  <text x="485" y="242" class="node-title">FastAPI API</text>
+  <text x="485" y="267" class="node-sub">JSON / SSE Runtime API</text>
+  <text x="485" y="289" class="node-file">api/routes/runs.py</text>
+
+  <rect x="660" y="207" width="280" height="106" class="node"/>
+  <text x="800" y="242" class="node-title">身份校验 + Session</text>
+  <text x="800" y="267" class="node-sub">user_id · workspace_id</text>
+  <text x="800" y="289" class="node-file">auth / session / run store</text>
+
+  <rect x="990" y="207" width="290" height="106" class="node"/>
+  <text x="1135" y="242" class="node-title">ResponsePlan</text>
+  <text x="1135" y="267" class="node-sub">意图、Skill、查询目标</text>
+  <text x="1135" y="289" class="node-file">chat/response_plan.py</text>
+
+  <rect x="1360" y="207" width="350" height="106" class="node"/>
+  <text x="1535" y="242" class="node-title">直接回复 / 澄清 / 拒绝</text>
+  <text x="1535" y="267" class="node-sub">无需读取数据库时结束主链路</text>
+  <text x="1535" y="289" class="node-file">render_direct_response → audit</text>
+
+  <path d="M310 260 H350" class="edge"/>
+  <path d="M610 260 H650" class="edge"/>
+  <path d="M940 260 H980" class="edge"/>
+  <path d="M1280 260 H1350" class="edge"/>
+  <text x="1308" y="247" class="edge-label">非查询意图</text>
+
+  <!-- Controlled query flow -->
+  <rect x="36" y="392" width="1728" height="384" rx="12" class="group" fill="#eaf7ee" stroke="#76ad87"/>
+  <text x="58" y="423" class="group-title">受控查询链路</text>
+  <text x="58" y="446" class="group-note">只向模型披露必要的业务词典、候选表和字段；查询必须通过 Query Guard 后才可执行。</text>
+
+  <rect x="70" y="492" width="250" height="126" class="node"/>
+  <text x="195" y="527" class="node-title">Schema 候选检索</text>
+  <text x="195" y="552" class="node-sub">业务词典 → 相关表</text>
+  <text x="195" y="575" class="node-file">metadata / business knowledge</text>
+
+  <rect x="370" y="492" width="250" height="126" class="node"/>
+  <text x="495" y="527" class="node-title">Schema 表选择</text>
+  <text x="495" y="552" class="node-sub">限制可见表和关系</text>
+  <text x="495" y="575" class="node-file">metadata/schema_selector.py</text>
+
+  <rect x="670" y="492" width="250" height="126" class="node"/>
+  <text x="795" y="527" class="node-title">字段和关系加载</text>
+  <text x="795" y="552" class="node-sub">生成最小 metadata disclosure</text>
+  <text x="795" y="575" class="node-file">table_registry / catalog</text>
+
+  <rect x="970" y="492" width="250" height="126" class="node"/>
+  <text x="1095" y="527" class="node-title">Analysis Plan</text>
+  <text x="1095" y="552" class="node-sub">指标、过滤条件、排序和范围</text>
+  <text x="1095" y="575" class="node-file">planner / analysis schema</text>
+
+  <rect x="1270" y="492" width="250" height="126" class="node"/>
+  <text x="1395" y="527" class="node-title">Method Draft</text>
+  <text x="1395" y="552" class="node-sub">结构化查询方法和参数</text>
+  <text x="1395" y="575" class="node-file">methods / query compiler</text>
+
+  <rect x="1570" y="492" width="150" height="126" class="node"/>
+  <text x="1645" y="527" class="node-title">Query Guard</text>
+  <text x="1645" y="552" class="node-sub">只读 · 字段</text>
+  <text x="1645" y="572" class="node-sub">参数 · dry-run</text>
+  <text x="1645" y="595" class="node-file">query/guard.py</text>
+
+  <path d="M320 555 H360" class="edge"/>
+  <path d="M620 555 H660" class="edge"/>
+  <path d="M920 555 H960" class="edge"/>
+  <path d="M1220 555 H1260" class="edge"/>
+  <path d="M1520 555 H1560" class="edge"/>
+  <path d="M1135 313 V390 Q1135 458 195 458 V482" class="edge"/>
+  <text x="1040" y="381" class="edge-label">查询意图</text>
+
+  <!-- Execution, repair and private result boundary -->
+  <rect x="36" y="810" width="1728" height="294" rx="12" class="group" fill="#f2eef9" stroke="#a28aba"/>
+  <text x="58" y="841" class="group-title">执行、结果隔离与可观测性</text>
+  <text x="58" y="864" class="group-note">真实结果留在私有结果区；普通模型记忆只保存安全摘要，审计记录不包含凭据和敏感明文。</text>
+
+  <rect x="70" y="914" width="250" height="126" class="node"/>
+  <text x="195" y="949" class="node-title">Executor</text>
+  <text x="195" y="974" class="node-sub">mock · direct_db · safe_db</text>
+  <text x="195" y="997" class="node-file">executor / registry</text>
+
+  <rect x="370" y="914" width="250" height="126" class="node"/>
+  <text x="495" y="949" class="node-title">Private Result Store</text>
+  <text x="495" y="974" class="node-sub">结果行、参数、授权证据</text>
+  <text x="495" y="997" class="node-file">memory/private_result_store.py</text>
+
+  <rect x="670" y="914" width="250" height="126" class="node"/>
+  <text x="795" y="949" class="node-title">Renderer / Narrator</text>
+  <text x="795" y="974" class="node-sub">确定性渲染 + 安全摘要</text>
+  <text x="795" y="997" class="node-file">renderer / result narrator</text>
+
+  <rect x="970" y="914" width="250" height="126" class="node"/>
+  <text x="1095" y="949" class="node-title">JSON / SSE 返回</text>
+  <text x="1095" y="974" class="node-sub">answer、状态、证据引用</text>
+  <text x="1095" y="997" class="node-file">api response model</text>
+
+  <rect x="1270" y="914" width="220" height="126" class="node"/>
+  <text x="1380" y="949" class="node-title">Audit</text>
+  <text x="1380" y="974" class="node-sub">请求、策略、执行事件</text>
+  <text x="1380" y="997" class="node-file">audit / observability</text>
+
+  <rect x="1540" y="914" width="180" height="126" class="node"/>
+  <text x="1630" y="949" class="node-title">Memory</text>
+  <text x="1630" y="974" class="node-sub">安全 query history</text>
+  <text x="1630" y="997" class="node-file">public memory</text>
+
+  <path d="M1645 618 V638 H1370 V880 H195 V904" class="edge"/>
+  <text x="1390" y="866" class="edge-label">通过</text>
+  <path d="M195 1040 H360" class="edge"/>
+  <path d="M620 977 H660" class="edge"/>
+  <path d="M920 977 H960" class="edge"/>
+  <path d="M1220 977 H1260" class="edge-soft"/>
+  <path d="M1490 977 H1530" class="edge-soft"/>
+
+  <!-- Repair loop -->
+  <rect x="1450" y="668" width="270" height="126" class="node" stroke="#a28aba"/>
+  <text x="1585" y="703" class="node-title">修复循环</text>
+  <text x="1585" y="728" class="node-sub">Schema / Method 修复</text>
+  <text x="1585" y="751" class="node-sub">最多 3 次，仍失败则拒绝</text>
+  <text x="1585" y="775" class="node-file">repair_method / schema_repair</text>
+  <path d="M1645 618 V658" class="edge-fail"/>
+  <text x="1660" y="646" class="edge-label" fill="#a25353">失败</text>
+  <path d="M1450 730 H1340 Q1320 730 1320 710 V650 H48 V470 Q48 458 60 458 H195 V482" class="edge-feedback"/>
+  <text x="1175" y="644" class="edge-label" fill="#765b9a">重新检索 / 生成</text>
+  <path d="M1585 794 V1070 H1720 V1120" class="edge-fail"/>
+  <text x="1604" y="1089" class="small" fill="#a25353">超过上限 → 受控拒绝</text>
+
+  <!-- Extensible module slot -->
+  <rect x="36" y="1128" width="1120" height="98" rx="12" class="group" fill="#fff5df" stroke="#c89b56"/>
+  <text x="58" y="1158" class="group-title">可插拔能力模块（Extension Slot）</text>
+  <text x="58" y="1180" class="group-note">Skill / 领域模块通过 Registry 注册，复用身份、Session、审计和执行边界；不改变主查询链路。</text>
+  <rect x="58" y="1190" width="250" height="28" class="node"/>
+  <text x="183" y="1209" class="node-sub">Skill Registry</text>
+  <path d="M308 1204 H360" class="edge-soft"/>
+  <rect x="360" y="1190" width="250" height="28" class="node"/>
+  <text x="485" y="1209" class="node-sub">领域模块 / Side Skill</text>
+  <path d="M610 1204 H662" class="edge-soft"/>
+  <rect x="662" y="1190" width="250" height="28" class="node"/>
+  <text x="787" y="1209" class="node-sub">受控状态与工具</text>
+  <path d="M912 1204 H964" class="edge-soft"/>
+  <rect x="964" y="1190" width="146" height="28" class="node"/>
+  <text x="1037" y="1209" class="node-sub">可独立扩展</text>
+
+  <!-- Failure notes -->
+  <text x="1200" y="1154" class="small" fill="#a25353">失败边界：</text>
+  <text x="1200" y="1178" class="small">鉴权失败 · Schema 不匹配 · Query Guard 失败 · 数据库执行失败</text>
+  <text x="1200" y="1200" class="small">均转为安全错误，不把凭据或原始敏感数据写入模型记忆。</text>
+
+  <!-- Legend -->
+  <path d="M58 1242 H105" class="edge"/>
+  <text x="116" y="1246" class="legend">主流程</text>
+  <path d="M210 1242 H257" class="edge-feedback"/>
+  <text x="268" y="1246" class="legend">修复 / 反馈</text>
+  <path d="M400 1242 H447" class="edge-soft"/>
+  <text x="458" y="1246" class="legend">辅助 / 弱依赖</text>
+  <path d="M620 1242 H667" class="edge-fail"/>
+  <text x="678" y="1246" class="legend">失败 / 拒绝</text>
+  <text x="1080" y="1246" class="legend">当前基线以仓库代码和 docs/current-architecture.md 为准</text>
+</svg>

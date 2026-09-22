@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import yaml
 
 # ---------------------------------------------------------------------------
 # SQL DDL 解析
@@ -81,15 +82,16 @@ def parse_sql_ddl(content: str) -> list[dict[str, Any]]:
 
         # 找到对应的表，添加列
         for table in tables:
-            if table["table_name"] == table_name:
+            if table["table_name"] == table_name and not any(
+                c["name"] == column_name for c in table["columns"]
+            ):
                 # 检查列是否已存在
-                if not any(c["name"] == column_name for c in table["columns"]):
-                    table["columns"].append({
-                        "name": column_name,
-                        "type": _normalize_sql_type(col_type),
-                        "nullable": nullable,
-                        "description": "",
-                    })
+                table["columns"].append({
+                    "name": column_name,
+                    "type": _normalize_sql_type(col_type),
+                    "nullable": nullable,
+                    "description": "",
+                })
 
     return tables
 
@@ -604,6 +606,38 @@ def parse_database_connection(connection_string: str) -> list[dict[str, Any]]:
                 ORDER BY cls.relname, attr.attnum
             """)
             column_rows = cursor.fetchall()
+
+            cursor.execute("""
+                SELECT
+                    child_cls.relname AS child_table,
+                    child_attr.attname AS child_column,
+                    parent_cls.relname AS parent_table,
+                    parent_attr.attname AS parent_column
+                FROM pg_catalog.pg_constraint AS con
+                JOIN pg_catalog.pg_class AS child_cls
+                    ON child_cls.oid = con.conrelid
+                JOIN pg_catalog.pg_namespace AS child_ns
+                    ON child_ns.oid = child_cls.relnamespace
+                JOIN pg_catalog.pg_class AS parent_cls
+                    ON parent_cls.oid = con.confrelid
+                JOIN pg_catalog.pg_namespace AS parent_ns
+                    ON parent_ns.oid = parent_cls.relnamespace
+                JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS child_key(attnum, position)
+                    ON TRUE
+                JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS parent_key(attnum, position)
+                    ON parent_key.position = child_key.position
+                JOIN pg_catalog.pg_attribute AS child_attr
+                    ON child_attr.attrelid = child_cls.oid
+                   AND child_attr.attnum = child_key.attnum
+                JOIN pg_catalog.pg_attribute AS parent_attr
+                    ON parent_attr.attrelid = parent_cls.oid
+                   AND parent_attr.attnum = parent_key.attnum
+                WHERE con.contype = 'f'
+                  AND child_ns.nspname = 'public'
+                  AND parent_ns.nspname = 'public'
+                ORDER BY child_cls.relname, child_attr.attnum
+            """)
+            foreign_key_rows = cursor.fetchall()
     finally:
         conn.close()
 
@@ -623,6 +657,15 @@ def parse_database_connection(connection_string: str) -> list[dict[str, Any]]:
             'nullable': nullable,
             'description': description or '',
         })
+
+    for child_table, child_column, parent_table, parent_column in foreign_key_rows:
+        table = tables_by_name.get(child_table)
+        if not table:
+            continue
+        for column in table['columns']:
+            if column['name'] == child_column:
+                column['foreign_key'] = f"{parent_table}.{parent_column}"
+                break
 
     return list(tables_by_name.values())
 
@@ -724,6 +767,34 @@ def generate_python_file(table_name: str, columns: list[dict], output_dir: Path,
     return output_path
 
 
+def generate_yaml_file(tables: list[dict[str, Any]], output_path: Path) -> Path:
+    """Write a data-only schema snapshot; never writes business records."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": "1",
+        "source": "database_metadata",
+        "tables": [
+            {
+                "name": table["table_name"],
+                "description": table.get("table_comment", ""),
+                "columns": [
+                    {
+                        "name": column["name"],
+                        "type": column.get("type", "text"),
+                        "nullable": bool(column.get("nullable", True)),
+                        **({"foreign_key": column["foreign_key"]} if column.get("foreign_key") else {}),
+                        **({"description": column["description"]} if column.get("description") else {}),
+                    }
+                    for column in table.get("columns", [])
+                ],
+            }
+            for table in sorted(tables, key=lambda item: item["table_name"])
+        ],
+    }
+    output_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return output_path
+
+
 # ---------------------------------------------------------------------------
 # 主函数
 # ---------------------------------------------------------------------------
@@ -733,7 +804,7 @@ def main():
     parser.add_argument('--from-sql', type=str, help='从 SQL DDL 文件提取')
     parser.add_argument('--from-db', type=str, help='从数据库连接提取')
     parser.add_argument('--from-entity', type=str, help='从 TypeORM entity 提取')
-    parser.add_argument('--output', type=str, default=None, help='输出目录')
+    parser.add_argument('--output', type=str, default=None, help='输出 YAML 文件路径')
     parser.add_argument('--tables', type=str, default=None, help='只提取指定表（逗号分隔）')
 
     args = parser.parse_args()
@@ -743,12 +814,7 @@ def main():
         print("\n错误: 请指定输入源 (--from-sql, --from-db, 或 --from-entity)")
         sys.exit(1)
 
-    # 输出目录
-    if args.output:
-        output_dir = Path(args.output)
-    else:
-        output_dir = Path(__file__).parent.parent / 'schema_catalog' / 'tables'
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = Path(args.output) if args.output else Path(__file__).parent.parent / 'schema_catalog' / 'schema.yaml'
 
     # 指定表过滤
     filter_tables = None
@@ -791,19 +857,14 @@ def main():
     if filter_tables:
         tables = [t for t in tables if t['table_name'] in filter_tables]
 
-    # 生成文件
+    # 生成 YAML 文件
     print(f"找到 {len(tables)} 个表:")
     for table in sorted(tables, key=lambda x: x['table_name']):
-        output_path = generate_python_file(
-            table['table_name'],
-            table['columns'],
-            output_dir,
-            table.get('table_comment', ''),
-        )
-        print(f"  {table['table_name']:30s} ({len(table['columns']):2d} 列) → {output_path.name}")
+        print(f"  {table['table_name']:30s} ({len(table['columns']):2d} 列)")
 
-    print(f"\n输出目录: {output_dir}")
-    print("请手动添加业务元数据（description、foreign_key、sensitive 等）。")
+    generate_yaml_file(tables, output_path)
+    print(f"\n输出文件: {output_path}")
+    print("请在 config/table_metadata.yaml 和 schema_catalog/value_aliases.yaml 中补充业务元数据。")
 
 
 if __name__ == '__main__':

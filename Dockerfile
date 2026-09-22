@@ -18,11 +18,13 @@ RUN apt-get update \
 COPY pyproject.toml ./
 COPY src ./src
 COPY config ./config
+COPY scripts ./scripts
+COPY schema_catalog/demo_schema.yaml ./schema_catalog/demo_schema.yaml
 RUN pip install --no-cache-dir .
 
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /app/schema_catalog
 VOLUME ["/app/data"]
 
 EXPOSE 8810
 
-CMD ["python", "-m", "uvicorn", "finance_agent.api.app:app", "--host", "0.0.0.0", "--port", "8810"]
+CMD ["./scripts/start.sh"]

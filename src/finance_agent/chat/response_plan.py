@@ -4,18 +4,16 @@ import json
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from finance_agent.chat.tool_registry import build_skill_tools
 from finance_agent.config import Settings
-from finance_agent.llm.provider import LlmProvider
-from finance_agent.llm.provider import LlmToolCall
+from finance_agent.llm.provider import LlmProvider, LlmToolCall
+from finance_agent.memory.query_candidate_selector import is_explicit_query_continuation
 from finance_agent.metadata.business_registry import BusinessTermRegistry
 from finance_agent.operations.handler_registry import OperationHandlerRegistry
 from finance_agent.operations.registry import OperationRegistry
 from finance_agent.skills.registry import SkillRegistry
-from finance_agent.chat.tool_registry import build_skill_tools
-from finance_agent.memory.query_candidate_selector import is_explicit_query_continuation
-
 
 # ---------------------------------------------------------------------------
 # 核心类型
@@ -86,7 +84,7 @@ class ResponsePlan(BaseModel):
     safety_flags: list[str] = Field(default_factory=list)
     refused: bool = False
 
-    def model_post_init(self, __context: Any) -> None:
+    def model_post_init(self, __context: Any, /) -> None:
         # 旧格式 → 新格式迁移
         if not self.message and self.assistant_message:
             self.message = self.assistant_message
@@ -455,7 +453,7 @@ def _try_model_tool_call(
             *messages[1:],
         ]
         return chat_with_tools(tool_messages, tools, temperature=0)
-    except Exception:
+    except Exception:  # noqa: BLE001 - compatible providers may reject tool calls
         # A compatible endpoint may advertise no tool support.  The existing
         # JSON contract is a deliberate compatibility fallback in that case.
         return None
@@ -518,7 +516,7 @@ def _parse_query_reference(value: Any) -> QueryReference:
         value = {**value, "query_ids": [value["query_id"]]}
     try:
         return QueryReference.model_validate(value)
-    except Exception:
+    except (TypeError, ValueError, ValidationError):
         return QueryReference()
 
 

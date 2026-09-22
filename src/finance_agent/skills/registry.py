@@ -39,12 +39,12 @@ class SkillToolSpec(BaseModel):
     exposure: Literal["direct", "deferred", "hidden"] = "direct"
 
     @model_validator(mode="after")
-    def validate_input_schema(self) -> "SkillToolSpec":
+    def validate_input_schema(self) -> SkillToolSpec:
         if self.input_schema.get("type") != "object":
-            raise ValueError("Skill tool input_schema must describe an object")
+            raise TypeError("Skill tool input_schema must describe an object")
         properties = self.input_schema.get("properties", {})
         if not isinstance(properties, dict):
-            raise ValueError("Skill tool input_schema.properties must be an object")
+            raise TypeError("Skill tool input_schema.properties must be an object")
         required = self.input_schema.get("required", [])
         if not isinstance(required, list) or any(name not in properties for name in required):
             raise ValueError("Skill tool input_schema.required must reference properties")

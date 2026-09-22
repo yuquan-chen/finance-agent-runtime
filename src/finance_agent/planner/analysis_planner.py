@@ -9,7 +9,6 @@ from finance_agent.llm.provider import LlmProvider, build_llm_provider
 from finance_agent.metadata.catalog import Catalog
 from finance_agent.operations.registry import OperationRegistry
 
-
 SYSTEM_PROMPT = """# 角色
 你是金融数据分析 Agent 的分析计划器。
 你的职责：根据用户目标，输出一组分析步骤（AnalysisPlan JSON）。

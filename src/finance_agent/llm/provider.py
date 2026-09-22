@@ -10,7 +10,6 @@ import httpx
 from finance_agent.config import Settings
 from finance_agent.observability import record_llm_response
 
-
 Message = dict[str, str]
 
 
@@ -215,7 +214,7 @@ class OpenAICompatibleLlmProvider:
                 else raw_arguments
             )
             if not isinstance(arguments, dict):
-                raise ValueError("LLM tool arguments must be a JSON object")
+                raise TypeError("LLM tool arguments must be a JSON object")
             calls.append(
                 LlmToolCall(
                     call_id=str(item.get("id") or f"tool_call_{index + 1}"),

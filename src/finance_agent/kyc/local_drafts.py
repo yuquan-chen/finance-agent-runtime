@@ -6,10 +6,9 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 OCR_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 OCR_DOCUMENT_EXTENSIONS = OCR_IMAGE_EXTENSIONS | {".pdf"}
@@ -50,7 +49,7 @@ class KycLocalDraftStore:
 
     @staticmethod
     def _timestamp() -> str:
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     def save_upload(
         self,
@@ -62,7 +61,7 @@ class KycLocalDraftStore:
         content_type: str,
         content: bytes,
         accept: str,
-        max_size_mb: int | float | None,
+        max_size_mb: float | None,
     ) -> dict[str, Any]:
         self._safe_component(upload_id, "材料标识")
         original_name = Path(filename).name.strip()
@@ -99,7 +98,7 @@ class KycLocalDraftStore:
         filename: str,
         content_type: str,
         content: bytes,
-        max_size_mb: int | float | None,
+        max_size_mb: float | None,
     ) -> dict[str, Any]:
         """Save a chat attachment before its KYC material type is confirmed."""
         return self.save_upload(
@@ -234,7 +233,7 @@ class KycLocalDraftStore:
     def export_draft(self, *, session_id: str, skill_key: str, state: dict[str, Any]) -> Path:
         directory = self._directory(session_id, skill_key) / "exports"
         directory.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         path = directory / f"{skill_key}-draft-{timestamp}.json"
         payload = {
             "format": "finance-agent-local-kyc-draft/v1",

@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from finance_agent.metadata.table_registry import get_default_table_registry, ColumnMeta
+from finance_agent.metadata.table_registry import ColumnMeta, get_default_table_registry
 
 
 def generate_value(col: ColumnMeta, row_idx: int) -> any:
@@ -26,7 +26,7 @@ def generate_value(col: ColumnMeta, row_idx: int) -> any:
 
     # 时间类型
     if "timestamp" in col_type or "date" in col_type or "time" in name:
-        base = datetime(2026, 1, 1)
+        base = datetime(2026, 1, 1)  # noqa: DTZ001 - deterministic fixture timestamp
         offset = timedelta(days=random.randint(0, 180), hours=random.randint(0, 23))
         return (base + offset).isoformat()
 

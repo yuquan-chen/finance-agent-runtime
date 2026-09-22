@@ -8,7 +8,6 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-
 SelectionStatus = Literal["none", "selected", "ambiguous"]
 
 _FOLLOWUP_MARKERS = (
@@ -320,14 +319,7 @@ def select_query_candidate(
                 "selected_query_id": selected.get("query_id"),
                 "ranked": ranked,
             }
-    elif _is_followup(user_query) and len(ranked) == 1:
-        return {
-            "status": "selected",
-            "selected_candidate": top["query_candidate"],
-            "selected_query_id": top.get("query_id"),
-            "ranked": ranked,
-        }
-    elif _is_followup(user_query) and top["score"] >= 2 and margin >= 2:
+    elif _is_followup(user_query) and len(ranked) == 1 or _is_followup(user_query) and top["score"] >= 2 and margin >= 2:
         return {
             "status": "selected",
             "selected_candidate": top["query_candidate"],

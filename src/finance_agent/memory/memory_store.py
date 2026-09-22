@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from finance_agent.memory.contracts import MemoryKind, make_namespace
 from finance_agent.memory.taxonomy import MemoryType
@@ -172,7 +172,7 @@ class MemoryStore:
                 continue
             try:
                 records.append(MemoryRecord.model_validate_json(line))
-            except Exception:
+            except (TypeError, ValueError, ValidationError):
                 legacy = self._from_legacy_query_card(line)
                 if legacy:
                     records.append(legacy)

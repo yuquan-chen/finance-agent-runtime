@@ -56,7 +56,7 @@ MEMORY_TYPE_DESCRIPTIONS: dict[MemoryType, dict[str, str]] = {
 def get_type_prompt() -> str:
     """获取类型描述的 prompt 片段。"""
     lines = ["## Memory 类型\n"]
-    for mem_type, desc in MEMORY_TYPE_DESCRIPTIONS.items():
+    for desc in MEMORY_TYPE_DESCRIPTIONS.values():
         lines.append(f"### {desc['name']}")
         lines.append(f"- 描述: {desc['description']}")
         lines.append(f"- 何时保存: {desc['when_to_save']}")

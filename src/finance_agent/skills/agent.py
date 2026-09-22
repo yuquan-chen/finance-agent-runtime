@@ -253,7 +253,7 @@ class SkillAgentExecutor:
             response = self.llm_provider.chat(messages, temperature=0.2, max_tokens=800)
             answer = str(response.content or "").strip()
             return answer or None
-        except Exception:
+        except Exception:  # noqa: BLE001 - side-agent chat has a text fallback
             return None
 
     @staticmethod
@@ -332,7 +332,7 @@ class SkillAgentExecutor:
                 }
                 answer_parts.append(result["message"])
                 uncertain = result.get("uncertain", [])
-            except Exception:
+            except Exception:  # noqa: BLE001 - malformed conversational input stays editable
                 answer_parts.append(
                     "这句话暂时无法可靠映射到当前字段，请直接填写卡片，或换一种方式描述。"
                 )
@@ -343,7 +343,7 @@ class SkillAgentExecutor:
                     attachments=attachments,
                     provider=self.llm_provider,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - attachment extraction stays reviewable
                 reviews = [
                     {
                         "attachment_id": item["document_id"],

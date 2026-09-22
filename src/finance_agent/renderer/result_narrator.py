@@ -105,14 +105,14 @@ def narrate_execution_result(
     narration = None
     try:
         narration = narrate_execution_result_with_lmstudio(safe_summary, settings, llm_provider)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - narration is optional and has a deterministic fallback
         pass
 
     # 第二次尝试：简化 prompt（去掉 variables 要求，只要 summary）
     if narration is None:
         try:
             narration = _narrate_simple(safe_summary, settings, llm_provider)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - narration is optional and has a deterministic fallback
             pass
 
     # 兜底
@@ -123,7 +123,7 @@ def narrate_execution_result(
     if safe_summary.result_data is not None and narration.variables:
         try:
             narration = validate_and_substitute_variables(narration, safe_summary.result_data)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - invalid substitutions use the original narration
             pass
 
     return narration

@@ -5,7 +5,6 @@ findings 解读使用通用逻辑，不再依赖 handler 函数。
 """
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from finance_agent.audit.audit_logger import stable_hash
@@ -368,11 +367,11 @@ def _top_n_findings(rows: list[dict]) -> list[str]:
     for row in rows:
         key = "-"
         value = None
-        for k, v in row.items():
-            if isinstance(v, str) and key == "-":
-                key = v
-            elif isinstance(v, (int, float)) and value is None:
-                value = v
+        for item in row.values():
+            if isinstance(item, str) and key == "-":
+                key = item
+            elif isinstance(item, (int, float)) and value is None:
+                value = item
         if value is not None:
             normalized.append((str(key), float(value)))
     if not normalized:

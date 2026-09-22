@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from finance_agent.metadata.table_registry import TableRegistry
-from finance_agent.metadata.business_registry import BusinessTermRegistry
 from finance_agent.graph.input_binding import normalize_relative_filter_values
+from finance_agent.metadata.business_registry import BusinessTermRegistry
+from finance_agent.metadata.table_registry import TableRegistry
 
 
 def normalize_filter_values(

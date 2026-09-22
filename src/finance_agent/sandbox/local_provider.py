@@ -43,7 +43,7 @@ class LocalProcessSandboxProvider:
                     "real_database_used": False,
                 },
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider returns a structured sandbox failure
             return MockDryRunResult(
                 status="failed",
                 errors=[f"{type(exc).__name__}: {exc}"],

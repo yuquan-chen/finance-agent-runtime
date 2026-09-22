@@ -19,15 +19,21 @@ services:
     build: .
     ports:
       - "${APP_PORT:-8810}:8810"
-    env_file:
-      - .env
     environment:
       APP_HOST: 0.0.0.0
       APP_PORT: 8810
+      EXECUTOR_MODE: ${EXECUTOR_MODE:-mock}
+      DATABASE_URL: ${DATABASE_URL:-}
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
+      LMSTUDIO_MODEL: ${LMSTUDIO_MODEL:-qwen2.5-coder-7b-instruct-mlx}
+      LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-lm-studio}
+      AUTH_MODE: ${AUTH_MODE:-local}
+      AUTH_SECRET: ${AUTH_SECRET:-}
       CATALOG_PATH: /app/config/catalog.yaml
       POLICY_PATH: /app/config/policy.yaml
       OPERATIONS_PATH: /app/config/operations.yaml
       SKILLS_PATH: /app/config/skills.yaml
+      SCHEMA_CATALOG_PATH: /app/schema_catalog/schema.yaml
       AUDIT_LOG_PATH: /app/data/audit.jsonl
       PRIVATE_RESULT_STORE_PATH: /app/data/private_results.jsonl
       PUBLIC_MEMORY_PATH: /app/data/public_memory.jsonl
@@ -35,6 +41,7 @@ services:
       KYC_DRAFT_PATH: /app/data/kyc_drafts
     volumes:
       - ./data:/app/data
+      - ./schema_catalog:/app/schema_catalog
 
 volumes:
   finance_agent_postgres_data:

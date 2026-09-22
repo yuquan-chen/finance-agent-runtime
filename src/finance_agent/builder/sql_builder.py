@@ -113,7 +113,7 @@ def assert_readonly_sql(sql: str, policy: Policy) -> None:
 
     # 3. 检查危险关键词和函数
     forbidden = "|".join(re.escape(word) for word in policy.forbidden_sql_keywords)
-    if forbidden and re.search(rf"\b({forbidden})\b", no_comments, re.I):
+    if forbidden and re.search(rf"\b({forbidden})\b", no_comments, re.IGNORECASE):
         raise SqlBuildError("forbidden SQL keyword detected")
 
     # 4. 检查危险的函数调用模式（函数名后跟括号）
@@ -139,7 +139,7 @@ def assert_readonly_sql(sql: str, policy: Policy) -> None:
         r'\bcopy\s+.*\bfrom\b',  # COPY ... FROM (文件操作)
     ]
     for pattern in dangerous_functions:
-        if re.search(pattern, no_comments, re.I):
+        if re.search(pattern, no_comments, re.IGNORECASE):
             raise SqlBuildError(f"dangerous function call detected: {pattern}")
 
     # 5. 检查系统表/视图访问
@@ -157,7 +157,7 @@ def assert_readonly_sql(sql: str, policy: Policy) -> None:
         r'\bpg_auth_members\b',
     ]
     for pattern in system_tables:
-        if re.search(pattern, no_comments, re.I):
+        if re.search(pattern, no_comments, re.IGNORECASE):
             raise SqlBuildError(f"system table access detected: {pattern}")
 
     # 6. 检查危险的字符串模式
@@ -168,5 +168,5 @@ def assert_readonly_sql(sql: str, policy: Policy) -> None:
         r"'\s*[A-Za-z]:\\",
     ]
     for pattern in dangerous_patterns:
-        if re.search(pattern, no_comments, re.I):
-            raise SqlBuildError(f"dangerous path pattern detected")
+        if re.search(pattern, no_comments, re.IGNORECASE):
+            raise SqlBuildError("dangerous path pattern detected")

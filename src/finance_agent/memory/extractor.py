@@ -104,7 +104,7 @@ async def extract_memories(
 
         return saved_memories
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - memory extraction is best-effort
         print(f"Memory extraction failed: {e}")
         return []
 

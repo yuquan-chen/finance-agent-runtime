@@ -12,7 +12,7 @@ def build_simulated_card_transactions(row_count: int = 100) -> list[dict[str, An
     channels = ["visa", "mastercard", "amex", "unionpay", "virtual_card"]
     accounts = [f"acct_{index:03d}" for index in range(1, 21)]
     currencies = ["USD", "USD", "USD", "EUR", "GBP"]
-    base_time = datetime(2026, 1, 1, 9, 0, 0)
+    base_time = datetime(2026, 1, 1, 9, 0, 0)  # noqa: DTZ001 - deterministic fixture timestamp
     rows: list[dict[str, Any]] = []
     for index in range(row_count):
         status = _status_for_index(index)

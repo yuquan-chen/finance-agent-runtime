@@ -88,7 +88,7 @@ async def select_relevant_memories(
 
         return selected_memories
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - memory selection is best-effort
         # 选择失败时返回空列表
         print(f"Memory selection failed: {e}")
         return []

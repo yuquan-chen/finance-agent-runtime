@@ -8,7 +8,6 @@ from finance_agent.harness.plan_schema import QueryPlan
 from finance_agent.llm.provider import LlmProvider, build_llm_provider
 from finance_agent.metadata.catalog import Catalog
 
-
 SYSTEM_PROMPT = """You are the Architect in a finance data agent runtime.
 You must output only a JSON object that matches the QueryPlan schema.
 You never output SQL. You never output final numbers. You never assume data values.

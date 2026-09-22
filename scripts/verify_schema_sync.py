@@ -16,8 +16,8 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from extract_schema import parse_typeorm_entity
-from finance_agent.metadata.table_registry import get_default_table_registry
 
+from finance_agent.metadata.table_registry import get_default_table_registry
 
 # These are the business-critical mappings exercised by the current test data and
 # recent production-like queries.  The full source/entity comparison below remains

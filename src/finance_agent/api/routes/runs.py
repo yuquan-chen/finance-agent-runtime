@@ -120,7 +120,7 @@ def _trace_event(stage: str, state: dict[str, Any]) -> dict[str, Any]:
         ]
     elif stage == "execute_readonly":
         trace["artifacts"] = [
-            {"label": "执行模式", "value": state.get("execution_mode") or "direct_db"},
+            {"label": "执行模式", "value": state.get("execution_mode") or "pending"},
             {"label": "返回行数", "value": state.get("row_count")},
         ]
     if state.get("sql") and stage in {"generate_method", "repair_method", "query_guard", "execute_readonly", "render_method_card", "render_direct_response"}:

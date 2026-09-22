@@ -24,7 +24,7 @@ class Policy(BaseModel):
 
     def is_sensitive_column_name(self, name: str) -> bool:
         lowered = name.lower()
-        return any(re.search(pattern, lowered, re.I) for pattern in self.sensitive_column_patterns)
+        return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in self.sensitive_column_patterns)
 
 
 def load_policy(path: Path) -> Policy:

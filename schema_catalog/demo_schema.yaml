@@ -1,0 +1,138 @@
+version: 'demo-1'
+source: bundled_demo
+description: 'Bundled metadata-only schema for mock mode. It contains no business records.'
+tables:
+  - name: account
+    description: 'Customer account and KYC/KYB status.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: legal_name, type: text, nullable: true, description: 'Customer name'}
+      - {name: legal_name_en, type: text, nullable: true, description: 'Customer English name'}
+      - {name: kyc_status, type: text, nullable: false, description: 'KYC status'}
+      - {name: card_kyb_status, type: text, nullable: false, description: 'Card KYB status'}
+      - {name: va_kyb_status, type: text, nullable: false, description: 'VA KYB status'}
+      - {name: status, type: text, nullable: false, description: 'Account status'}
+      - {name: type, type: text, nullable: true}
+      - {name: created_at, type: timestamptz, nullable: false}
+  - name: card_transaction
+    description: 'Card transaction records.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: status, type: text, nullable: true, description: 'Transaction status'}
+      - {name: type, type: text, nullable: true, description: 'Transaction type'}
+      - {name: total_amount, type: numeric, nullable: true}
+      - {name: settle_amount, type: numeric, nullable: true}
+      - {name: origin_amount, type: numeric, nullable: true}
+      - {name: card_channel, type: text, nullable: true, description: 'Card channel'}
+      - {name: transaction_at, type: timestamptz, nullable: true}
+      - {name: complete_at, type: timestamptz, nullable: true}
+      - {name: currency, type: text, nullable: true}
+  - name: va_transaction
+    description: 'Virtual account inbound and outbound transactions.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: status, type: text, nullable: true}
+      - {name: type, type: text, nullable: true}
+      - {name: operation_type, type: text, nullable: true}
+      - {name: total_amount, type: numeric, nullable: true}
+      - {name: settle_amount, type: numeric, nullable: true}
+      - {name: transaction_at, type: timestamptz, nullable: true}
+      - {name: complete_at, type: timestamptz, nullable: true}
+      - {name: currency, type: text, nullable: true}
+      - {name: channel, type: text, nullable: true}
+      - {name: va_id, type: uuid, nullable: true}
+  - name: pay_transaction
+    description: 'Payment transaction records.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: status, type: text, nullable: true}
+      - {name: type, type: text, nullable: true}
+      - {name: amount, type: numeric, nullable: true}
+      - {name: total_amount, type: numeric, nullable: true}
+      - {name: transaction_at, type: timestamptz, nullable: true}
+      - {name: completed_at, type: timestamptz, nullable: true}
+      - {name: currency, type: text, nullable: true}
+  - name: payout_transaction
+    description: 'Payout and remittance records.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: status, type: text, nullable: true}
+      - {name: amount, type: numeric, nullable: true}
+      - {name: process_status, type: text, nullable: true}
+      - {name: progress_status, type: text, nullable: true}
+      - {name: channel_status, type: text, nullable: true}
+      - {name: transaction_at, type: timestamptz, nullable: true}
+      - {name: completed_at, type: timestamptz, nullable: true}
+      - {name: currency, type: text, nullable: true}
+  - name: card
+    description: 'Issued cards and card status.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: balance_id, type: uuid, nullable: true}
+      - {name: status, type: text, nullable: true}
+      - {name: card_channel, type: text, nullable: true}
+      - {name: currency, type: text, nullable: true}
+      - {name: label, type: text, nullable: true}
+      - {name: last4, type: text, nullable: true}
+  - name: balance
+    description: 'Account and card balances.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: available, type: numeric, nullable: true}
+      - {name: pending, type: numeric, nullable: true}
+      - {name: frozen, type: numeric, nullable: true}
+      - {name: currency, type: text, nullable: true}
+      - {name: type, type: text, nullable: true}
+      - {name: status, type: text, nullable: true}
+  - name: budget
+    description: 'Budget groups and limits.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: balance_id, type: uuid, nullable: true}
+      - {name: name, type: text, nullable: true}
+      - {name: total_limit, type: numeric, nullable: true}
+      - {name: status, type: text, nullable: true}
+  - name: cdd_kyc
+    description: 'KYC review cases and statuses.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: status, type: text, nullable: true}
+      - {name: review_result, type: text, nullable: true}
+      - {name: review_comment, type: text, nullable: true}
+      - {name: submit_time, type: timestamptz, nullable: true}
+      - {name: review_time, type: timestamptz, nullable: true}
+  - name: cdd_kyb
+    description: 'KYB review cases and statuses.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: status, type: text, nullable: true}
+      - {name: review_result, type: text, nullable: true}
+      - {name: review_comment, type: text, nullable: true}
+      - {name: submit_time, type: timestamptz, nullable: true}
+      - {name: review_time, type: timestamptz, nullable: true}
+  - name: funds_in
+    description: 'Fund inflow records.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: status, type: text, nullable: true}
+      - {name: to_amount, type: numeric, nullable: true}
+      - {name: transaction_at, type: timestamptz, nullable: true}
+  - name: funds_out
+    description: 'Fund outflow records.'
+    columns:
+      - {name: id, type: uuid, nullable: false}
+      - {name: account_id, type: uuid, nullable: false, foreign_key: account.id}
+      - {name: status, type: text, nullable: true}
+      - {name: from_amount, type: numeric, nullable: true}
+      - {name: to_amount, type: numeric, nullable: true}
+      - {name: transaction_at, type: timestamptz, nullable: true}

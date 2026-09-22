@@ -77,7 +77,7 @@ def _prepare_sql(
     prepared = sql.strip().rstrip(";")
 
     # 安全检查：只允许 SELECT/WITH
-    if not re.match(r"^(select|with)\b", prepared, re.I):
+    if not re.match(r"^(select|with)\b", prepared, re.IGNORECASE):
         raise SandboxSqlError("sandbox sql runner only accepts SELECT/WITH")
 
     # 处理 PostgreSQL 日期函数
@@ -86,7 +86,7 @@ def _prepare_sql(
         r"DATE_TRUNC\('year',\s*CURRENT_DATE\s*-\s*INTERVAL\s+'(\d+)\s+year'\)",
         r"DATE_TRUNC('year', CURRENT_DATE - INTERVAL '\1 year')",
         prepared,
-        flags=re.I
+        flags=re.IGNORECASE
     )
 
     # Keep driver-specific placeholder conversion below, but share all
@@ -188,9 +188,6 @@ def _columns(rows: list[dict[str, Any]]) -> list[str]:
 
 def _sqlite_type(rows: list[dict[str, Any]], column: str) -> str:
     """根据本地样本推断 SQLite 临时列类型。"""
-    # 时间字段后缀
-    time_suffixes = ("_at", "_time", "_date", "_datetime", "_timestamp")
-
     for row in rows:
         value = row.get(column)
         if value is None:

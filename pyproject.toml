@@ -1,7 +1,7 @@
 [project]
 name = "finance-agent-runtime"
 version = "0.1.0"
-description = "Transparent read-only finance agent runtime with LangGraph, LM Studio, and deterministic harness."
+description = "Governed multi-turn analysis agent for sensitive data with LangGraph, OpenAI-compatible LLMs, and deterministic guards."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.111",

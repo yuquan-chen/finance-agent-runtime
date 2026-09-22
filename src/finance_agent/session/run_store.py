@@ -20,6 +20,8 @@ class ActionClaim:
 
 RUN_TERMINAL_STATUSES = frozenset({
     "executed_simulated_real",
+    "executed_direct_db",
+    "executed_safe_db",
     "executed",
     "method_execution_failed",
     "method_generation_failed",

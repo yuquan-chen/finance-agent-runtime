@@ -11,7 +11,6 @@ from finance_agent.chat.response_plan import (
 from finance_agent.config import Settings
 from finance_agent.llm.provider import LlmProvider
 
-
 ResponseMode = Literal["chat_response", "help_response", "clarification", "refusal", "tool_call"]
 
 

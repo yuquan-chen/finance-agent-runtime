@@ -4,7 +4,6 @@ from finance_agent.harness.analysis_schema import MethodDraft, MockDryRunResult
 from finance_agent.sandbox.local_provider import LocalProcessSandboxProvider
 from finance_agent.sandbox.provider import SandboxExecutionRequest, SandboxProvider
 
-
 DEFAULT_SANDBOX_PROVIDER = LocalProcessSandboxProvider()
 
 

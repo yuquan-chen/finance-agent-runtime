@@ -685,7 +685,7 @@ async def process_chat_attachments(
             attachments=attachments,
             provider=runtime().llm_provider,
         )
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - attachment extraction is a user-facing fallback boundary
         extraction_error = str(error)
         reviews = [
             {
@@ -1040,7 +1040,7 @@ def _safe_run_detail(state: dict[str, Any]) -> dict[str, Any]:
                         for index, execution in enumerate(executions)
                     ]
                 ),
-                "type": "success" if state.get("status") == "executed_simulated_real" else "error",
+                "type": "success" if state.get("status", "").startswith("executed") else "error",
             }
         )
 
@@ -1049,10 +1049,12 @@ def _safe_run_detail(state: dict[str, Any]) -> dict[str, Any]:
         "analysis_plan_review_ready": "等待确认分析计划",
         "method_review_ready": "等待确认执行方法",
         "prior_result_authorization_pending": "等待授权使用先前结果",
-        "executed_simulated_real": "分析已完成",
+        "executed_simulated_real": "分析已完成（沙箱）",
+        "executed_direct_db": "分析已完成（真实数据库）",
+        "executed_safe_db": "分析已完成（安全查询）",
         "method_execution_failed": "执行失败",
     }.get(status, "已完成")
-    status_type = "error" if status == "method_execution_failed" else ("success" if status == "executed_simulated_real" else "")
+    status_type = "error" if status == "method_execution_failed" else ("success" if status.startswith("executed") else "")
     skill_detail = state.get("selected_skill_detail") or {}
     return {
         "request_id": state.get("request_id"),

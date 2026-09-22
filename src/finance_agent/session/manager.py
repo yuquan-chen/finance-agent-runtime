@@ -9,7 +9,7 @@ import json
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,18 +25,18 @@ PENDING_REVIEW_STATUSES = frozenset({
 
 def _utc_now_iso() -> str:
     """Return one sortable timestamp format for every session mutation."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _timestamp_value(value: Any) -> float:
     """Normalize legacy naive/offset timestamps for chronological sorting."""
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value))
         if parsed.tzinfo is None:
             # Before this fix, update timestamps were written in the host's
             # local timezone without an offset. Interpret those legacy values
             # in the current local timezone rather than treating them as UTC.
-            parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo or timezone.utc)
+            parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo or UTC)
         return parsed.timestamp()
     except (TypeError, ValueError, OverflowError):
         return float("-inf")
@@ -153,7 +153,7 @@ class SessionManager:
                     "pinned": bool(data.get("metadata", {}).get("pinned", False)),
                     "message_count": len(data.get("conversation_history", [])),
                 })
-            except Exception:
+            except (KeyError, TypeError, ValueError):
                 continue
         # 文件名是随机 UUID，不能代表对话的新旧；按最近更新时间展示。
         return sorted(
@@ -353,7 +353,7 @@ class SessionManager:
         def event_timestamp(event: dict[str, Any]) -> float:
             raw_timestamp = str(event.get("timestamp") or "")
             try:
-                parsed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+                parsed = datetime.fromisoformat(raw_timestamp)
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=local_timezone)
                 return parsed.timestamp()

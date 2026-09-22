@@ -5,7 +5,6 @@ from typing import Any
 
 from finance_agent.llm.provider import LlmProvider
 
-
 SYSTEM_PROMPT = """你是一个友好的数据分析助手。根据系统数据，用自然、口语化的中文回复用户。
 
 【当前日期】{today}
@@ -107,7 +106,7 @@ async def summarize_conversation(
             max_tokens=200,
         )
         return response.content.strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 - concise fallback keeps chat responses available
         # 如果总结失败，返回简化版本
         return _fallback_summary(conversation_history)
 
@@ -290,7 +289,7 @@ def _format_context(context: dict[str, Any]) -> str:
         parts.append("【阶段：分析计划】请向用户展示分析计划，确认是否继续。")
 
     # 注入之前的查询信息（如果有）
-    if "prior_queries" in context and context["prior_queries"]:
+    if context.get("prior_queries"):
         parts.append("\n【之前的查询记录】")
         for i, pq in enumerate(context["prior_queries"][-3:], 1):  # 只显示最近3条
             parts.append(f"{i}. 用户问: {pq.get('user_query', '未知')}")
@@ -332,7 +331,7 @@ def _format_context(context: dict[str, Any]) -> str:
     if "tables" in context:
         parts.append(f"涉及的表：{', '.join(context['tables'])}")
 
-    if "requires_authorization" in context and context["requires_authorization"]:
+    if context.get("requires_authorization"):
         parts.append("\n注意：用户确认后会直接执行查询")
 
     # 注入查询结果（execution_result 阶段）

@@ -1,7 +1,7 @@
-"""数据库表 Schema 注册表（装饰器 + 自动发现）。
+"""数据库表 Schema 注册表。
 
-使用 @register_table 和 @register_column 装饰器注册表结构和业务元数据。
-从 versioned `schema_catalog/tables/` 目录加载表定义。
+Schema 结构从本地 YAML 快照加载；YAML 只包含表、字段、类型和注释，
+不包含业务数据。
 
 用法：
     @register_table(name="card_transaction", description="卡交易记录")
@@ -14,14 +14,14 @@
 """
 from __future__ import annotations
 
-import importlib.util
+import os
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from pydantic import BaseModel, Field
 import yaml
-
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # 列和表模型
@@ -87,7 +87,7 @@ class TableMeta(BaseModel):
 _pending_tables: list[dict[str, Any]] = []
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 VALUE_ALIASES_OVERLAY_PATH = PROJECT_ROOT / "schema_catalog" / "value_aliases.yaml"
-SCHEMA_TABLES_PATH = PROJECT_ROOT / "schema_catalog" / "tables"
+SCHEMA_CATALOG_PATH = PROJECT_ROOT / "schema_catalog" / "schema.yaml"
 
 
 def _load_value_aliases_overlay(path: Path = VALUE_ALIASES_OVERLAY_PATH) -> dict[str, dict[str, dict[str, Any]]]:
@@ -220,31 +220,39 @@ class TableRegistry:
 # 自动发现 + 构建默认注册表
 # ---------------------------------------------------------------------------
 
-def _discover_tables() -> None:
-    """加载 versioned schema catalog 中的表定义，触发注册装饰器。"""
-    if not SCHEMA_TABLES_PATH.is_dir():
-        raise RuntimeError(f"schema catalog directory does not exist: {SCHEMA_TABLES_PATH}")
-
-    for table_path in sorted(SCHEMA_TABLES_PATH.glob("*.py")):
-        if table_path.name == "__init__.py":
-            continue
-        module_name = f"finance_agent_schema_catalog.{table_path.stem}"
-        spec = importlib.util.spec_from_file_location(module_name, table_path)
-        if not spec or not spec.loader:
-            raise RuntimeError(f"unable to load schema table definition: {table_path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+def _load_yaml_tables(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        raise RuntimeError(
+            f"schema catalog does not exist: {path}. "
+            "Run scripts/extract_schema.py --from-db <DATABASE_URL> first."
+        )
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict) or not isinstance(raw.get("tables"), list):
+        raise TypeError(f"invalid schema catalog YAML: {path}")
+    return [table for table in raw["tables"] if isinstance(table, dict)]
 
 
-@lru_cache(maxsize=1)
-def get_default_table_registry() -> TableRegistry:
-    """返回预注册所有表的注册表。"""
-    _discover_tables()
+@lru_cache(maxsize=8)
+def get_default_table_registry(schema_path: Path | str | None = None) -> TableRegistry:
+    """返回从 YAML schema 快照构建的注册表。"""
+    path = Path(schema_path or os.environ.get("SCHEMA_CATALOG_PATH", SCHEMA_CATALOG_PATH))
+    if (
+        not path.exists()
+        and path.name == "schema.yaml"
+        and os.environ.get("EXECUTOR_MODE", "mock") == "mock"
+    ):
+        demo_path = path.with_name("demo_schema.yaml")
+        if demo_path.exists():
+            path = demo_path
+    table_data_list = _load_yaml_tables(path)
 
     registry = TableRegistry()
 
     value_aliases_overlay = _load_value_aliases_overlay()
-    for table_data in _pending_tables:
+    for table_data in table_data_list:
+        table_name = str(table_data.get("name") or table_data.get("table_name") or "")
+        if not table_name:
+            continue
         columns = [
             ColumnMeta(
                 name=col["name"],
@@ -255,21 +263,22 @@ def get_default_table_registry() -> TableRegistry:
                 foreign_key=col.get("foreign_key"),
                 enum_values=col.get("enum_values", []),
                 semantic_aliases=(
-                    value_aliases_overlay.get(table_data["name"], {}).get(col["name"], {}).get("semantic_aliases", [])
+                    value_aliases_overlay.get(table_name, {}).get(col["name"], {}).get("semantic_aliases", [])
                     or col.get("semantic_aliases", [])
                 ),
                 value_aliases=(
-                    value_aliases_overlay.get(table_data["name"], {}).get(col["name"], {}).get("value_aliases", {})
+                    value_aliases_overlay.get(table_name, {}).get(col["name"], {}).get("value_aliases", {})
                     or col.get("value_aliases", {})
                 ),
             )
-            for col in table_data["columns"]
+            for col in table_data.get("columns", [])
+            if isinstance(col, dict) and col.get("name")
         ]
         registry.register(TableMeta(
-            name=table_data["name"],
-            description=table_data["description"],
+            name=table_name,
+            description=table_data.get("description", ""),
             columns=columns,
-            source="decorator",
+            source="yaml",
         ))
 
     return registry

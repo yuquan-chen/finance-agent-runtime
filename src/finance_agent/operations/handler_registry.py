@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
+from collections.abc import Callable
 from functools import lru_cache
-from typing import Any, Callable
 
 from pydantic import BaseModel
-
 
 # ---------------------------------------------------------------------------
 # 操作模型（纯元数据）

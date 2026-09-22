@@ -5,12 +5,14 @@
 """
 from __future__ import annotations
 
+# These fixtures intentionally use naive local datetimes and append +08:00 to
+# serialized values so their generated output remains stable across hosts.
+# ruff: noqa: DTZ001, DTZ005
 import json
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-
 
 CATALOG_MOCK_DATA_PATH = Path(__file__).resolve().parents[1] / "executor" / "mock_data.json"
 CATALOG_MOCK_ROW_LIMIT = 20
@@ -525,8 +527,6 @@ def _generate_funds_transfers(
         out_trx = transactions[(i * 2) % len(transactions)]
         in_trx = transactions[(i * 2 + 1) % len(transactions)]
         status = statuses[i % len(statuses)]
-        tx_time = reference_time - timedelta(days=(i * 5) % 181, hours=(i * 3) % 24)
-
         transfers.append({
             "id": _mock_uuid("funds_transfer", i),
             "id_no": 5000000 + i,
@@ -575,8 +575,6 @@ def _generate_p2p_funds_transfers(
         out_trx = transactions[(i * 2) % len(transactions)]
         in_trx = transactions[(i * 2 + 1) % len(transactions)]
         status = statuses[i % len(statuses)]
-        tx_time = reference_time - timedelta(days=(i * 4) % 181, hours=(i * 6) % 24)
-
         transfers.append({
             "id": _mock_uuid("p2p_transfer", i),
             "id_no": 6000000 + i,
@@ -622,8 +620,6 @@ def _generate_funds_in(
         balance = balances[i % len(balances)]
         trx = transactions[i % len(transactions)]
         status = statuses[i % len(statuses)]
-        tx_time = reference_time - timedelta(days=(i * 6) % 181, hours=(i * 4) % 24)
-
         funds_in.append({
             "id": _mock_uuid("funds_in", i),
             "id_no": 7000000 + i,
@@ -663,8 +659,6 @@ def _generate_funds_out(
         balance = balances[i % len(balances)]
         trx = transactions[i % len(transactions)]
         status = statuses[i % len(statuses)]
-        tx_time = reference_time - timedelta(days=(i * 7) % 181, hours=(i * 5) % 24)
-
         funds_out.append({
             "id": _mock_uuid("funds_out", i),
             "id_no": 8000000 + i,
@@ -712,8 +706,6 @@ def _generate_account_transactions(
         tx_type = types[i % len(types)]
         action = actions[i % len(actions)]
         amount = round(50 + ((i * 37) % 2000) + ((i % 7) * 0.5), 2)
-        tx_time = reference_time - timedelta(days=(i * 3) % 181, hours=(i * 5) % 24, minutes=(i * 7) % 60)
-
         account_transactions.append({
             "id": _mock_uuid("acct_tx", i),
             "id_no": 9000000 + i,

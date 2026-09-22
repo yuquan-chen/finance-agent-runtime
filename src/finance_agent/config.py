@@ -4,7 +4,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -33,6 +32,7 @@ class Settings:
     db_statement_timeout_ms: int
     db_max_rows: int
     safe_query_definitions_path: Path
+    schema_catalog_path: Path
     catalog_path: Path
     table_metadata_path: Path
     policy_path: Path
@@ -59,6 +59,20 @@ class Settings:
 
 def get_settings() -> Settings:
     load_dotenv()
+    executor_mode = os.environ.get("EXECUTOR_MODE", "mock")
+    configured_schema_path = os.environ.get("SCHEMA_CATALOG_PATH", "").strip()
+    if configured_schema_path:
+        schema_catalog_path = Path(configured_schema_path)
+    else:
+        generated_schema_path = PROJECT_ROOT / "schema_catalog" / "schema.yaml"
+        demo_schema_path = PROJECT_ROOT / "schema_catalog" / "demo_schema.yaml"
+        # Keep using an existing local snapshot when present; a fresh clone
+        # falls back to the tracked demo schema only in mock mode.
+        schema_catalog_path = (
+            generated_schema_path
+            if generated_schema_path.exists() or executor_mode != "mock"
+            else demo_schema_path
+        )
     return Settings(
         lmstudio_base_url=os.environ.get("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/"),
         lmstudio_model=os.environ.get("LMSTUDIO_MODEL", "qwen2.5-coder-7b-instruct-mlx"),
@@ -66,13 +80,14 @@ def get_settings() -> Settings:
         lmstudio_timeout_seconds=int(os.environ.get("LMSTUDIO_TIMEOUT_SECONDS", "30")),
         lmstudio_retry_attempts=max(1, int(os.environ.get("LMSTUDIO_RETRY_ATTEMPTS", "2"))),
         result_narration_timeout_seconds=int(os.environ.get("RESULT_NARRATION_TIMEOUT_SECONDS", "8")),
-        executor_mode=os.environ.get("EXECUTOR_MODE", "mock"),
+        executor_mode=executor_mode,
         database_url=os.environ.get("DATABASE_URL", ""),
         db_statement_timeout_ms=int(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "30000")),
         db_max_rows=int(os.environ.get("DB_MAX_ROWS", "1000")),
         safe_query_definitions_path=Path(
             os.environ.get("SAFE_QUERY_DEFINITIONS_PATH", str(PROJECT_ROOT / "config" / "safe_queries.yaml"))
         ),
+        schema_catalog_path=schema_catalog_path,
         catalog_path=Path(os.environ.get("CATALOG_PATH", str(PROJECT_ROOT / "config" / "catalog.yaml"))),
         table_metadata_path=Path(
             os.environ.get("TABLE_METADATA_PATH", str(PROJECT_ROOT / "config" / "table_metadata.yaml"))
